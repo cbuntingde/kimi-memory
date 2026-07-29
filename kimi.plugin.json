@@ -1,0 +1,69 @@
+{
+  "name": "kimi-memory",
+  "version": "0.1.0",
+  "description": "Three-layer local memory for Kimi Code: global user memory, per-project durable + working memory, and per-project session archives — exposed via MCP tools and lifecycle hooks.",
+  "skills": "./skills/",
+  "sessionStart": {
+    "skill": "kimi-memory"
+  },
+  "skillInstructions": "Use the kimi-memory MCP tools. Routing rules: (1) durable facts about the user, their environment, or reusable workflows are GLOBAL — pass scope:'global' on memory_save so they land in $KIMI_CODE_HOME/kimi-memory/_global/memory.sqlite. (2) Durable facts about the active project (repo conventions, decisions, architectures) are PROJECT — default scope for memory_save/update/delete. (3) Transient current focus is working_memory_set/get/clear (project-only). (4) Session transcripts are conversation_list/get/search/ingest (project-only, automatic). memory_recall/list/get default to scope:'all' so a default caller sees project + global hits; pass scope:'project' or scope:'global' to filter. Always pass `cwd` (the active project root), even for global writes — it stays as provenance context. Prefer memory_recall (scope:'all') before memory_save to avoid duplicates; if a recall hit exists, update or use supersede:true instead of saving a second copy. Echo the returned operation, scope, and id so the user can see what was persisted. Never store secrets (API keys, tokens, passwords, credentials, .env contents, PII).",
+  "mcpServers": {
+    "kimi-memory": {
+      "command": "node",
+      "args": ["./src/mcp/main.js"],
+      "cwd": "./"
+    }
+  },
+  "hooks": [
+    {
+      "event": "SessionStart",
+      "matcher": "",
+      "command": "node ./hooks/session-start.js",
+      "timeout": 10
+    },
+    {
+      "event": "UserPromptSubmit",
+      "matcher": "",
+      "command": "node ./hooks/user-prompt-submit.js",
+      "timeout": 10
+    },
+    {
+      "event": "Stop",
+      "matcher": "",
+      "command": "node ./hooks/stop.js",
+      "timeout": 15
+    },
+    {
+      "event": "SessionEnd",
+      "matcher": "",
+      "command": "node ./hooks/session-end.js",
+      "timeout": 15
+    },
+    {
+      "event": "PreCompact",
+      "matcher": "",
+      "command": "node ./hooks/pre-compact.js",
+      "timeout": 5
+    },
+    {
+      "event": "Interrupt",
+      "matcher": "",
+      "command": "node ./hooks/interrupt.js",
+      "timeout": 5
+    },
+    {
+      "event": "StopFailure",
+      "matcher": "",
+      "command": "node ./hooks/stop-failure.js",
+      "timeout": 5
+    }
+  ],
+  "commands": "./commands/",
+  "interface": {
+    "displayName": "Project Memory",
+    "shortDescription": "Three-layer local memory for Kimi Code (global preferences, project facts, session archives).",
+    "longDescription": "Adds a kimi-memory MCP server with three storage layers: GLOBAL durable memory at $KIMI_CODE_HOME/kimi-memory/_global/memory.sqlite for cross-project user preferences and reusable workflows, PROJECT durable + working memory at $KIMI_CODE_HOME/kimi-memory/<project-key>/memory.sqlite for repository facts and current focus, and PROJECT session archives (conversations and conversation_events) ingested idempotently from Kimi's wire.jsonl. Tools: memory_save, memory_recall, memory_list, memory_get, memory_update, memory_delete, memory_save_bulk (scope: project|global|all), working_memory_set/get/clear (project-only), conversation_list/get/search/ingest (project-only), memory_status (combined project + global summary). Fail-open lifecycle hooks: SessionStart, UserPromptSubmit, Stop, SessionEnd, PreCompact, Interrupt, StopFailure. SessionStart and UserPromptSubmit emit a bounded status line with active memory counts, working slots, conversations, conversation events, ingest/recall counts, plus recent and recall preview lines.",
+    "developerName": "kimi-memory",
+    "websiteURL": "https://github.com/MoonshotAI/kimi-code"
+  }
+}

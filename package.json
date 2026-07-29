@@ -1,0 +1,20 @@
+{
+  "name": "kimi-memory",
+  "version": "0.1.0",
+  "description": "Kimi Code plugin: persistent per-project memory store with MCP tools, lifecycle hooks, and a session-start skill.",
+  "license": "MIT",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "scripts": {
+    "start": "node src/mcp/main.js",
+    "test": "node --test --test-reporter=spec tests/*.test.js",
+    "check": "node --check src/mcp/main.js && node --check src/server.js && node --check src/persist.js && node --check src/wire.js && node --check src/project-key.js && node --check src/hooks/run.js && node --check src/validation.js && node --check src/util.js && node --check hooks/session-start.js && node --check hooks/user-prompt-submit.js && node --check hooks/stop.js && node --check hooks/session-end.js && node --check hooks/pre-compact.js && node --check hooks/interrupt.js && node --check hooks/stop-failure.js"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^3.25.76"
+  }
+}
