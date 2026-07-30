@@ -21,14 +21,39 @@ The plugin uses three storage layers, each with its own scope defaults:
 
 ## Install
 
-From Kimi Code, install this source directory as a Custom plugin:
+The plugin source is this directory. Two prerequisites from a clean checkout:
+
+1. `npm install` inside this directory. Kimi copies the source into
+   `$KIMI_CODE_HOME/plugins/managed/project-memory/` on install but does
+   not run `npm install` for you, so the MCP server fails on its first
+   call without `node_modules/`.
+2. The plugin is not on the Kimi official marketplace, so
+   `/plugins install` shows a trust prompt that defaults to **Cancel**.
+   Pick the affirmative option; a Cancel leaves no record, so just
+   re-run the slash and accept.
+
+Then from the Kimi TUI chat input:
 
 ```text
-/plugins install C:/Chris-Dev/plugins/kimi-memory
+/plugins install <absolute-path-to-this-repo>
 /reload
 ```
 
-Local plugins are copied into Kimi's managed plugin directory. After editing this source, reinstall it and run `/reload`; editing this directory alone does not update the managed copy. The MCP server and loaded Skill only see changes after `/reload` or a new session.
+To install without a local checkout, pass a GitHub URL:
+`/plugins install https://github.com/<owner>/<repo>`. Kimi pulls the
+source itself; you still owe `npm install` in the managed copy once it
+lands under `$KIMI_CODE_HOME/plugins/managed/project-memory/`.
+
+Verify with `/plugins info project-memory` — no diagnostic block means a
+clean install. If the plugin is already installed (check
+`$KIMI_CODE_HOME/plugins/installed.json`), skip the install slash and
+just `/reload` after dependency changes; each install copies the source
+again, so re-installing a healthy install is wasteful.
+
+Local plugins are copied into Kimi's managed plugin directory. Edits to
+this source do not propagate to the managed copy; reinstall after every
+meaningful change and then `/reload`. The MCP server and loaded Skill
+only see changes after `/reload` or a new session.
 
 This repository does not install or enable itself globally.
 
