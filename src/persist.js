@@ -12,12 +12,17 @@ import { DatabaseSync } from 'node:sqlite';
 import { promises as fs, mkdirSync } from 'node:fs';
 import path from 'node:path';
 import { nowIso, hashId, shortId, safeJsonParse } from './util.js';
+import { ensureProjectDir, ingestStatePath } from './project-key.js';
 import {
-  ensureProjectDir,
-  ingestStatePath,
-} from './project-key.js';
+  EMBEDDING_DIM,
+  EMBEDDING_MODEL,
+  embedText,
+  encodeVector,
+  decodeVector,
+  cosineSimilarity,
+} from './embedding.js';
 
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 5;
 
 // Schema migrations. Each entry is idempotent: it inspects the live
 // schema, no-ops when its target shape is already in place, and
@@ -33,7 +38,7 @@ const MIGRATIONS = [
   // DBs had a single-column primary key on (slot) only, which made
   // per-project isolation impossible at the SQL level.
   function migrateWorkingMemoryCompositePk(db) {
-    const pk = db.prepare("PRAGMA table_info(working_memory)").all();
+    const pk = db.prepare('PRAGMA table_info(working_memory)').all();
     if (pk.filter((column) => column.pk > 0).length === 2) return;
     db.exec(`
       BEGIN;
@@ -50,6 +55,159 @@ const MIGRATIONS = [
       DROP TABLE working_memory_v1;
       COMMIT;
     `);
+  },
+
+  // v3: add embedding columns + usage tracking. All columns are
+  // idempotent — re-runs are no-ops via the `have` set check.
+  function migrateAddEmbeddingColumns(db) {
+    const cols = db.prepare('PRAGMA table_info(memories)').all();
+    const have = new Set(cols.map((c) => c.name));
+    const alters = [];
+    if (!have.has('embedding')) alters.push('ALTER TABLE memories ADD COLUMN embedding BLOB');
+    if (!have.has('embedding_model'))
+      alters.push('ALTER TABLE memories ADD COLUMN embedding_model TEXT');
+    if (!have.has('embedding_dim'))
+      alters.push('ALTER TABLE memories ADD COLUMN embedding_dim INTEGER');
+    if (!have.has('embedded_at')) alters.push('ALTER TABLE memories ADD COLUMN embedded_at TEXT');
+    if (!have.has('access_count'))
+      alters.push('ALTER TABLE memories ADD COLUMN access_count INTEGER NOT NULL DEFAULT 0');
+    if (!have.has('last_accessed_at'))
+      alters.push('ALTER TABLE memories ADD COLUMN last_accessed_at TEXT');
+    for (const sql of alters) db.exec(sql);
+    const idx = db
+      .prepare(
+        "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_memories_embedded_at'",
+      )
+      .get();
+    if (!idx) db.exec('CREATE INDEX idx_memories_embedded_at ON memories(embedded_at)');
+  },
+
+  // v4: typed edges between memories (related | supports | contradicts |
+  // supersedes | synthesizes). Replaces the in-memory supersedes /
+  // superseded_by columns going forward — those stay for back-compat, but
+  // new links land here. Idempotent: create-table-if-missing plus
+  // index-if-missing probes.
+  function migrateAddMemoryEdges(db) {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS memory_edges (
+        id          TEXT PRIMARY KEY,
+        project_key TEXT NOT NULL,
+        from_id     TEXT NOT NULL,
+        to_id       TEXT NOT NULL,
+        kind        TEXT NOT NULL CHECK (kind IN ('related','supports','contradicts','supersedes','synthesizes')),
+        weight      REAL NOT NULL DEFAULT 1.0,
+        created_at  TEXT NOT NULL,
+        UNIQUE(project_key, from_id, to_id, kind)
+      )
+    `);
+    const idxFrom = db
+      .prepare("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_memory_edges_from'")
+      .get();
+    if (!idxFrom)
+      db.exec('CREATE INDEX idx_memory_edges_from ON memory_edges(project_key, from_id)');
+    const idxTo = db
+      .prepare("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_memory_edges_to'")
+      .get();
+    if (!idxTo) db.exec('CREATE INDEX idx_memory_edges_to ON memory_edges(project_key, to_id)');
+  },
+
+  // v5: extend the memories CHECK to allow 'conclusion' (the higher-order
+  // type that synthesizes N underlying memories) and add the
+  // memory_synthesizes table that records conclusion → source edges.
+  //
+  // SQLite cannot ALTER an existing CHECK constraint in place. The
+  // migration probes first (try INSERT type='conclusion' on a throwaway
+  // row); only if that fails do we rebuild the memories + memories_fts
+  // tables with the new constraint and copy every row across. The probe
+  // row is always deleted before returning. CREATE TABLE IF NOT EXISTS
+  // keeps the migration idempotent — re-runs are no-ops once the rebuild
+  // has happened.
+  function migrateAddConclusionType(db) {
+    // Probe: can we already insert type='conclusion'?
+    const probeId = '__conclusion_probe__';
+    let needsRebuild = false;
+    try {
+      db.prepare(
+        "INSERT INTO memories (id, project_key, type, content) VALUES (?, '_conclusion_probe', 'conclusion', 'x')",
+      ).run(probeId);
+      // Succeeded — the CHECK already accepts 'conclusion'. Tidy up.
+      db.prepare('DELETE FROM memories WHERE id=?').run(probeId);
+    } catch {
+      needsRebuild = true;
+    }
+    if (needsRebuild) {
+      db.exec(`
+        BEGIN;
+        CREATE TABLE memories_new (
+          id            TEXT PRIMARY KEY,
+          project_key   TEXT NOT NULL,
+          type          TEXT NOT NULL CHECK (type IN ('working','episodic','semantic','procedural','conclusion')),
+          title         TEXT,
+          content       TEXT NOT NULL,
+          tags          TEXT NOT NULL DEFAULT '[]',
+          metadata      TEXT NOT NULL DEFAULT '{}',
+          provenance    TEXT NOT NULL DEFAULT '{}',
+          confidence    REAL NOT NULL DEFAULT 0.8,
+          status        TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','superseded','deleted')),
+          priority      INTEGER NOT NULL DEFAULT 0,
+          supersedes    TEXT,
+          superseded_by TEXT,
+          created_at    TEXT NOT NULL,
+          updated_at    TEXT NOT NULL,
+          expires_at    TEXT,
+          embedding       BLOB,
+          embedding_model TEXT,
+          embedding_dim   INTEGER,
+          embedded_at     TEXT,
+          access_count     INTEGER NOT NULL DEFAULT 0,
+          last_accessed_at TEXT
+        );
+        INSERT INTO memories_new
+          SELECT id, project_key, type, title, content, tags, metadata, provenance,
+                 confidence, status, priority, supersedes, superseded_by,
+                 created_at, updated_at, expires_at,
+                 embedding, embedding_model, embedding_dim, embedded_at,
+                 access_count, last_accessed_at
+          FROM memories;
+        DROP TABLE memories;
+        ALTER TABLE memories_new RENAME TO memories;
+        -- Recreate every index the SCHEMA_SQL ships with. Indexes don't
+        -- survive DROP TABLE, so we have to re-create them after the
+        -- rename. These mirror SCHEMA_SQL exactly — keep them in sync.
+        CREATE INDEX idx_memories_project_type   ON memories(project_key, type);
+        CREATE INDEX idx_memories_project_status ON memories(project_key, status);
+        CREATE INDEX idx_memories_expires        ON memories(expires_at);
+        CREATE INDEX idx_memories_supersedes     ON memories(supersedes);
+        CREATE INDEX idx_memories_embedded_at    ON memories(embedded_at);
+        -- FTS5 is a virtual table; rebuild from the canonical memories
+        -- table so the search index stays consistent. The tags column
+        -- is a JSON string ('["a","b"]'); FTS5 tokenizes it as text,
+        -- which is sufficient for keyword recall (titles + content are
+        -- the high-signal fields anyway).
+        DELETE FROM memories_fts;
+        INSERT INTO memories_fts (id, project_key, type, title, content, tags)
+          SELECT id, project_key, type, title, content, tags
+          FROM memories;
+        COMMIT;
+      `);
+    }
+    // The synthesizes edge table is additive; idempotent via IF NOT EXISTS.
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS memory_synthesizes (
+        parent_id   TEXT NOT NULL,
+        child_id    TEXT NOT NULL,
+        project_key TEXT NOT NULL,
+        created_at  TEXT NOT NULL,
+        PRIMARY KEY (parent_id, child_id)
+      )
+    `);
+    const idxSynth = db
+      .prepare(
+        "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_memory_synthesizes_child'",
+      )
+      .get();
+    if (!idxSynth)
+      db.exec('CREATE INDEX idx_memory_synthesizes_child ON memory_synthesizes(child_id)');
   },
 ];
 
@@ -75,13 +233,25 @@ CREATE TABLE IF NOT EXISTS memories (
   superseded_by TEXT,                         -- id of the memory that replaced this one
   created_at    TEXT NOT NULL,
   updated_at    TEXT NOT NULL,
-  expires_at    TEXT                          -- ISO; null = never
+  expires_at    TEXT,                         -- ISO; null = never
+  -- v3: embedding support for hybrid (FTS5 + vector) retrieval.
+  -- embedding is a packed Float32Array little-endian, EMBEDDING_DIM floats.
+  embedding       BLOB,
+  embedding_model TEXT,
+  embedding_dim   INTEGER,
+  embedded_at     TEXT,
+  -- v3: usage tracking for importance / decay (will be used by #3).
+  access_count     INTEGER NOT NULL DEFAULT 0,
+  last_accessed_at TEXT
 );
 
 CREATE INDEX IF NOT EXISTS idx_memories_project_type ON memories(project_key, type);
 CREATE INDEX IF NOT EXISTS idx_memories_project_status ON memories(project_key, status);
 CREATE INDEX IF NOT EXISTS idx_memories_expires ON memories(expires_at);
 CREATE INDEX IF NOT EXISTS idx_memories_supersedes ON memories(supersedes);
+-- idx_memories_embedded_at is created by the v3 migration after it
+-- adds the embedded_at column. Including it here would fail on any
+-- pre-v3 database because the column doesn't exist yet.
 
 CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
   id UNINDEXED,
@@ -141,7 +311,11 @@ export function openDb(dbPath) {
   // so callers (tests, hooks, MCP server) can pass a path that does
   // not yet exist.
   const parent = path.dirname(dbPath);
-  try { mkdirSync(parent, { recursive: true }); } catch { /* ignore */ }
+  try {
+    mkdirSync(parent, { recursive: true });
+  } catch {
+    /* ignore */
+  }
   // Open read-write + create if missing.
   const db = new DatabaseSync(dbPath, { readOnly: false, create: true });
   db.exec('PRAGMA journal_mode = WAL;');
@@ -158,10 +332,12 @@ export function openDb(dbPath) {
   // Run every idempotent migration. Cost is one PRAGMA per migration;
   // on a healthy DB each one short-circuits.
   for (const migrate of MIGRATIONS) migrate(db);
-  db.prepare(`
+  db.prepare(
+    `
     INSERT INTO schema_meta (key, value) VALUES ('schema_version', ?)
     ON CONFLICT(key) DO UPDATE SET value=excluded.value
-  `).run(String(SCHEMA_VERSION));
+  `,
+  ).run(String(SCHEMA_VERSION));
   cachedDbs.set(dbPath, db);
   return db;
 }
@@ -170,14 +346,26 @@ export function closeDb(dbPath) {
   if (dbPath) {
     const db = cachedDbs.get(dbPath);
     if (db) {
-      try { db.close(); } catch { /* ignore */ }
+      try {
+        db.close();
+      } catch {
+        /* ignore */
+      }
       cachedDbs.delete(dbPath);
     }
     return;
   }
   for (const [p, db] of cachedDbs) {
-    try { db.close(); } catch { /* ignore */ }
-    try { cachedDbs.delete(p); } catch { /* ignore */ }
+    try {
+      db.close();
+    } catch {
+      /* ignore */
+    }
+    try {
+      cachedDbs.delete(p);
+    } catch {
+      /* ignore */
+    }
   }
 }
 
@@ -203,6 +391,11 @@ export function rowToMemory(row) {
     created_at: row.created_at,
     updated_at: row.updated_at,
     expires_at: row.expires_at || null,
+    // Lightweight embedding summary — never include the raw BLOB.
+    embedding_status: row.embedding ? 'embedded' : 'pending',
+    embedding_model: row.embedding_model || null,
+    access_count: row.access_count || 0,
+    last_accessed_at: row.last_accessed_at || null,
   };
 }
 
@@ -214,7 +407,8 @@ export function saveMemory(db, projectKey, input) {
   const tags = JSON.stringify(input.tags || []);
   const metadata = JSON.stringify(input.metadata || {});
   const provenance = JSON.stringify(input.provenance || {});
-  const confidence = typeof input.confidence === 'number' ? Math.max(0, Math.min(1, input.confidence)) : 0.8;
+  const confidence =
+    typeof input.confidence === 'number' ? Math.max(0, Math.min(1, input.confidence)) : 0.8;
   const status = input.status || 'active';
   const priority = Number.isFinite(input.priority) ? Math.trunc(input.priority) : 0;
   const expires = input.expires_at || null;
@@ -228,21 +422,46 @@ export function saveMemory(db, projectKey, input) {
   // title they intend to replace.
   let supersedesId = input.supersedes || null;
   if (input.supersede) {
-    const existing = db.prepare(
-      "SELECT id FROM memories WHERE project_key = ? AND type = ? AND COALESCE(title,'') = ? AND status = 'active' AND id != ? ORDER BY updated_at DESC"
-    ).all(projectKey, input.type, input.title || '', id);
+    const existing = db
+      .prepare(
+        "SELECT id FROM memories WHERE project_key = ? AND type = ? AND COALESCE(title,'') = ? AND status = 'active' AND id != ? ORDER BY updated_at DESC",
+      )
+      .all(projectKey, input.type, input.title || '', id);
     if (existing.length > 0) {
       // Link back to the most-recent prior; mark every prior superseded.
       supersedesId = existing[0].id;
       for (const ex of existing) {
-        db.prepare("UPDATE memories SET status='superseded', superseded_by=?, updated_at=? WHERE id=?").run(id, now, ex.id);
+        db.prepare(
+          "UPDATE memories SET status='superseded', superseded_by=?, updated_at=? WHERE id=?",
+        ).run(id, now, ex.id);
+      }
+      // Record a typed supersedes edge in memory_edges so the new
+      // graph primitive stays the canonical source going forward.
+      // Deduped via UNIQUE(project_key, from_id, to_id, kind); the
+      // edge primitive is idempotent.
+      try {
+        db.prepare(
+          `
+          INSERT OR IGNORE INTO memory_edges (id, project_key, from_id, to_id, kind, weight, created_at)
+          VALUES (?, ?, ?, ?, 'supersedes', 1.0, ?)
+        `,
+        ).run(
+          shortId(hashId('edge', projectKey, ex.id, id, 'supersedes'), 16),
+          projectKey,
+          ex.id,
+          id,
+          now,
+        );
+      } catch {
+        /* memory_edges may not exist on a pre-v4 DB; ignore */
       }
     }
   }
 
-  const row = db.prepare("SELECT id, created_at FROM memories WHERE id=?").get(id);
+  const row = db.prepare('SELECT id, created_at FROM memories WHERE id=?').get(id);
   if (row) {
-    db.prepare(`
+    db.prepare(
+      `
       UPDATE memories SET
         title = COALESCE(?, title),
         content = COALESCE(?, content),
@@ -256,7 +475,8 @@ export function saveMemory(db, projectKey, input) {
         expires_at = COALESCE(?, expires_at),
         updated_at = ?
       WHERE id = ?
-    `).run(
+    `,
+    ).run(
       input.title ?? null,
       input.content ?? null,
       input.tags !== undefined ? JSON.stringify(input.tags) : null,
@@ -268,27 +488,160 @@ export function saveMemory(db, projectKey, input) {
       supersedesId ?? null,
       expires,
       now,
-      id
+      id,
     );
   } else {
-    db.prepare(`
+    db.prepare(
+      `
       INSERT INTO memories (id, project_key, type, title, content, tags, metadata, provenance, confidence, status, priority, supersedes, created_at, updated_at, expires_at)
       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `).run(
-      id, projectKey, input.type, input.title || '', input.content || '',
-      tags, metadata, provenance, confidence, status, priority,
+    `,
+    ).run(
+      id,
+      projectKey,
+      input.type,
+      input.title || '',
+      input.content || '',
+      tags,
+      metadata,
+      provenance,
+      confidence,
+      status,
+      priority,
       supersedesId,
-      now, now, expires
+      now,
+      now,
+      expires,
     );
   }
 
   // FTS upsert
-  db.prepare("DELETE FROM memories_fts WHERE id=?").run(id);
-  db.prepare("INSERT INTO memories_fts (id, project_key, type, title, content, tags) VALUES (?, ?, ?, ?, ?, ?)").run(
-    id, projectKey, input.type, input.title || '', input.content || '', (input.tags || []).join(' ')
+  db.prepare('DELETE FROM memories_fts WHERE id=?').run(id);
+  db.prepare(
+    'INSERT INTO memories_fts (id, project_key, type, title, content, tags) VALUES (?, ?, ?, ?, ?, ?)',
+  ).run(
+    id,
+    projectKey,
+    input.type,
+    input.title || '',
+    input.content || '',
+    (input.tags || []).join(' '),
   );
 
-  return getMemory(db, projectKey, id);
+  // Conclusion edge: record this memory's synthesizes[] children in
+  // memory_synthesizes so bidirectional lookup is a single indexed
+  // query. Skip empty / duplicate / self-references. Idempotent via
+  // PRIMARY KEY (parent_id, child_id); re-saving just re-stamps the
+  // created_at, which is what callers usually want.
+  const synth = Array.isArray(input.synthesizes) ? input.synthesizes : null;
+  if (synth && synth.length > 0) {
+    const stmt = db.prepare(`
+      INSERT OR REPLACE INTO memory_synthesizes (parent_id, child_id, project_key, created_at)
+      VALUES (?, ?, ?, ?)
+    `);
+    for (const childId of synth) {
+      if (typeof childId !== 'string' || childId === id) continue;
+      try {
+        stmt.run(id, childId, projectKey, now);
+      } catch {
+        /* child missing in same scope; ignore */
+      }
+    }
+  }
+
+  const saved = getMemory(db, projectKey, id);
+
+  // Fire-and-forget embedding update. Runs as a microtask so saveMemory
+  // itself stays synchronous (existing tests and callers depend on that).
+  // Failures inside the embedding module are already logged via warnOnce;
+  // they never bubble up here. Pass _embed:false to skip (used by tests).
+  if (input._embed !== false && process.env.KIMI_MEMORY_EMBEDDINGS !== 'off') {
+    scheduleEmbeddingUpdate(db, id, saved?.title || '', saved?.content || '');
+  }
+
+  return saved;
+}
+
+// Read every conclusion that synthesizes a given memory. The argument
+// is a *child* memory id; we return the parent conclusions.
+export function listConclusionsFor(db, projectKey, childId, { limit = 50 } = {}) {
+  const rows = db
+    .prepare(
+      `
+    SELECT m.* FROM memories m
+    JOIN memory_synthesizes s ON s.parent_id = m.id
+    WHERE s.child_id = ? AND s.project_key = ?
+      AND m.status = 'active'
+    ORDER BY m.priority DESC, datetime(m.updated_at) DESC
+    LIMIT ?
+  `,
+    )
+    .all(childId, projectKey, Math.max(1, Math.min(200, limit)));
+  return rows.map(rowToMemory);
+}
+
+// Inverse of listConclusionsFor: given a conclusion's id, return the
+// underlying memories it synthesizes.
+export function getParents(db, projectKey, conclusionId, { limit = 200 } = {}) {
+  const rows = db
+    .prepare(
+      `
+    SELECT m.* FROM memories m
+    JOIN memory_synthesizes s ON s.child_id = m.id
+    WHERE s.parent_id = ? AND s.project_key = ?
+      AND m.status = 'active'
+    ORDER BY m.priority DESC, datetime(m.updated_at) DESC
+    LIMIT ?
+  `,
+    )
+    .all(conclusionId, projectKey, Math.max(1, Math.min(500, limit)));
+  return rows.map(rowToMemory);
+}
+
+// Async helper: compute embedding for a saved memory and write the
+// four embedding columns. Never throws — the embedding module catches
+// its own errors and warns once.
+function scheduleEmbeddingUpdate(db, id, title, content) {
+  Promise.resolve().then(async () => {
+    try {
+      const text = `${title || ''}\n${content || ''}`.trim().slice(0, 4000);
+      if (!text) return;
+      const vec = await embedText(text);
+      if (!vec) return;
+      // Re-check the row still exists; could have been deleted between
+      // save and this microtask.
+      const stillThere = db.prepare('SELECT id FROM memories WHERE id=?').get(id);
+      if (!stillThere) return;
+      db.prepare(
+        `UPDATE memories
+                    SET embedding=?, embedding_model=?, embedding_dim=?, embedded_at=?
+                    WHERE id=?`,
+      ).run(encodeVector(vec), EMBEDDING_MODEL, EMBEDDING_DIM, nowIso(), id);
+    } catch {
+      // Defensive — embedText is fail-open but be paranoid here too.
+    }
+  });
+}
+
+// Increment access_count and stamp last_accessed_at for the given ids.
+// Best-effort: failures (e.g. locked db) are swallowed.
+function bumpAccess(db, projectKey, ids) {
+  if (!ids || ids.length === 0) return;
+  try {
+    const stmt = db.prepare(`UPDATE memories
+                              SET access_count = access_count + 1, last_accessed_at = ?
+                              WHERE project_key = ? AND id = ?`);
+    const now = nowIso();
+    db.exec('BEGIN');
+    for (const id of ids) stmt.run(now, projectKey, id);
+    db.exec('COMMIT');
+  } catch {
+    try {
+      db.exec('ROLLBACK');
+    } catch {
+      /* ignore */
+    }
+  }
 }
 
 // Save N memories atomically inside one transaction. On any error
@@ -310,13 +663,17 @@ export function saveMemoryBulk(db, projectKey, inputs) {
     db.exec('COMMIT');
     return out;
   } catch (err) {
-    try { db.exec('ROLLBACK'); } catch { /* ignore */ }
+    try {
+      db.exec('ROLLBACK');
+    } catch {
+      /* ignore */
+    }
     throw err;
   }
 }
 
 export function getMemory(db, projectKey, id, { includeSuperseded = false } = {}) {
-  const row = db.prepare("SELECT * FROM memories WHERE id=? AND project_key=?").get(id, projectKey);
+  const row = db.prepare('SELECT * FROM memories WHERE id=? AND project_key=?').get(id, projectKey);
   if (!row) return null;
   if (row.status === 'deleted') return null;
   if (row.status === 'superseded' && !includeSuperseded) return null;
@@ -327,11 +684,21 @@ export function getMemory(db, projectKey, id, { includeSuperseded = false } = {}
   return rowToMemory(row);
 }
 
-export function listMemories(db, projectKey, { type, status = 'active', limit = 50, offset = 0, includeExpired = false } = {}) {
+export function listMemories(
+  db,
+  projectKey,
+  { type, status = 'active', limit = 50, offset = 0, includeExpired = false } = {},
+) {
   const where = ['project_key = ?'];
   const params = [projectKey];
-  if (type) { where.push('type = ?'); params.push(type); }
-  if (status) { where.push('status = ?'); params.push(status); }
+  if (type) {
+    where.push('type = ?');
+    params.push(type);
+  }
+  if (status) {
+    where.push('status = ?');
+    params.push(status);
+  }
   if (!includeExpired) where.push("(expires_at IS NULL OR datetime(expires_at) > datetime('now'))");
   const sql = `SELECT * FROM memories WHERE ${where.join(' AND ')} ORDER BY priority DESC, datetime(updated_at) DESC LIMIT ? OFFSET ?`;
   params.push(Math.max(1, Math.min(500, limit)), Math.max(0, offset));
@@ -341,88 +708,547 @@ export function listMemories(db, projectKey, { type, status = 'active', limit = 
 
 export function deleteMemory(db, projectKey, id, { hard = false } = {}) {
   if (hard) {
-    db.prepare("DELETE FROM memories_fts WHERE id=?").run(id);
-    const r = db.prepare("DELETE FROM memories WHERE id=? AND project_key=?").run(id, projectKey);
+    db.prepare('DELETE FROM memories_fts WHERE id=?').run(id);
+    const r = db.prepare('DELETE FROM memories WHERE id=? AND project_key=?').run(id, projectKey);
     return r.changes > 0;
   }
   const now = nowIso();
-  const r = db.prepare("UPDATE memories SET status='deleted', updated_at=? WHERE id=? AND project_key=?").run(now, id, projectKey);
+  const r = db
+    .prepare("UPDATE memories SET status='deleted', updated_at=? WHERE id=? AND project_key=?")
+    .run(now, id, projectKey);
   if (r.changes) {
-    db.prepare("DELETE FROM memories_fts WHERE id=?").run(id);
+    db.prepare('DELETE FROM memories_fts WHERE id=?').run(id);
   }
   return r.changes > 0;
 }
 
-export function searchMemories(db, projectKey, query, { type, limit = 20 } = {}) {
+export async function searchMemories(db, projectKey, query, opts = {}) {
   if (!query || !query.trim()) return [];
-  // Build a safe FTS5 prefix query from sanitised tokens.
+  const limit = Math.max(1, Math.min(200, opts.limit || 20));
+  const type = opts.type || null;
+
+  // ---- 1. FTS5 candidates ----
   const tokens = query
     .toLowerCase()
     .replace(/[^\p{L}\p{N}\s_-]/gu, ' ')
     .split(/\s+/)
     .filter(Boolean)
     .slice(0, 16);
-  if (tokens.length === 0) return [];
-  const fts = tokens.map((t) => `"${t.replace(/"/g, '""')}"*`).join(' ');
-  const params = [fts, projectKey];
-  let typeClause = '';
-  if (type) { typeClause = ' AND m.type = ?'; params.push(type); }
-  params.push(Math.max(1, Math.min(200, limit)));
-  const rows = db.prepare(`
-    SELECT m.* FROM memories_fts f
-    JOIN memories m ON m.id = f.id
-    WHERE memories_fts MATCH ?
-      AND m.project_key = ?
-      AND m.status = 'active'
-      AND (m.expires_at IS NULL OR datetime(m.expires_at) > datetime('now'))${typeClause}
-    ORDER BY rank, m.priority DESC
-    LIMIT ?
-  `).all(...params);
-  return rows.map(rowToMemory);
+  const ftsRows = [];
+  if (tokens.length > 0) {
+    const fts = tokens.map((t) => `"${t.replace(/"/g, '""')}"*`).join(' ');
+    const params = [fts, projectKey];
+    let typeClause = '';
+    if (type) {
+      typeClause = ' AND m.type = ?';
+      params.push(type);
+    }
+    params.push(limit);
+    ftsRows.push(
+      ...db
+        .prepare(
+          `
+      SELECT m.* FROM memories_fts f
+      JOIN memories m ON m.id = f.id
+      WHERE memories_fts MATCH ?
+        AND m.project_key = ?
+        AND m.status = 'active'
+        AND (m.expires_at IS NULL OR datetime(m.expires_at) > datetime('now'))${typeClause}
+      ORDER BY rank, m.priority DESC
+      LIMIT ?
+    `,
+        )
+        .all(...params),
+    );
+  }
+
+  // ---- 2. Vector candidates (best-effort, fail-open) ----
+  // Compute the query embedding once, then cosine-similarity against
+  // every active memory in this project that has an embedding of the
+  // expected dimension. Embedding module never throws; null = skip.
+  const qVec = await embedText(query);
+  const vecScores = new Map();
+  if (qVec && qVec.length === EMBEDDING_DIM) {
+    const where = [
+      'project_key = ?',
+      "status = 'active'",
+      "(expires_at IS NULL OR datetime(expires_at) > datetime('now'))",
+      'embedding IS NOT NULL',
+      'embedding_dim = ?',
+    ];
+    const params = [projectKey, EMBEDDING_DIM];
+    if (type) {
+      where.push('type = ?');
+      params.push(type);
+    }
+    const rows = db
+      .prepare(`SELECT id, embedding FROM memories WHERE ${where.join(' AND ')}`)
+      .all(...params);
+    for (const r of rows) {
+      const v = decodeVector(r.embedding);
+      if (!v || v.length !== EMBEDDING_DIM) continue;
+      vecScores.set(r.id, cosineSimilarity(qVec, v));
+    }
+  }
+
+  // ---- 3. Combine ----
+  // Hybrid score = 0.5 * ftsScore + 0.5 * vecScore, where ftsScore is a
+  // rank-based decay (1/(rank+1)) so top FTS hits beat later ones. A
+  // memory only present in one channel still gets a non-zero score; the
+  // combined value is a fair ranking signal either way.
+  const ftsScored = ftsRows.map((row, idx) => ({ id: row.id, row, ftsScore: 1 / (idx + 1) }));
+  const merged = new Map();
+  for (const e of ftsScored) merged.set(e.id, { row: e.row, ftsScore: e.ftsScore, vecScore: 0 });
+
+  if (vecScores.size > 0) {
+    // Build a lookup for any vector-only rows we need to fetch.
+    const missing = [...vecScores.keys()].filter((id) => !merged.has(id));
+    let fetched = new Map();
+    if (missing.length > 0) {
+      const placeholders = missing.map(() => '?').join(',');
+      const fetchedRows = db
+        .prepare(`SELECT * FROM memories WHERE project_key=? AND id IN (${placeholders})`)
+        .all(projectKey, ...missing);
+      fetched = new Map(fetchedRows.map((r) => [r.id, r]));
+    }
+    for (const [id, sim] of vecScores) {
+      const row = merged.get(id)?.row || fetched.get(id);
+      if (!row) continue;
+      const e = merged.get(id) || { row, ftsScore: 0, vecScore: 0 };
+      e.vecScore = sim;
+      merged.set(id, e);
+    }
+  }
+
+  const combined = [...merged.values()]
+    .map(({ row, ftsScore, vecScore }) => ({
+      row,
+      score: 0.5 * ftsScore + 0.5 * Math.max(0, Math.min(1, vecScore)),
+    }))
+    .sort((a, b) => b.score - a.score)
+    .slice(0, limit);
+
+  const out = combined.map(({ row }) => rowToMemory(row));
+
+  // ---- 4. Best-effort access bump on the top results ----
+  bumpAccess(
+    db,
+    projectKey,
+    out.map((m) => m.id),
+  );
+
+  return out;
 }
 
-// ----- Working memory -----
+// Find memories semantically similar to a given memory id (cosine
+// over stored embeddings). Returns [] if the target has no embedding
+// (e.g. legacy row, embedding model unavailable).
+export async function similarMemories(db, projectKey, id, { limit = 10, threshold = 0.6 } = {}) {
+  const target = db
+    .prepare('SELECT id, embedding, embedding_dim FROM memories WHERE id=? AND project_key=?')
+    .get(id, projectKey);
+  if (!target || !target.embedding) return [];
+  const tVec = decodeVector(target.embedding);
+  if (!tVec || tVec.length !== EMBEDDING_DIM) return [];
+
+  const where = [
+    'project_key = ?',
+    'id != ?',
+    "status = 'active'",
+    "(expires_at IS NULL OR datetime(expires_at) > datetime('now'))",
+    'embedding IS NOT NULL',
+    'embedding_dim = ?',
+  ];
+  const params = [projectKey, id, EMBEDDING_DIM];
+  const rows = db.prepare(`SELECT * FROM memories WHERE ${where.join(' AND ')}`).all(...params);
+
+  const scored = [];
+  for (const row of rows) {
+    const v = decodeVector(row.embedding);
+    if (!v || v.length !== EMBEDDING_DIM) continue;
+    const sim = cosineSimilarity(tVec, v);
+    if (sim >= threshold) scored.push({ row, sim });
+  }
+  scored.sort((a, b) => b.sim - a.sim);
+  const top = scored.slice(0, Math.max(1, Math.min(50, limit)));
+
+  if (top.length > 0) {
+    bumpAccess(
+      db,
+      projectKey,
+      top.map((s) => s.row.id),
+    );
+  }
+
+  return top.map(({ row, sim }) => ({
+    ...rowToMemory(row),
+    similarity: sim,
+  }));
+}
+
+// Backfill embeddings for rows that don't have one yet. Idempotent:
+// safe to re-run. Returns counts. Used by `npm run backfill-embeddings`
+// and exposed to the dashboard.
+export async function backfillEmbeddings(db, projectKey, { batchSize = 50, force = false } = {}) {
+  const where = ['project_key = ?', "status = 'active'"];
+  const params = [projectKey];
+  if (!force) where.push('embedding IS NULL');
+  const rows = db
+    .prepare(
+      `SELECT id, title, content FROM memories WHERE ${where.join(' AND ')} ORDER BY updated_at DESC`,
+    )
+    .all(...params);
+
+  let embedded = 0,
+    skipped = 0,
+    failed = 0;
+  for (let i = 0; i < rows.length; i += batchSize) {
+    const batch = rows.slice(i, i + batchSize);
+    for (const r of batch) {
+      try {
+        const text = `${r.title || ''}\n${r.content || ''}`.trim().slice(0, 4000);
+        const vec = await embedText(text);
+        if (!vec) {
+          skipped++;
+          continue;
+        }
+        db.prepare(
+          `UPDATE memories
+                      SET embedding=?, embedding_model=?, embedding_dim=?, embedded_at=?
+                      WHERE id=?`,
+        ).run(encodeVector(vec), EMBEDDING_MODEL, EMBEDDING_DIM, nowIso(), r.id);
+        embedded++;
+      } catch {
+        failed++;
+      }
+    }
+  }
+  return { scanned: rows.length, embedded, skipped, failed };
+}
+
+// ----- Importance + decay (signal-driven reinforcement) -----
+
+// Single-row bump for "this memory helped": +1 access, stamp the time,
+// and nudge confidence toward 1.0. The nudge is small (0.05) so a
+// single reinforce isn't enough to rescue a low-quality memory — it
+// rewards consistently-useful memories over many calls, mirroring how
+// a real recall signal accumulates over time.
+const REINFORCE_DELTA = 0.05;
+
+export function reinforceMemory(db, projectKey, id) {
+  const now = nowIso();
+  const row = db
+    .prepare("SELECT id, confidence FROM memories WHERE id=? AND project_key=? AND status='active'")
+    .get(id, projectKey);
+  if (!row) return null;
+  const next = Math.min(1, Math.max(0, (row.confidence || 0) + REINFORCE_DELTA));
+  db.prepare(
+    `
+    UPDATE memories
+    SET access_count = access_count + 1,
+        last_accessed_at = ?,
+        confidence = ?
+    WHERE id = ? AND project_key = ?
+  `,
+  ).run(now, next, id, projectKey);
+  return getMemory(db, projectKey, id);
+}
+
+// Idempotent, best-effort decay pass. Decreases confidence on every
+// active memory that has not been touched in 30+ days, scaled by the
+// length of the inactivity. Floor 0.1 so a memory never fully "dies"
+// from disuse alone — soft-delete (`memory_delete`) is the right tool
+// for permanent removal. Used by the SessionStart hook (hooks/decay.js)
+// and exposed for dashboards / CLI use.
+const DECAY_DAYS = 30;
+const DECAY_RATE_PER_DAY = 0.05 / DECAY_DAYS; // 5% per 30 days
+const DECAY_FLOOR = 0.1;
+
+export function decayMemories(db, projectKey, { now = nowIso() } = {}) {
+  // One UPDATE statement covers every row — no per-row roundtrip.
+  // inactivity_days = max(0, days(now - COALESCE(last_accessed_at, updated_at)) - DECAY_DAYS)
+  // so the first 30 days are a grace period; only memories stale beyond
+  // that lose confidence.
+  const r = db
+    .prepare(
+      `
+    UPDATE memories
+    SET confidence = MAX(
+      ?,
+      confidence * (1.0 - ? * MAX(
+        0.0,
+        julianday(?) - julianday(COALESCE(last_accessed_at, updated_at)) - ?
+      ))
+    )
+    WHERE project_key = ?
+      AND status = 'active'
+      AND julianday(?) - julianday(COALESCE(last_accessed_at, updated_at)) > ?
+  `,
+    )
+    .run(DECAY_FLOOR, DECAY_RATE_PER_DAY, now, DECAY_DAYS, projectKey, now, DECAY_DAYS);
+  return { affected: r.changes };
+}
+
+// Allowed kinds for memory_edges. Stable, versioned vocabulary — the
+// dashboard and any external consumers key off these strings.
+const EDGE_KINDS = new Set(['related', 'supports', 'contradicts', 'supersedes', 'synthesizes']);
+
+export function validEdgeKinds() {
+  return [...EDGE_KINDS];
+}
+
+export function isValidEdgeKind(kind) {
+  return EDGE_KINDS.has(kind);
+}
+
+// Deterministic id for an edge. Same (project_key, from, to, kind)
+// always hashes to the same id, which makes memory_link idempotent —
+// re-linking returns the same edge instead of erroring on the UNIQUE
+// constraint.
+function edgeId(projectKey, fromId, toId, kind) {
+  return shortId(hashId('edge', projectKey, fromId, toId, kind), 16);
+}
+
+// Read an edge by id; returns null if not found or cross-project.
+function readEdge(db, projectKey, id) {
+  return (
+    db.prepare('SELECT * FROM memory_edges WHERE id=? AND project_key=?').get(id, projectKey) ||
+    null
+  );
+}
+
+// Insert (or no-op fetch) an edge from fromId -> toId. Returns the
+// existing or newly-created edge. Validates kind up-front.
+export function linkMemory(db, projectKey, fromId, toId, kind, { weight = 1.0 } = {}) {
+  if (!EDGE_KINDS.has(kind)) throw new Error(`invalid edge kind: ${kind}`);
+  if (!fromId || !toId) throw new Error('linkMemory: fromId and toId are required');
+  if (fromId === toId) throw new Error('linkMemory: fromId and toId must differ');
+  const id = edgeId(projectKey, fromId, toId, kind);
+  const existing = readEdge(db, projectKey, id);
+  if (existing) {
+    // Idempotent: same (project, from, to, kind) is a no-op. If the
+    // caller passed a new weight, update it in place.
+    if (Number.isFinite(weight) && Math.abs((existing.weight || 1.0) - weight) > 1e-9) {
+      db.prepare('UPDATE memory_edges SET weight=? WHERE id=? AND project_key=?').run(
+        weight,
+        id,
+        projectKey,
+      );
+      existing.weight = weight;
+    }
+    return existing;
+  }
+  const now = nowIso();
+  db.prepare(
+    `
+    INSERT INTO memory_edges (id, project_key, from_id, to_id, kind, weight, created_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+  `,
+  ).run(id, projectKey, fromId, toId, kind, Number.isFinite(weight) ? weight : 1.0, now);
+  return {
+    id,
+    project_key: projectKey,
+    from_id: fromId,
+    to_id: toId,
+    kind,
+    weight: Number.isFinite(weight) ? weight : 1.0,
+    created_at: now,
+  };
+}
+
+// Remove an edge by id. Returns true if a row was deleted.
+export function unlinkMemory(db, projectKey, id) {
+  const r = db.prepare('DELETE FROM memory_edges WHERE id=? AND project_key=?').run(id, projectKey);
+  return r.changes > 0;
+}
+
+// List every edge touching a memory in the given scope (project or
+// global). direction is "out" (from_id = id), "in" (to_id = id), or
+// "both" (default). kind is optional filter.
+export function listEdges(db, projectKey, id, { direction = 'both', kind = null } = {}) {
+  const where = ['project_key = ?'];
+  const params = [projectKey];
+  if (direction === 'out') where.push('from_id = ?');
+  else if (direction === 'in') where.push('to_id = ?');
+  else where.push('(from_id = ? OR to_id = ?)');
+  if (direction === 'out' || direction === 'in') params.push(id);
+  else params.push(id, id);
+  if (kind) {
+    if (!EDGE_KINDS.has(kind)) throw new Error(`invalid edge kind: ${kind}`);
+    where.push('kind = ?');
+    params.push(kind);
+  }
+  const rows = db
+    .prepare(
+      `SELECT * FROM memory_edges WHERE ${where.join(' AND ')} ORDER BY created_at DESC, kind ASC`,
+    )
+    .all(...params);
+  return rows.map((r) => ({
+    id: r.id,
+    project_key: r.project_key,
+    from_id: r.from_id,
+    to_id: r.to_id,
+    kind: r.kind,
+    weight: r.weight,
+    created_at: r.created_at,
+    direction: r.from_id === id ? 'out' : 'in',
+  }));
+}
+
+// Merge `fromId` into `intoId`. Behaviour:
+//   - intoId gains a union of tags from both memories (existing tags preserved, new ones appended).
+//   - intoId gains a merge entry in its provenance: { source: 'memory_merge', merged_from: fromId, ... }.
+//   - fromId is soft-superseded (status='superseded', superseded_by=intoId).
+//   - fromId is removed from FTS so it no longer matches recall.
+//   - A 'supersedes' edge (from -> into) is recorded in memory_edges.
+//   - If opts.mergedContent is provided, intoId's content is replaced.
+// Returns { into, from, edge }. Throws if either id is missing / soft-deleted.
+export function mergeMemory(
+  db,
+  projectKey,
+  intoId,
+  fromId,
+  { mergedContent = null, weight = 1.0 } = {},
+) {
+  if (!intoId || !fromId) throw new Error('mergeMemory: intoId and fromId are required');
+  if (intoId === fromId) throw new Error('mergeMemory: intoId and fromId must differ');
+
+  const into = getMemory(db, projectKey, intoId, { includeSuperseded: true });
+  const from = getMemory(db, projectKey, fromId, { includeSuperseded: true });
+  if (!into) throw new Error(`mergeMemory: into memory not found: ${intoId}`);
+  if (!from) throw new Error(`mergeMemory: from memory not found: ${fromId}`);
+
+  // Union tags (preserve order, de-dup case-insensitively).
+  const seen = new Set();
+  const tags = [];
+  for (const t of into.tags || []) {
+    const k = String(t).toLowerCase();
+    if (seen.has(k)) continue;
+    seen.add(k);
+    tags.push(t);
+  }
+  for (const t of from.tags || []) {
+    const k = String(t).toLowerCase();
+    if (seen.has(k)) continue;
+    seen.add(k);
+    tags.push(t);
+  }
+
+  // Build the new provenance: copy into's, append a merge entry that
+  // records where the trailing tags came from.
+  const provenance = { ...(into.provenance || {}) };
+  provenance.merged_from = Array.isArray(provenance.merged_from) ? provenance.merged_from : [];
+  provenance.merged_from.push({
+    id: from.id,
+    merged_at: nowIso(),
+    kind: 'memory_merge',
+  });
+
+  // Persist the merged into-memory. We call saveMemory directly so we
+  // bypass its supersede-on-same-title logic (we already have a
+  // supersedes relationship from -> into).
+  const merged = {
+    id: into.id,
+    type: into.type,
+    title: into.title,
+    content:
+      typeof mergedContent === 'string' && mergedContent.length > 0 ? mergedContent : into.content,
+    tags,
+    metadata: into.metadata || {},
+    provenance,
+    confidence: into.confidence,
+    status: 'active',
+    priority: into.priority || 0,
+    expires_at: into.expires_at || null,
+    // _embed:false keeps saveMemory sync and skips the embedding
+    // microtask — the merged content already has the same or similar
+    // embedding as before; the next backfill will refresh if needed.
+    _embed: false,
+  };
+  const updated = saveMemory(db, projectKey, merged);
+
+  // Soft-supersede the from-memory and stamp a back-link. Use raw SQL
+  // so we don't re-fire saveMemory's title-based supersede logic (which
+  // would chase a chain).
+  const now = nowIso();
+  db.prepare(
+    `
+    UPDATE memories
+    SET status='superseded', superseded_by=?, updated_at=?
+    WHERE id=? AND project_key=?
+  `,
+  ).run(intoId, now, fromId, projectKey);
+  db.prepare('DELETE FROM memories_fts WHERE id=?').run(fromId);
+
+  // Record the typed supersedes edge in memory_edges so consumers of
+  // the new graph primitive see the relationship too.
+  const edge = linkMemory(db, projectKey, fromId, intoId, 'supersedes', { weight });
+
+  // Reload from-side so the caller sees the soft-superseded status.
+  const after = db
+    .prepare('SELECT * FROM memories WHERE id=? AND project_key=?')
+    .get(fromId, projectKey);
+  return {
+    into: updated,
+    from: after ? { ...rowToMemory(after), status: 'superseded', superseded_by: intoId } : null,
+    edge,
+  };
+}
 
 export function setWorkingMemory(db, projectKey, slot, value) {
   const now = nowIso();
-  db.prepare(`
+  db.prepare(
+    `
     INSERT INTO working_memory (slot, project_key, value, updated_at)
     VALUES (?, ?, ?, ?)
     ON CONFLICT(project_key, slot) DO UPDATE SET
       value = excluded.value,
       updated_at = excluded.updated_at
-  `).run(slot, projectKey, value, now);
+  `,
+  ).run(slot, projectKey, value, now);
   return { slot, value, updated_at: now };
 }
 
 export function getWorkingMemory(db, projectKey, slot) {
-  const row = db.prepare("SELECT * FROM working_memory WHERE slot=? AND project_key=?").get(slot, projectKey);
+  const row = db
+    .prepare('SELECT * FROM working_memory WHERE slot=? AND project_key=?')
+    .get(slot, projectKey);
   if (!row) return null;
   return { slot: row.slot, value: row.value, updated_at: row.updated_at };
 }
 
 export function clearWorkingMemory(db, projectKey, slot) {
-  const r = db.prepare("DELETE FROM working_memory WHERE slot=? AND project_key=?").run(slot, projectKey);
+  const r = db
+    .prepare('DELETE FROM working_memory WHERE slot=? AND project_key=?')
+    .run(slot, projectKey);
   return r.changes > 0;
 }
 
 export function listWorkingMemory(db, projectKey) {
-  return db.prepare("SELECT slot, value, updated_at FROM working_memory WHERE project_key=? ORDER BY updated_at DESC").all(projectKey);
+  return db
+    .prepare(
+      'SELECT slot, value, updated_at FROM working_memory WHERE project_key=? ORDER BY updated_at DESC',
+    )
+    .all(projectKey);
 }
 
 // ----- Conversations -----
 
 export function upsertConversation(db, projectKey, sessionId, cwd) {
-  db.prepare(`
+  db.prepare(
+    `
     INSERT INTO conversations (session_id, project_key, cwd, last_event_at)
     VALUES (?, ?, ?, NULL)
     ON CONFLICT(session_id, project_key) DO UPDATE SET cwd = COALESCE(conversations.cwd, excluded.cwd)
-  `).run(sessionId, projectKey, cwd || null);
+  `,
+  ).run(sessionId, projectKey, cwd || null);
   return getConversation(db, projectKey, sessionId);
 }
 
 export function getConversation(db, projectKey, sessionId) {
-  const row = db.prepare("SELECT * FROM conversations WHERE session_id=? AND project_key=?").get(sessionId, projectKey);
+  const row = db
+    .prepare('SELECT * FROM conversations WHERE session_id=? AND project_key=?')
+    .get(sessionId, projectKey);
   if (!row) return null;
   return {
     session_id: row.session_id,
@@ -436,7 +1262,11 @@ export function getConversation(db, projectKey, sessionId) {
 }
 
 export function listConversations(db, projectKey, { limit = 50 } = {}) {
-  const rows = db.prepare("SELECT * FROM conversations WHERE project_key=? ORDER BY datetime(last_event_at) DESC LIMIT ?").all(projectKey, Math.max(1, Math.min(500, limit)));
+  const rows = db
+    .prepare(
+      'SELECT * FROM conversations WHERE project_key=? ORDER BY datetime(last_event_at) DESC LIMIT ?',
+    )
+    .all(projectKey, Math.max(1, Math.min(500, limit)));
   return rows.map((r) => ({
     session_id: r.session_id,
     cwd: r.cwd,
@@ -448,17 +1278,37 @@ export function listConversations(db, projectKey, { limit = 50 } = {}) {
   }));
 }
 
-export function searchConversationEvents(db, projectKey, query, { sessionId, role, limit = 20 } = {}) {
+export function searchConversationEvents(
+  db,
+  projectKey,
+  query,
+  { sessionId, role, limit = 20 } = {},
+) {
   if (!query || !query.trim()) return [];
-  const tokens = query.toLowerCase().replace(/[^\p{L}\p{N}\s_-]/gu, ' ').split(/\s+/).filter(Boolean).slice(0, 16);
+  const tokens = query
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s_-]/gu, ' ')
+    .split(/\s+/)
+    .filter(Boolean)
+    .slice(0, 16);
   if (tokens.length === 0) return [];
   const like = '%' + tokens.slice(0, 6).join('%') + '%';
-  const where = ['project_key = ?', "(summary LIKE ? OR payload LIKE ?)"];
+  const where = ['project_key = ?', '(summary LIKE ? OR payload LIKE ?)'];
   const params = [projectKey, like, like];
-  if (sessionId) { where.push('session_id = ?'); params.push(sessionId); }
-  if (role) { where.push('role = ?'); params.push(role); }
+  if (sessionId) {
+    where.push('session_id = ?');
+    params.push(sessionId);
+  }
+  if (role) {
+    where.push('role = ?');
+    params.push(role);
+  }
   params.push(Math.max(1, Math.min(200, limit)));
-  const rows = db.prepare(`SELECT * FROM conversation_events WHERE ${where.join(' AND ')} ORDER BY datetime(created_at) DESC LIMIT ?`).all(...params);
+  const rows = db
+    .prepare(
+      `SELECT * FROM conversation_events WHERE ${where.join(' AND ')} ORDER BY datetime(created_at) DESC LIMIT ?`,
+    )
+    .all(...params);
   return rows.map((r) => ({
     session_id: r.session_id,
     line_no: r.line_no,
@@ -472,11 +1322,15 @@ export function searchConversationEvents(db, projectKey, query, { sessionId, rol
 }
 
 export function getConversationEvents(db, projectKey, sessionId, { limit = 200, since = 0 } = {}) {
-  const rows = db.prepare(`
+  const rows = db
+    .prepare(
+      `
     SELECT * FROM conversation_events
     WHERE project_key = ? AND session_id = ? AND line_no >= ?
     ORDER BY line_no ASC LIMIT ?
-  `).all(projectKey, sessionId, Math.max(0, since), Math.max(1, Math.min(1000, limit)));
+  `,
+    )
+    .all(projectKey, sessionId, Math.max(0, since), Math.max(1, Math.min(1000, limit)));
   return rows.map((r) => ({
     session_id: r.session_id,
     line_no: r.line_no,
@@ -495,7 +1349,8 @@ export function recordConversationEvent(db, projectKey, sessionId, lineNo, byteO
   const role = event.role || null;
   const kind = event.kind || null;
   const createdAt = event.created_at || nowIso();
-  db.prepare(`
+  db.prepare(
+    `
     INSERT INTO conversation_events (session_id, project_key, line_no, byte_offset, role, kind, payload, summary, created_at)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
     ON CONFLICT(session_id, project_key, line_no) DO UPDATE SET
@@ -504,15 +1359,25 @@ export function recordConversationEvent(db, projectKey, sessionId, lineNo, byteO
       kind = excluded.kind,
       payload = excluded.payload,
       summary = excluded.summary
-  `).run(sessionId, projectKey, lineNo, byteOffset, role, kind, payload, summary, createdAt);
+  `,
+  ).run(sessionId, projectKey, lineNo, byteOffset, role, kind, payload, summary, createdAt);
 }
 
-export function updateConversationProgress(db, projectKey, sessionId, byteOffset, lineCount, lastEventAt) {
-  db.prepare(`
+export function updateConversationProgress(
+  db,
+  projectKey,
+  sessionId,
+  byteOffset,
+  lineCount,
+  lastEventAt,
+) {
+  db.prepare(
+    `
     UPDATE conversations
     SET byte_offset = ?, line_count = ?, last_event_at = COALESCE(?, last_event_at), last_import_at = ?
     WHERE session_id = ? AND project_key = ?
-  `).run(byteOffset, lineCount, lastEventAt || null, nowIso(), sessionId, projectKey);
+  `,
+  ).run(byteOffset, lineCount, lastEventAt || null, nowIso(), sessionId, projectKey);
 }
 
 // ----- Ingest state (per-session cursor, persisted to JSON) -----
@@ -522,7 +1387,9 @@ export async function loadIngestState(kimiHomeDir, projectKey) {
     const raw = await fs.readFile(ingestStatePath(kimiHomeDir, projectKey), 'utf8');
     const parsed = safeJsonParse(raw);
     if (parsed.ok && parsed.value && typeof parsed.value === 'object') return parsed.value;
-  } catch { /* missing */ }
+  } catch {
+    /* missing */
+  }
   return { sessions: {} };
 }
 
@@ -539,21 +1406,37 @@ export async function saveIngestState(kimiHomeDir, projectKey, state) {
 // already-open db handle plus the project_key value (a SHA-256 prefix
 // for project DBs, or the literal "_global" string for the global DB).
 export function memoryCounts(db, projectKey) {
-  const total = db.prepare("SELECT COUNT(*) AS n FROM memories WHERE project_key=?").get(projectKey).n;
-  const active = db.prepare(
-    "SELECT COUNT(*) AS n FROM memories WHERE project_key=? AND status='active' AND (expires_at IS NULL OR datetime(expires_at) > datetime('now'))"
-  ).get(projectKey).n;
-  const expired = db.prepare(
-    "SELECT COUNT(*) AS n FROM memories WHERE project_key=? AND status='active' AND expires_at IS NOT NULL AND datetime(expires_at) <= datetime('now')"
-  ).get(projectKey).n;
-  const superseded = db.prepare("SELECT COUNT(*) AS n FROM memories WHERE project_key=? AND status='superseded'").get(projectKey).n;
-  const deleted = db.prepare("SELECT COUNT(*) AS n FROM memories WHERE project_key=? AND status='deleted'").get(projectKey).n;
+  const total = db
+    .prepare('SELECT COUNT(*) AS n FROM memories WHERE project_key=?')
+    .get(projectKey).n;
+  const active = db
+    .prepare(
+      "SELECT COUNT(*) AS n FROM memories WHERE project_key=? AND status='active' AND (expires_at IS NULL OR datetime(expires_at) > datetime('now'))",
+    )
+    .get(projectKey).n;
+  const expired = db
+    .prepare(
+      "SELECT COUNT(*) AS n FROM memories WHERE project_key=? AND status='active' AND expires_at IS NOT NULL AND datetime(expires_at) <= datetime('now')",
+    )
+    .get(projectKey).n;
+  const superseded = db
+    .prepare("SELECT COUNT(*) AS n FROM memories WHERE project_key=? AND status='superseded'")
+    .get(projectKey).n;
+  const deleted = db
+    .prepare("SELECT COUNT(*) AS n FROM memories WHERE project_key=? AND status='deleted'")
+    .get(projectKey).n;
   const retained = expired + superseded + deleted;
-  const byType = db.prepare(
-    "SELECT type, COUNT(*) AS n FROM memories WHERE project_key=? AND status='active' AND (expires_at IS NULL OR datetime(expires_at) > datetime('now')) GROUP BY type"
-  ).all(projectKey);
-  const byStatus = db.prepare("SELECT status, COUNT(*) AS n FROM memories WHERE project_key=? GROUP BY status").all(projectKey);
-  const latestRow = db.prepare("SELECT MAX(updated_at) AS t FROM memories WHERE project_key=?").get(projectKey);
+  const byType = db
+    .prepare(
+      "SELECT type, COUNT(*) AS n FROM memories WHERE project_key=? AND status='active' AND (expires_at IS NULL OR datetime(expires_at) > datetime('now')) GROUP BY type",
+    )
+    .all(projectKey);
+  const byStatus = db
+    .prepare('SELECT status, COUNT(*) AS n FROM memories WHERE project_key=? GROUP BY status')
+    .all(projectKey);
+  const latestRow = db
+    .prepare('SELECT MAX(updated_at) AS t FROM memories WHERE project_key=?')
+    .get(projectKey);
   return {
     // `total` is preserved as a compatibility field: every row in the
     // memories table for this key, regardless of status. The accurate
@@ -576,9 +1459,15 @@ export function memoryCounts(db, projectKey) {
 // matching the shape returned by earlier versions of this plugin.
 export function projectStatus(db, projectKey) {
   const mem = memoryCounts(db, projectKey);
-  const wm = db.prepare("SELECT COUNT(*) AS n FROM working_memory WHERE project_key=?").get(projectKey).n;
-  const conv = db.prepare("SELECT COUNT(*) AS n FROM conversations WHERE project_key=?").get(projectKey).n;
-  const events = db.prepare("SELECT COUNT(*) AS n FROM conversation_events WHERE project_key=?").get(projectKey).n;
+  const wm = db
+    .prepare('SELECT COUNT(*) AS n FROM working_memory WHERE project_key=?')
+    .get(projectKey).n;
+  const conv = db
+    .prepare('SELECT COUNT(*) AS n FROM conversations WHERE project_key=?')
+    .get(projectKey).n;
+  const events = db
+    .prepare('SELECT COUNT(*) AS n FROM conversation_events WHERE project_key=?')
+    .get(projectKey).n;
   return {
     project_key: projectKey,
     memories: mem,

@@ -46,7 +46,10 @@ test('per-project data layout uses the project key under kimi home', () => {
     const key = deriveProjectKey(root);
     const expected = path.join(home, 'kimi-memory', key, 'memory.sqlite');
     assert.equal(projectDbPath(home, key), expected);
-    assert.equal(ingestStatePath(home, key), path.join(home, 'kimi-memory', key, 'ingest-state.json'));
+    assert.equal(
+      ingestStatePath(home, key),
+      path.join(home, 'kimi-memory', key, 'ingest-state.json'),
+    );
   } finally {
     rmRf(home);
   }

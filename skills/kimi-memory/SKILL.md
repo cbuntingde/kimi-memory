@@ -11,12 +11,12 @@ The kimi-memory plugin gives the Kimi agent a three-layer memory store backed by
 
 Pick the right scope for every fact you save or recall:
 
-| Layer | Scope | When |
-|---|---|---|
-| Global user memory | `scope: "global"` | Cross-project preferences, profile facts, reusable procedures (e.g. "user prefers dark mode", "use `pnpm` globally", "how to onboard the agent on a new machine"). |
-| Project durable memory | `scope: "project"` (default) | Repository-specific facts, decisions, conventions, workflows for the active project. |
-| Project working memory | `working_memory_set/get/clear` (project-only) | Transient current focus, in-flight tasks, recent decisions you want surfaced next turn. |
-| Session archive | `conversation_*` tools (project-only) | Automatic full per-session transcript; no manual reads unless the user asks. |
+| Layer                  | Scope                                         | When                                                                                                                                                               |
+| ---------------------- | --------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| Global user memory     | `scope: "global"`                             | Cross-project preferences, profile facts, reusable procedures (e.g. "user prefers dark mode", "use `pnpm` globally", "how to onboard the agent on a new machine"). |
+| Project durable memory | `scope: "project"` (default)                  | Repository-specific facts, decisions, conventions, workflows for the active project.                                                                               |
+| Project working memory | `working_memory_set/get/clear` (project-only) | Transient current focus, in-flight tasks, recent decisions you want surfaced next turn.                                                                            |
+| Session archive        | `conversation_*` tools (project-only)         | Automatic full per-session transcript; no manual reads unless the user asks.                                                                                       |
 
 ## When to act
 
@@ -38,31 +38,47 @@ Pick the right scope for every fact you save or recall:
 
 ## Types
 
-| Type | When |
-|---|---|
-| `working` | Short, in-flight context. Often the current task or focus. Prefer `working_memory_set` for genuinely transient state. |
-| `episodic` | An event that happened ("on 2026-07-27 we migrated X to Y"). |
-| `semantic` | A durable fact, definition, or convention. |
-| `procedural` | A procedure ("to release: ..."). |
+| Type         | When                                                                                                                                                                                                                                             |
+| ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| `working`    | Short, in-flight context. Often the current task or focus. Prefer `working_memory_set` for genuinely transient state.                                                                                                                            |
+| `episodic`   | An event that happened ("on 2026-07-27 we migrated X to Y").                                                                                                                                                                                     |
+| `semantic`   | A durable fact, definition, or convention.                                                                                                                                                                                                       |
+| `procedural` | A procedure ("to release: ...").                                                                                                                                                                                                                 |
+| `conclusion` | A higher-order synthesis built from one or more underlying memories. Pass `synthesizes: [childId, ...]` to `memory_save`; the plugin records the lineage in `memory_synthesizes` and exposes it via `memory_conclusions_for` / `memory_parents`. |
 
 ## Tools
 
 Durable memory (scope-aware):
-- `memory_save(scope, type, ...)` — defaults `scope: "project"`.
-- `memory_recall(scope, query, ...)` — defaults `scope: "all"` (project hits first, then global).
+
+- `memory_save(scope, type, ...)` — defaults `scope: "project"`. Accepts `synthesizes: [childId, ...]` for the `conclusion` type.
+- `memory_recall(scope, query, ...)` — defaults `scope: "all"` (project hits first, then global). Hybrid FTS5 + cosine; falls back to FTS5 when `KIMI_MEMORY_EMBEDDINGS=off` or the model fails to load.
 - `memory_list(scope, ...)` — defaults `scope: "all"`.
 - `memory_get(scope, id)` — defaults `scope: "all"` (project first, then global).
 - `memory_update(scope, id, ...)` — defaults `scope: "project"` (must be explicit for global).
 - `memory_delete(scope, id, hard?)` — defaults `scope: "project"` (must be explicit for global).
 - `memory_save_bulk(scope, items)` — defaults `scope: "project"`. Atomic batch save (1–500 items, single transaction, all-or-nothing).
 
+Similarity, edges, and synthesis:
+
+- `memory_similar(scope, id, limit?, threshold?)` — return memories closest to `id` by embedding cosine. `threshold` is the minimum cosine in `[0, 1]` (default `0.6`).
+- `memory_link(scope, from_id, to_id, kind, weight?)` — write a typed edge. `kind` is one of `related | supports | contradicts | supersedes | synthesizes`; `weight` is in `[0, 10]`, default `1.0`.
+- `memory_unlink(scope, edge_id)` — remove a previously written edge.
+- `memory_edges(scope, id, direction?, kind?)` — return edges where `id` is the source or target.
+- `memory_merge(scope, into_id, from_id, merged_content?, weight?)` — soft-supersede one memory into another; the source row is marked `superseded` and a `supersedes` edge is written.
+- `memory_reinforce(scope, id)` — bump a memory's `confidence` by `+0.05` and stamp `last_accessed_at = now`.
+- `memory_conclusions_for(scope, child_id, limit?)` — list `conclusion`-typed memories that synthesise `child_id`.
+- `memory_parents(scope, conclusion_id, limit?)` — list the underlying memories a `conclusion` was built from.
+
 Working memory (project-only):
+
 - `working_memory_set`, `working_memory_get`, `working_memory_clear`.
 
 Sessions (project-only):
+
 - `conversation_list`, `conversation_get`, `conversation_search`, `conversation_ingest`.
 
 Aggregate:
+
 - `memory_status` — returns project durable counts plus a parallel `global.memories` summary.
 
 ## Typical flow

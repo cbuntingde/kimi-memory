@@ -12,7 +12,11 @@ const pluginRoot = path.resolve(path.dirname(__filename), '..', '..');
 
 // Pin cwd to the plugin root so all relative paths (assets, default
 // kimi-home probe) resolve consistently.
-try { process.chdir(pluginRoot); } catch { /* ignore */ }
+try {
+  process.chdir(pluginRoot);
+} catch {
+  /* ignore */
+}
 
 const { server } = makeServer({ pluginRootDir: pluginRoot });
 
@@ -20,6 +24,10 @@ const transport = new StdioServerTransport();
 server.connect(transport).catch((err) => {
   // Fail open: print to stderr and exit non-zero only when the transport
   // is genuinely unusable. MCP surfaces errors to the client anyway.
-  try { process.stderr.write('[kimi-memory] connect failed: ' + (err && err.message) + '\n'); } catch { /* ignore */ }
+  try {
+    process.stderr.write('[kimi-memory] connect failed: ' + (err && err.message) + '\n');
+  } catch {
+    /* ignore */
+  }
   process.exit(1);
 });

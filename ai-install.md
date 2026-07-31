@@ -1,12 +1,12 @@
 # ai-install.md
 
 Agent-facing install procedure for the **kimi-memory** plugin (managed-copy
-id `project-memory`). Run every step end-to-end before reporting success;
+id `kimi-memory`). Run every step end-to-end before reporting success;
 partial installs leave the Skill and MCP missing. Do not ask the human to
 click anything — type the slash commands into the Kimi chat input yourself.
 
 The plugin source is this directory. Its `name` in the manifest is
-`kimi-memory`; Kimi stores the install under `$KIMI_CODE_HOME/plugins/managed/project-memory/`.
+`kimi-memory`; Kimi stores the install under `$KIMI_CODE_HOME/plugins/managed/kimi-memory/`.
 
 ## 0. Scope of this doc
 
@@ -41,28 +41,35 @@ If any check fails, stop. There is no install to do on a host without
 You need a directory containing both `kimi.plugin.json` and `package.json`.
 Three forms are accepted by `/plugins install`:
 
-| Form | Example | When |
-|---|---|---|
-| Local directory | `/abs/path/to/project-memory` | Working tree, branch checkout. |
-| GitHub repo | `https://github.com/<owner>/<repo>` | No clone — Kimi pulls source itself. Falls back to default branch if no release. |
-| Pinned ref | `…/tree/<ref>`, `…/releases/tag/<tag>`, `…/commit/<sha>` | When the user pinned a version. |
+| Form            | Example                                                  | When                                                                             |
+| --------------- | -------------------------------------------------------- | -------------------------------------------------------------------------------- |
+| Local directory | `/abs/path/to/kimi-memory`                               | Working tree, branch checkout.                                                   |
+| GitHub repo     | `https://github.com/<owner>/<repo>`                      | No clone — Kimi pulls source itself. Falls back to default branch if no release. |
+| Pinned ref      | `…/tree/<ref>`, `…/releases/tag/<tag>`, `…/commit/<sha>` | When the user pinned a version.                                                  |
 
 For local installs, resolve to an **absolute** path. Kimi rejects relative
 paths and silently skips the install if the resolved manifest is missing.
 
 ## 3. Install dependencies
 
-Inside the source directory:
-
-```bash
-npm install
-```
-
-This is mandatory even when installing from a GitHub URL: Kimi copies
-the source into `plugins/managed/project-memory/` but does not run
+`npm install` is mandatory so the MCP server can resolve its runtime
+modules (`@modelcontextprotocol/sdk`, `@huggingface/transformers`, `zod`)
+and the plugin's hook scripts can import them. Kimi does not run
 `npm install` for you. Without `node_modules/`, the MCP server fails to
 start with `Cannot find module '@modelcontextprotocol/sdk'`, which
 surfaces only after `/reload` and looks like a manifest bug.
+
+The flow differs by install source:
+
+- **Local checkout** — `cd /abs/path/to/kimi-memory && npm install`, then
+  `/plugins install /abs/path/to/kimi-memory`. Re-running `npm install`
+  after source changes is unnecessary; the next `/reload` re-evaluates
+  the managed copy.
+- **GitHub URL** — `/plugins install https://github.com/<owner>/<repo>`
+  first (Kimi copies the source into `plugins/managed/kimi-memory/`),
+  then `cd "$KIMI_CODE_HOME/plugins/managed/kimi-memory"` and
+  `npm ci` (or `npm install` if there is no `package-lock.json`),
+  then `/reload`.
 
 ## 4. Self-check
 
@@ -88,7 +95,7 @@ node -e '
     ? process.env.KIMI_CODE_HOME + "/plugins/installed.json"
     : require("os").homedir() + "/.kimi-code/plugins/installed.json", "utf8");
   const p = JSON.parse(raw);
-  const hit = (p.plugins || []).find(x => x.id === "project-memory");
+  const hit = (p.plugins || []).find(x => x.id === "kimi-memory");
   process.stdout.write(hit ? JSON.stringify(hit) : "null");
 '
 ```
@@ -120,7 +127,7 @@ a trust prompt that defaults to **Cancel**. Pick the affirmative option
 A `Cancel` lands you with a half-install that the manager reports as
 "Removed" — if you see that, just re-run the slash.
 
-After install, Kimi prints the plugin id (`project-memory`) and a
+After install, Kimi prints the plugin id (`kimi-memory`) and a
 one-line summary. Capture both for the verification step.
 
 ## 7. Enable
@@ -129,7 +136,7 @@ one-line summary. Capture both for the verification step.
 or the install reversed:
 
 ```
-/plugins enable project-memory
+/plugins enable kimi-memory
 ```
 
 The `Installed` tab also exposes a `Space`-to-toggle handler; the slash
@@ -151,9 +158,9 @@ and is idempotent.
 ## 9. Verify — every box must pass
 
 1. **Record present and enabled.** Re-run the `node -e …` snippet from
-   step 5 and confirm `id: "project-memory"`, `enabled: true`, and
-   `root` pointing at `$KIMI_CODE_HOME/plugins/managed/project-memory`.
-2. **Manifest clean.** Run `/plugins info project-memory`. A clean
+   step 5 and confirm `id: "kimi-memory"`, `enabled: true`, and
+   `root` pointing at `$KIMI_CODE_HOME/plugins/managed/kimi-memory`.
+2. **Manifest clean.** Run `/plugins info kimi-memory`. A clean
    install prints the interface metadata with no diagnostic block.
    Common diagnostics and their meaning:
    - `Path escapes plugin root` → a declared `mcpServers.cwd` or
@@ -162,7 +169,7 @@ and is idempotent.
    - `Manifest not found` → the managed copy lost its `kimi.plugin.json`
      during a partial copy. Reinstall.
 3. **MCP server live.** The tool list now contains names starting with
-   `mcp__plugin-project-memory_kimi-memory__`. If absent, the reload
+   `mcp__plugin-kimi-memory_kimi-memory__`. If absent, the reload
    did not land — repeat step 8 from a fresh slash.
 4. **Read works.** Call `memory_status` with the active project root
    as `cwd`. A `memories.total: 0` payload confirms the SQLite layer
@@ -200,16 +207,17 @@ travels as provenance context, never as the storage target.
 
 ## Troubleshooting
 
-| Symptom | Cause | Fix |
-|---|---|---|
-| `/plugins install` exits with no record after a trust prompt | The trust prompt defaults to Cancel; you picked the wrong button | Re-run the slash and pick the affirmative option this time. |
-| `Module not found: @modelcontextprotocol/sdk` in MCP logs | Forgot `npm install` in the source dir | Step 3, then `/reload`. |
-| `/plugins info` shows `Path escapes plugin root` | A `cwd` or `command` in the manifest resolves outside the plugin root | Edit the manifest — paths must stay inside `kimi.plugin.json`'s directory. |
-| `memory_status` returns `Tool not found` | Reload did not run, or the MCP got disabled | `/plugins mcp enable project-memory kimi-memory`, then `/reload`. |
-| Hook stdout is silent | Hooks fail-open by design — silent on success is normal | Check `$KIMI_CODE_HOME/kimi-memory/_diagnostics/hooks.log` for the full transcript. |
-| Project memory mixes with another project | Two repos canonicalise to the same root | By design — same key → same DB. Distinguish the roots. |
-| `_global` rows leak into project reads | A read was issued with `scope: "all"` and global hits joined the list | Re-issue with `scope: "project"`. |
-| Stale managed copy (source drifted, `/plugins install` no-ops) | Kimi's installer skips when the source path matches the existing managed copy | Remove the record first: `node -e '…'` to mutate `installed.json`, set `enabled: false`, then reinstall. Prefer updating the source and leaving the managed copy alone — re-installing copies every time. |
+| Symptom                                                        | Cause                                                                                                                                                                                           | Fix                                                                                                                                                                                                                           |
+| -------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `/plugins install` exits with no record after a trust prompt   | The trust prompt defaults to Cancel; you picked the wrong button                                                                                                                                | Re-run the slash and pick the affirmative option this time.                                                                                                                                                                   |
+| `Module not found: @modelcontextprotocol/sdk` in MCP logs      | Forgot `npm install` in the source dir                                                                                                                                                          | Step 3, then `/reload`.                                                                                                                                                                                                       |
+| `/plugins info` shows `Path escapes plugin root`               | A `cwd` or `command` in the manifest resolves outside the plugin root                                                                                                                           | Edit the manifest — paths must stay inside `kimi.plugin.json`'s directory.                                                                                                                                                    |
+| `memory_status` returns `Tool not found`                       | Reload did not run, or the MCP got disabled                                                                                                                                                     | `/plugins mcp enable kimi-memory kimi-memory`, then `/reload`.                                                                                                                                                                |
+| Hook stdout is silent                                          | Hooks fail-open by design — silent on success is normal for `Stop` / `SessionEnd` / `PreCompact` / `Interrupt` / `StopFailure`; `SessionStart` and `UserPromptSubmit` always emit a status line | Check `$KIMI_CODE_HOME/kimi-memory/_diagnostics/hooks.log` for the runner and `<plugin-root>/_diagnostics/advisor-hooks.log` for the advisor detector. If a `UserPromptSubmit` is silent, the hook payload was missing `cwd`. |
+| Auto-extraction makes an outbound LLM call on every `Stop`     | Default behaviour — the extractor sends a short prompt to the configured provider                                                                                                               | Set `KIMI_MEMORY_AUTO_EXTRACT=off` in the environment, or add `[kimi-memory] disable_auto_extract = true` to `$KIMI_CODE_HOME/config.toml`.                                                                                   |
+| Project memory mixes with another project                      | Two repos canonicalise to the same root                                                                                                                                                         | By design — same key → same DB. Distinguish the roots.                                                                                                                                                                        |
+| `_global` rows leak into project reads                         | A read was issued with `scope: "all"` and global hits joined the list                                                                                                                           | Re-issue with `scope: "project"`.                                                                                                                                                                                             |
+| Stale managed copy (source drifted, `/plugins install` no-ops) | Kimi's installer skips when the source path matches the existing managed copy                                                                                                                   | Run `/plugins remove kimi-memory` followed by `/plugins install <path-or-url>`, then `/reload`. Direct edits to `$KIMI_CODE_HOME/plugins/installed.json` are not supported.                                                   |
 
 ## What this plugin does NOT do
 
@@ -234,3 +242,5 @@ travels as provenance context, never as the storage target.
 - Plugin manifest: `kimi.plugin.json`
 - Storage layout (project + global DBs, diagnostics log):
   `README.md` § "Storage and privacy"
+- Complete uninstall (managed copy, memory databases, model cache):
+  `uninstall.md`

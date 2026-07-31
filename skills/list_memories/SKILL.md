@@ -16,6 +16,7 @@ If the user explicitly asks for one scope, pass it through:
 - "list memories" (unqualified) → `scope: "all"`.
 
 Natural-language triggers include:
+
 - "list memories"
 - "show project memory"
 - "what do you remember about this project"

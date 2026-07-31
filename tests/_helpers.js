@@ -1,16 +1,34 @@
 // Test helpers shared across files. Temp-dir creation, MCP stdio
 // harness, and a few utility functions.
-import { mkdtempSync, writeFileSync, readFileSync, existsSync, mkdirSync, rmSync, statSync } from 'node:fs';
+import {
+  mkdtempSync,
+  writeFileSync,
+  readFileSync,
+  existsSync,
+  mkdirSync,
+  rmSync,
+  statSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 
+// Tests opt out of embedding by default — we don't want the suite to
+// hit Hugging Face to download the model on every CI run. Tests that
+// specifically exercise embedding logic should set
+// `process.env.KIMI_MEMORY_EMBEDDINGS = 'on'` before importing.
+if (!('KIMI_MEMORY_EMBEDDINGS' in process.env)) {
+  process.env.KIMI_MEMORY_EMBEDDINGS = 'off';
+}
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const PLUGIN_ROOT = path.resolve(__dirname, '..');
 
-export function pluginRoot() { return PLUGIN_ROOT; }
+export function pluginRoot() {
+  return PLUGIN_ROOT;
+}
 
 export function mkTempHome(prefix = 'pm-test-') {
   const dir = mkdtempSync(path.join(tmpdir(), prefix));
@@ -18,7 +36,11 @@ export function mkTempHome(prefix = 'pm-test-') {
 }
 
 export function rmRf(dir) {
-  try { rmSync(dir, { recursive: true, force: true }); } catch { /* ignore */ }
+  try {
+    rmSync(dir, { recursive: true, force: true });
+  } catch {
+    /* ignore */
+  }
 }
 
 // Spawn the MCP server in a child process with KIMI_CODE_HOME set to
@@ -44,11 +66,19 @@ export class StdioMcp {
       stdio: ['pipe', 'pipe', 'pipe'],
     });
     this.proc.stdout.on('data', (chunk) => this._onStdout(chunk));
-    this.proc.stderr.on('data', (chunk) => { this.stderr += chunk.toString('utf8'); });
-    this.proc.on('error', () => { /* ignore */ });
+    this.proc.stderr.on('data', (chunk) => {
+      this.stderr += chunk.toString('utf8');
+    });
+    this.proc.on('error', () => {
+      /* ignore */
+    });
   }
   stop() {
-    try { this.proc && this.proc.kill(); } catch { /* ignore */ }
+    try {
+      this.proc && this.proc.kill();
+    } catch {
+      /* ignore */
+    }
   }
   _onStdout(chunk) {
     this.buf = Buffer.concat([this.buf, chunk]);
@@ -59,7 +89,11 @@ export class StdioMcp {
       this.buf = this.buf.slice(newline + 1);
       if (!body) continue;
       let msg;
-      try { msg = JSON.parse(body); } catch { continue; }
+      try {
+        msg = JSON.parse(body);
+      } catch {
+        continue;
+      }
       this.stdoutLog += body + '\n';
       if (msg.id != null && (msg.result !== undefined || msg.error !== undefined)) {
         const r = this.pending.get(msg.id);
@@ -69,7 +103,11 @@ export class StdioMcp {
           else r.resolve(msg.result);
         }
       } else if (msg.method && this.onNotification) {
-        try { this.onNotification(msg); } catch { /* ignore */ }
+        try {
+          this.onNotification(msg);
+        } catch {
+          /* ignore */
+        }
       }
     }
   }
@@ -105,6 +143,10 @@ export function readText(file) {
   return readFileSync(file, 'utf8');
 }
 
-export function exists(file) { return existsSync(file); }
+export function exists(file) {
+  return existsSync(file);
+}
 
-export function stat(file) { return statSync(file); }
+export function stat(file) {
+  return statSync(file);
+}

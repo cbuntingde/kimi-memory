@@ -1,9 +1,15 @@
 // Input validation shared between MCP tools and tests.
 import { canonicalizeRoot } from './project-key.js';
 
-const TYPES = new Set(['working', 'episodic', 'semantic', 'procedural']);
+const TYPES = new Set(['working', 'episodic', 'semantic', 'procedural', 'conclusion']);
 const STATUSES = new Set(['active', 'superseded', 'deleted']);
-const SLOTS = new Set(['current_focus', 'active_task', 'recent_decision', 'context_note', 'open_questions']);
+const SLOTS = new Set([
+  'current_focus',
+  'active_task',
+  'recent_decision',
+  'context_note',
+  'open_questions',
+]);
 const CONV_ROLES = new Set(['user', 'assistant', 'tool', 'system']);
 
 // Memory scope vocabulary. Read tools (memory_recall/list/get) accept
@@ -42,7 +48,8 @@ export function validateType(v) {
 
 export function validateStatus(v) {
   if (v == null) return { ok: true, value: 'active' };
-  if (!STATUSES.has(v)) return { ok: false, error: `status must be one of: ${[...STATUSES].join(', ')}` };
+  if (!STATUSES.has(v))
+    return { ok: false, error: `status must be one of: ${[...STATUSES].join(', ')}` };
   return { ok: true, value: v };
 }
 
@@ -54,28 +61,32 @@ export function validateSlot(v) {
 
 export function validateRole(v) {
   if (v == null) return { ok: true, value: null };
-  if (!CONV_ROLES.has(v)) return { ok: false, error: `role must be one of: ${[...CONV_ROLES].join(', ')}` };
+  if (!CONV_ROLES.has(v))
+    return { ok: false, error: `role must be one of: ${[...CONV_ROLES].join(', ')}` };
   return { ok: true, value: v };
 }
 
 export function validateConfidence(v) {
   if (v == null) return { ok: true, value: 0.8 };
   const n = Number(v);
-  if (!Number.isFinite(n) || n < 0 || n > 1) return { ok: false, error: 'confidence must be a number in [0, 1]' };
+  if (!Number.isFinite(n) || n < 0 || n > 1)
+    return { ok: false, error: 'confidence must be a number in [0, 1]' };
   return { ok: true, value: n };
 }
 
 export function validateLimit(v, lo, hi, fallback) {
   if (v == null) return { ok: true, value: fallback };
   const n = Number(v);
-  if (!Number.isFinite(n) || n < lo || n > hi) return { ok: false, error: `limit must be an integer in [${lo}, ${hi}]` };
+  if (!Number.isFinite(n) || n < lo || n > hi)
+    return { ok: false, error: `limit must be an integer in [${lo}, ${hi}]` };
   return { ok: true, value: Math.trunc(n) };
 }
 
 export function validateOffset(v) {
   if (v == null) return { ok: true, value: 0 };
   const n = Number(v);
-  if (!Number.isFinite(n) || n < 0) return { ok: false, error: 'offset must be a non-negative integer' };
+  if (!Number.isFinite(n) || n < 0)
+    return { ok: false, error: 'offset must be a non-negative integer' };
   return { ok: true, value: Math.trunc(n) };
 }
 
@@ -94,7 +105,8 @@ export function validateTags(v) {
 
 export function validateMetadata(v) {
   if (v == null) return { ok: true, value: {} };
-  if (typeof v !== 'object' || Array.isArray(v)) return { ok: false, error: 'metadata must be an object' };
+  if (typeof v !== 'object' || Array.isArray(v))
+    return { ok: false, error: 'metadata must be an object' };
   return { ok: true, value: v };
 }
 
@@ -106,12 +118,14 @@ export function validateExpiresAt(v) {
   if (v == null || v === '') return { ok: true, value: null };
   if (typeof v !== 'string') return { ok: false, error: 'expires_at must be an ISO-8601 string' };
   const t = Date.parse(v);
-  if (Number.isNaN(t)) return { ok: false, error: 'expires_at must be a parseable ISO-8601 string' };
+  if (Number.isNaN(t))
+    return { ok: false, error: 'expires_at must be a parseable ISO-8601 string' };
   return { ok: true, value: new Date(t).toISOString() };
 }
 
 export function validateId(v) {
-  if (typeof v !== 'string' || v.length < 4 || v.length > 64) return { ok: false, error: 'id must be a 4-64 char string' };
+  if (typeof v !== 'string' || v.length < 4 || v.length > 64)
+    return { ok: false, error: 'id must be a 4-64 char string' };
   return { ok: true, value: v };
 }
 
@@ -133,6 +147,55 @@ export function validateScope(v, { read = false } = {}) {
   return { ok: true, value: v };
 }
 
+// Edge kind vocabulary. Mirrors persist.js EDGE_KINDS so validators and
+// runtime share one source of truth.
+const EDGE_KINDS = new Set(['related', 'supports', 'contradicts', 'supersedes', 'synthesizes']);
+
+export function validateEdgeKind(v) {
+  if (v == null) return { ok: false, error: 'kind is required' };
+  if (!EDGE_KINDS.has(v))
+    return { ok: false, error: `kind must be one of: ${[...EDGE_KINDS].join(', ')}` };
+  return { ok: true, value: v };
+}
+
+const EDGE_DIRECTIONS = new Set(['out', 'in', 'both']);
+
+export function validateEdgeDirection(v) {
+  if (v == null) return { ok: true, value: 'both' };
+  if (!EDGE_DIRECTIONS.has(v))
+    return { ok: false, error: `direction must be one of: ${[...EDGE_DIRECTIONS].join(', ')}` };
+  return { ok: true, value: v };
+}
+
+export function validateWeight(v) {
+  if (v == null) return { ok: true, value: 1.0 };
+  const n = Number(v);
+  if (!Number.isFinite(n) || n < 0 || n > 10)
+    return { ok: false, error: 'weight must be a number in [0, 10]' };
+  return { ok: true, value: n };
+}
+
+// Auto-extract config under [kimi-memory] in config.toml. Currently a
+// single boolean (disable_auto_extract). Validated shape-only — the
+// extractor reads the parsed config directly, but consumers of the MCP
+// tool surface can ask `validateAutoExtractConfig(cfg)` to surface a
+// friendly error rather than a runtime misfire.
+export function validateAutoExtractConfig(cfg) {
+  if (!cfg || typeof cfg !== 'object') return { ok: true, value: {} };
+  const km = cfg['kimi-memory'];
+  if (!km || typeof km !== 'object') return { ok: true, value: {} };
+  if ('disable_auto_extract' in km) {
+    if (typeof km.disable_auto_extract !== 'boolean') {
+      return { ok: false, error: 'kimi-memory.disable_auto_extract must be a boolean' };
+    }
+  }
+  return { ok: true, value: { disable_auto_extract: km.disable_auto_extract === true } };
+}
+
 export function toError(error) {
-  return { ok: false, error: typeof error === 'string' ? error : (error && error.message) ? error.message : 'unknown error' };
+  return {
+    ok: false,
+    error:
+      typeof error === 'string' ? error : error && error.message ? error.message : 'unknown error',
+  };
 }

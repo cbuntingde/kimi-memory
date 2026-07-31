@@ -40,8 +40,12 @@ export function classifyEvent(parsed) {
   if (parsed.type === 'turn.prompt') return { role: 'user', kind: 'message' };
   if (parsed.type === 'context.append_loop_event' && parsed.event) {
     const eventType = parsed.event.type || 'loop_event';
-    const role = eventType === 'tool.call' || eventType === 'tool.result' ? 'tool' :
-      eventType === 'content.part' ? 'assistant' : null;
+    const role =
+      eventType === 'tool.call' || eventType === 'tool.result'
+        ? 'tool'
+        : eventType === 'content.part'
+          ? 'assistant'
+          : null;
     return { role, kind: eventType.replaceAll('.', '_') };
   }
   const kind = pickString(parsed.kind, parsed.type, parsed.event, parsed.role) || 'message';
@@ -52,11 +56,13 @@ export function classifyEvent(parsed) {
 function contentText(content) {
   if (typeof content === 'string') return content;
   if (!Array.isArray(content)) return null;
-  const text = content.map((part) => {
-    if (typeof part === 'string') return part;
-    if (!part || typeof part !== 'object') return '';
-    return part.text || part.content || '';
-  }).join('');
+  const text = content
+    .map((part) => {
+      if (typeof part === 'string') return part;
+      if (!part || typeof part !== 'object') return '';
+      return part.text || part.content || '';
+    })
+    .join('');
   return text || null;
 }
 
@@ -69,8 +75,10 @@ export function extractSummary(parsed) {
   if (parsed.type === 'context.append_loop_event' && parsed.event) {
     const event = parsed.event;
     if (event.type === 'content.part') return contentText([event.part]);
-    if (event.type === 'tool.call') return `[tool_call] ${event.name || 'unknown'}(${truncate(JSON.stringify(event.args || {}), 240)})`;
-    if (event.type === 'tool.result') return `[tool_result] ${truncate(JSON.stringify(event.result || {}), 240)}`;
+    if (event.type === 'tool.call')
+      return `[tool_call] ${event.name || 'unknown'}(${truncate(JSON.stringify(event.args || {}), 240)})`;
+    if (event.type === 'tool.result')
+      return `[tool_result] ${truncate(JSON.stringify(event.result || {}), 240)}`;
   }
   // Try common text paths used by agent protocols.
   const fromMessage = parsed.message;
@@ -80,7 +88,9 @@ export function extractSummary(parsed) {
       contentText(fromMessage.content),
       fromMessage.text,
       fromMessage.summary,
-      fromMessage.parts && Array.isArray(fromMessage.parts) ? fromMessage.parts.map((p) => (typeof p === 'string' ? p : (p && p.text) || '')).join('') : null
+      fromMessage.parts && Array.isArray(fromMessage.parts)
+        ? fromMessage.parts.map((p) => (typeof p === 'string' ? p : (p && p.text) || '')).join('')
+        : null,
     );
     if (text) return text;
   }
@@ -126,11 +136,15 @@ export async function findSessionDir(kimiHomeDir, workDirKey, sessionId) {
   try {
     const stat = await fs.stat(path.join(base, 'wire.jsonl'));
     if (stat.isFile()) return path.dirname(stat.parentPath || path.join(base));
-  } catch { /* ignore */ }
+  } catch {
+    /* ignore */
+  }
   try {
     const stat = await fs.stat(base);
     if (stat.isDirectory()) return base;
-  } catch { /* ignore */ }
+  } catch {
+    /* ignore */
+  }
   return null;
 }
 
@@ -161,7 +175,12 @@ function looksLikeSessionId(name) {
   return /^[A-Za-z0-9_-]+$/.test(name);
 }
 
-export async function locateSessionArchive(kimiHomeDir, workDirKey, sessionId, { extraRoots = [] } = {}) {
+export async function locateSessionArchive(
+  kimiHomeDir,
+  workDirKey,
+  sessionId,
+  { extraRoots = [] } = {},
+) {
   if (!sessionId) return null;
   const roots = [];
   if (workDirKey) roots.push(path.join(kimiHomeDir, 'sessions', workDirKey, sessionId));
@@ -175,7 +194,9 @@ export async function locateSessionArchive(kimiHomeDir, workDirKey, sessionId, {
       try {
         const st = await fs.stat(cand);
         if (st.isFile()) return cand;
-      } catch { /* ignore */ }
+      } catch {
+        /* ignore */
+      }
     }
   }
   // If no work-dir key is known, consult the documented top-level index.
@@ -187,13 +208,19 @@ export async function locateSessionArchive(kimiHomeDir, workDirKey, sessionId, {
     });
     if (hit) {
       const indexedDir = hit.sessionDir || hit.session_dir;
-      if (indexedDir) roots.push(path.isAbsolute(indexedDir) ? indexedDir : path.join(kimiHomeDir, indexedDir));
+      if (indexedDir)
+        roots.push(path.isAbsolute(indexedDir) ? indexedDir : path.join(kimiHomeDir, indexedDir));
       const indexedKey = hit.workDirKey || hit.work_dir_key;
       if (indexedKey) roots.push(path.join(kimiHomeDir, 'sessions', indexedKey, sessionId));
       for (const r of roots) {
         for (const relative of relativeCandidates) {
           const cand = path.join(r, relative);
-          try { const st = await fs.stat(cand); if (st.isFile()) return cand; } catch { /* ignore */ }
+          try {
+            const st = await fs.stat(cand);
+            if (st.isFile()) return cand;
+          } catch {
+            /* ignore */
+          }
         }
       }
     }
@@ -210,7 +237,11 @@ export async function locateSessionArchive(kimiHomeDir, workDirKey, sessionId, {
 async function boundedFind(dir, sessionId, depth) {
   if (depth > MAX_DEPTH) return null;
   let entries;
-  try { entries = await fs.readdir(dir, { withFileTypes: true }); } catch { return null; }
+  try {
+    entries = await fs.readdir(dir, { withFileTypes: true });
+  } catch {
+    return null;
+  }
   let checked = 0;
   for (const e of entries) {
     if (checked++ > MAX_DIRS) break;
@@ -218,7 +249,12 @@ async function boundedFind(dir, sessionId, depth) {
     if (e.isDirectory() && e.name === sessionId) {
       for (const relative of ['wire.jsonl', path.join('agents', 'main', 'wire.jsonl')]) {
         const cand = path.join(full, relative);
-        try { const st = await fs.stat(cand); if (st.isFile()) return cand; } catch { /* ignore */ }
+        try {
+          const st = await fs.stat(cand);
+          if (st.isFile()) return cand;
+        } catch {
+          /* ignore */
+        }
       }
       return null;
     }
@@ -237,7 +273,18 @@ export async function* walkWire(filePath, startByte = 0, lineBase = 0) {
   for await (const ev of readJsonl(filePath, { startByte })) {
     if (ev.parsed == null) {
       // Preserve the raw line even when malformed.
-      yield { lineNo: lineBase + ev.n, byteOffset: ev.byteOffset, nextByteOffset: ev.nextByteOffset, raw: ev.raw, parsed: null, role: null, kind: 'malformed', summary: null, created_at: null, error: ev.error ? String(ev.error.message || ev.error) : 'parse error' };
+      yield {
+        lineNo: lineBase + ev.n,
+        byteOffset: ev.byteOffset,
+        nextByteOffset: ev.nextByteOffset,
+        raw: ev.raw,
+        parsed: null,
+        role: null,
+        kind: 'malformed',
+        summary: null,
+        created_at: null,
+        error: ev.error ? String(ev.error.message || ev.error) : 'parse error',
+      };
       continue;
     }
     const cls = classifyEvent(ev.parsed);

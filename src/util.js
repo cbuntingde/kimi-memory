@@ -32,7 +32,10 @@ export function kimiHome() {
 //      manifest's "cwd": "./" pins it) still finds its assets.
 export function pluginRoot(importMetaUrl) {
   if (process.env.KIMI_PLUGIN_ROOT) return path.resolve(process.env.KIMI_PLUGIN_ROOT);
-  if (importMetaUrl) return path.dirname(path.dirname(new URL(importMetaUrl).pathname.replace(/^\/([A-Za-z]:)/, '$1')));
+  if (importMetaUrl)
+    return path.dirname(
+      path.dirname(new URL(importMetaUrl).pathname.replace(/^\/([A-Za-z]:)/, '$1')),
+    );
   return process.cwd();
 }
 
@@ -60,7 +63,12 @@ export async function readStdin(limitBytes = 1024 * 1024) {
       chunks.push(c);
     });
     process.stdin.on('end', finish);
-    process.stdin.on('error', (e) => { if (!aborted) { aborted = true; reject(e); } });
+    process.stdin.on('error', (e) => {
+      if (!aborted) {
+        aborted = true;
+        reject(e);
+      }
+    });
   });
 }
 
@@ -90,7 +98,15 @@ export async function* readJsonl(filePath, { startByte = 0, signal } = {}) {
         lineNo += 1;
         const stripped = line.endsWith('\r') ? line.slice(0, -1) : line;
         const parsed = stripped.length === 0 ? null : safeJsonParse(stripped);
-        yield { line: stripped, n: lineNo, raw: stripped, parsed: parsed && parsed.ok ? parsed.value : null, error: parsed && !parsed.ok ? parsed.error : null, byteOffset: offset, nextByteOffset: offset + Buffer.byteLength(line, 'utf8') + 1 };
+        yield {
+          line: stripped,
+          n: lineNo,
+          raw: stripped,
+          parsed: parsed && parsed.ok ? parsed.value : null,
+          error: parsed && !parsed.ok ? parsed.error : null,
+          byteOffset: offset,
+          nextByteOffset: offset + Buffer.byteLength(line, 'utf8') + 1,
+        };
         offset += Buffer.byteLength(line, 'utf8') + 1;
       }
     }
@@ -98,10 +114,22 @@ export async function* readJsonl(filePath, { startByte = 0, signal } = {}) {
       lineNo += 1;
       const stripped = buf.endsWith('\r') ? buf.slice(0, -1) : buf;
       const parsed = stripped.length === 0 ? null : safeJsonParse(stripped);
-      yield { line: stripped, n: lineNo, raw: stripped, parsed: parsed && parsed.ok ? parsed.value : null, error: parsed && !parsed.ok ? parsed.error : null, byteOffset: offset, nextByteOffset: offset + Buffer.byteLength(buf, 'utf8') };
+      yield {
+        line: stripped,
+        n: lineNo,
+        raw: stripped,
+        parsed: parsed && parsed.ok ? parsed.value : null,
+        error: parsed && !parsed.ok ? parsed.error : null,
+        byteOffset: offset,
+        nextByteOffset: offset + Buffer.byteLength(buf, 'utf8'),
+      };
     }
   } finally {
-    try { await fh.close(); } catch { /* ignore */ }
+    try {
+      await fh.close();
+    } catch {
+      /* ignore */
+    }
   }
 }
 

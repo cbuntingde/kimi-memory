@@ -24,6 +24,7 @@ import {
 import {
   openDb,
   closeDb,
+  saveMemory,
   listMemories,
   searchMemories,
   listWorkingMemory,
@@ -33,12 +34,18 @@ import {
   recordConversationEvent,
   updateConversationProgress,
   upsertConversation,
+  decayMemories,
 } from '../persist.js';
 import { locateSessionArchive, walkWire, readSessionIndex } from '../wire.js';
+import { runAutoExtract } from '../extract.js';
+import { matchAdvisor, logAdvisorDiag } from '../advisor/detect.js';
 
-const EVENT = asString(process.env.PM_HOOK_EVENT) || 'unknown';
+const EVENT = asString(process.env.KM_HOOK_EVENT) || 'unknown';
 const HOME = kimiHome();
-const DIAG_DIR = path.join(HOME, 'kimi-memory', '_diagnostics');
+// Diagnostics live next to the plugin's own source tree so the plugin is
+// self-contained. `import.meta.dirname` of `src/hooks/run.js` resolves to
+// `.../plugins/managed/kimi-memory/src/hooks/`; walk up two levels.
+const DIAG_DIR = path.resolve(import.meta.dirname, '..', '..', '_diagnostics');
 const DIAG_LOG = path.join(DIAG_DIR, 'hooks.log');
 const DIAG_LOG_MAX_BYTES = 1024 * 1024; // 1 MiB before rotation.
 
@@ -53,12 +60,21 @@ const PROMPT_TOKEN_LIMIT = 6;
 // Field names Kimi has used across versions for the project's working
 // directory in hook payloads. Keep them in one place so payloadProjectRoot
 // stays the single point that knows about historical renames.
-const PAYLOAD_CWD_KEYS = ['cwd', 'workdir', 'workDir', 'project_root', 'projectRoot', 'workspace', 'cwd_path'];
+const PAYLOAD_CWD_KEYS = [
+  'cwd',
+  'workdir',
+  'workDir',
+  'project_root',
+  'projectRoot',
+  'workspace',
+  'cwd_path',
+];
 const PAYLOAD_SESSION_KEYS = ['session_id', 'sessionId', 'session', 'id'];
 const PAYLOAD_PROMPT_KEYS = ['prompt', 'user_prompt', 'text', 'input'];
 
 async function logDiag(level, message, extra) {
-  const line = JSON.stringify({ ts: nowIso(), event: EVENT, level, message, ...(extra || {}) }) + '\n';
+  const line =
+    JSON.stringify({ ts: nowIso(), event: EVENT, level, message, ...(extra || {}) }) + '\n';
   try {
     await fs.mkdir(DIAG_DIR, { recursive: true });
     // Rotate when the file gets too large. The rotation is atomic
@@ -67,13 +83,23 @@ async function logDiag(level, message, extra) {
     try {
       const st = await fs.stat(DIAG_LOG);
       if (st.size >= DIAG_LOG_MAX_BYTES) {
-        await fs.rename(DIAG_LOG, DIAG_LOG + '.1').catch(() => { /* ignore */ });
+        await fs.rename(DIAG_LOG, DIAG_LOG + '.1').catch(() => {
+          /* ignore */
+        });
       }
-    } catch { /* missing file is fine */ }
+    } catch {
+      /* missing file is fine */
+    }
     await fs.appendFile(DIAG_LOG, line, 'utf8');
-  } catch { /* ignore */ }
+  } catch {
+    /* ignore */
+  }
   if (level === 'error') {
-    try { process.stderr.write('[kimi-memory:hook:' + EVENT + '] ' + message + '\n'); } catch { /* ignore */ }
+    try {
+      process.stderr.write('[kimi-memory:hook:' + EVENT + '] ' + message + '\n');
+    } catch {
+      /* ignore */
+    }
   }
 }
 
@@ -135,7 +161,7 @@ function truncate(s, n) {
 // Irregular plurals are passed explicitly; everything else takes the
 // default "s" suffix.
 function pluralize(n, singular, plural) {
-  return `${n} ${n === 1 ? singular : (plural || singular + 's')}`;
+  return `${n} ${n === 1 ? singular : plural || singular + 's'}`;
 }
 
 function derivePromptTokens(prompt) {
@@ -163,13 +189,29 @@ function buildCounts({ projectDb, globalDb, key }) {
   const project = projectDb ? memoryCounts(projectDb, key) : zeroCounts();
   const global = globalDb ? memoryCounts(globalDb, GLOBAL_PROJECT_KEY) : zeroCounts();
   const wm = projectDb ? listWorkingMemory(projectDb, key) : [];
-  const conv = projectDb ? projectDb.prepare("SELECT COUNT(*) AS n FROM conversations WHERE project_key=?").get(key).n : 0;
-  const events = projectDb ? projectDb.prepare("SELECT COUNT(*) AS n FROM conversation_events WHERE project_key=?").get(key).n : 0;
+  const conv = projectDb
+    ? projectDb.prepare('SELECT COUNT(*) AS n FROM conversations WHERE project_key=?').get(key).n
+    : 0;
+  const events = projectDb
+    ? projectDb
+        .prepare('SELECT COUNT(*) AS n FROM conversation_events WHERE project_key=?')
+        .get(key).n
+    : 0;
   return { project, global, wm, conv, events };
 }
 
 function zeroCounts() {
-  return { total: 0, active: 0, retained: 0, expired: 0, superseded: 0, deleted: 0, by_type: {}, by_status: {}, latest_update_at: null };
+  return {
+    total: 0,
+    active: 0,
+    retained: 0,
+    expired: 0,
+    superseded: 0,
+    deleted: 0,
+    by_type: {},
+    by_status: {},
+    latest_update_at: null,
+  };
 }
 
 function buildStatusLine({ event, key, cwd, counts, ingest, recall }) {
@@ -189,8 +231,12 @@ function buildStatusLine({ event, key, cwd, counts, ingest, recall }) {
 }
 
 function buildRecentSummary(projectDb, globalDb, key) {
-  const projectRecent = projectDb ? listMemories(projectDb, key, { limit: STATUS_RECENT_MEMORIES }) : [];
-  const globalRecent = globalDb ? listMemories(globalDb, GLOBAL_PROJECT_KEY, { limit: STATUS_RECENT_GLOBAL }) : [];
+  const projectRecent = projectDb
+    ? listMemories(projectDb, key, { limit: STATUS_RECENT_MEMORIES })
+    : [];
+  const globalRecent = globalDb
+    ? listMemories(globalDb, GLOBAL_PROJECT_KEY, { limit: STATUS_RECENT_GLOBAL })
+    : [];
   const total = projectRecent.length + globalRecent.length;
   if (total === 0) return 'No recent memories.';
   const parts = [];
@@ -205,14 +251,18 @@ function buildWorkingMemoryPreview(projectDb, key) {
   return slots.map((s) => `- WM ${s.slot}: ${truncate(s.value, 200)}`);
 }
 
-function buildRecallSummary({ projectDb, globalDb, key, prompt }) {
+async function buildRecallSummary({ projectDb, globalDb, key, prompt }) {
   const tokens = derivePromptTokens(prompt);
   if (tokens.length === 0) return { summary: null, projectHits: 0, globalHits: 0, query: '' };
   const query = tokens.join(' ');
   let projectHits = [];
   let globalHits = [];
-  if (projectDb) projectHits = searchMemories(projectDb, key, query, { limit: PROMPT_RECALL_LIMIT });
-  if (globalDb) globalHits = searchMemories(globalDb, GLOBAL_PROJECT_KEY, query, { limit: PROMPT_RECALL_LIMIT });
+  if (projectDb)
+    projectHits = await searchMemories(projectDb, key, query, { limit: PROMPT_RECALL_LIMIT });
+  if (globalDb)
+    globalHits = await searchMemories(globalDb, GLOBAL_PROJECT_KEY, query, {
+      limit: PROMPT_RECALL_LIMIT,
+    });
   const total = projectHits.length + globalHits.length;
   let summary;
   if (total === 0) {
@@ -228,7 +278,11 @@ function buildRecallSummary({ projectDb, globalDb, key, prompt }) {
 
 function emitLines(lines) {
   if (!lines || lines.length === 0) return;
-  try { process.stdout.write(lines.join('\n') + '\n'); } catch { /* ignore */ }
+  try {
+    process.stdout.write(lines.join('\n') + '\n');
+  } catch {
+    /* ignore */
+  }
 }
 
 // ---- Handlers ----
@@ -245,6 +299,18 @@ async function handleSessionStart(payload) {
   const globalDbPath2 = path.join(HOME, 'kimi-memory', '_global', 'memory.sqlite');
   const projectDb = safeOpenDb(projectDbPath);
   const globalDb = safeOpenDb(globalDbPath2);
+  // Decay pass on the project DB: the only mutating action at
+  // SessionStart. Runs once per SessionStart, idempotent (re-running
+  // on already-decayed rows is a no-op). Failures are logged but
+  // never block the status emit below.
+  let decay = null;
+  if (projectDb) {
+    try {
+      decay = decayMemories(projectDb, key);
+    } catch (e) {
+      decay = { error: e && e.message };
+    }
+  }
   const counts = buildCounts({ projectDb, globalDb, key });
   const recentSummary = buildRecentSummary(projectDb, globalDb, key);
   const lines = [];
@@ -253,7 +319,8 @@ async function handleSessionStart(payload) {
   const wm = buildWorkingMemoryPreview(projectDb, key);
   for (const l of wm) lines.push(l);
   emitLines(lines);
-  return { ok: true, key, counts, recent: recentSummary, wm: wm.length, ingest };
+  if (decay) await logDiag('info', 'decay pass result', { key, decay });
+  return { ok: true, key, counts, recent: recentSummary, wm: wm.length, ingest, decay };
 }
 
 async function handleUserPromptSubmit(payload) {
@@ -269,20 +336,66 @@ async function handleUserPromptSubmit(payload) {
   const globalDb = safeOpenDb(globalDbPath2);
   const counts = buildCounts({ projectDb, globalDb, key });
   const prompt = payloadPrompt(payload);
-  const recall = buildRecallSummary({ projectDb, globalDb, key, prompt });
+  const recall = await buildRecallSummary({ projectDb, globalDb, key, prompt });
+  // Advisor keyword detection runs here, in-process, on the same payload
+  // the memory recall just used. One matched keyword → one extra stdout
+  // line so the agent knows to consider loading skill `advisor`. No-match
+  // is silent. Detection is fail-open: any error is logged and ignored.
+  let advisorMatch = null;
+  try {
+    advisorMatch = matchAdvisor(prompt);
+  } catch (e) {
+    logAdvisorDiag('matchAdvisor threw: ' + (e && e.message));
+  }
   const lines = [];
-  lines.push(buildStatusLine({ event: 'UserPromptSubmit', key, cwd, counts, ingest, recall: { project: recall.projectHits, global: recall.globalHits } }));
+  lines.push(
+    buildStatusLine({
+      event: 'UserPromptSubmit',
+      key,
+      cwd,
+      counts,
+      ingest,
+      recall: { project: recall.projectHits, global: recall.globalHits },
+    }),
+  );
   if (recall.summary) lines.push(recall.summary);
+  if (advisorMatch) {
+    lines.push(
+      `[advisor] matched: "${advisorMatch}" — /advisor or ask naturally; skill \`advisor\` is loaded`,
+    );
+  }
   const wm = buildWorkingMemoryPreview(projectDb, key);
   for (const l of wm) lines.push(l);
   emitLines(lines);
-  return { ok: true, key, counts, ingest, recall_hits: { project: recall.projectHits, global: recall.globalHits } };
+  return {
+    ok: true,
+    key,
+    counts,
+    ingest,
+    recall_hits: { project: recall.projectHits, global: recall.globalHits },
+    advisor: advisorMatch,
+  };
 }
 
 async function handleStop(payload) {
   const cwd = payloadProjectRoot(payload);
   if (!cwd) return { ok: false, reason: 'no project cwd in payload' };
-  return safeHandleStop(payload, cwd);
+  const sessionId = payloadSessionId(payload);
+  const ingest = await safeHandleStop(payload, cwd);
+  // Auto-extract piggybacks on the ingest pass: the conversation_events
+  // table is now up to date, so we can read the last few exchanges and
+  // ask the LLM whether anything durable is worth saving. Failures here
+  // are non-fatal — we never throw out of the hook.
+  let extract = null;
+  if (sessionId && ingest && ingest.ok !== false && !ingest.skipped) {
+    try {
+      extract = await handleAutoExtract(cwd, sessionId);
+    } catch (e) {
+      extract = { skipped: 'extract_threw', error: e && e.message };
+    }
+  }
+  if (extract) await logDiag('info', 'auto_extract result', { extract });
+  return { ok: true, ingest, extract };
 }
 
 async function safeHandleStop(payload, cwd) {
@@ -296,12 +409,20 @@ async function safeHandleStop(payload, cwd) {
   let wdk = prev.work_dir_key || null;
   if (!wdk) {
     const idx = await readSessionIndex(HOME);
-    const hit = idx.find((e) => e && (e.sessionId === sessionId || e.session_id === sessionId || e.id === sessionId));
+    const hit = idx.find(
+      (e) => e && (e.sessionId === sessionId || e.session_id === sessionId || e.id === sessionId),
+    );
     if (hit && (hit.work_dir_key || hit.workDirKey)) wdk = hit.work_dir_key || hit.workDirKey;
   }
   const archive = await locateSessionArchive(HOME, wdk, sessionId);
   if (!archive) {
-    return { ok: true, skipped: 'archive_not_found', session_id: sessionId, work_dir_key: wdk, project_key: key };
+    return {
+      ok: true,
+      skipped: 'archive_not_found',
+      session_id: sessionId,
+      work_dir_key: wdk,
+      project_key: key,
+    };
   }
   const db = openDb(path.join(HOME, 'kimi-memory', key, 'memory.sqlite'));
   upsertConversation(db, key, sessionId, cwd);
@@ -319,7 +440,13 @@ async function safeHandleStop(payload, cwd) {
     if (ev.created_at) lastEventAt = ev.created_at;
   }
   updateConversationProgress(db, key, sessionId, finalOffset, lineNo, lastEventAt);
-  state.sessions[sessionId] = { work_dir_key: wdk, byte_offset: finalOffset, line_count: lineNo, last_event_at: lastEventAt, last_import_at: nowIso() };
+  state.sessions[sessionId] = {
+    work_dir_key: wdk,
+    byte_offset: finalOffset,
+    line_count: lineNo,
+    last_event_at: lastEventAt,
+    last_import_at: nowIso(),
+  };
   await saveIngestState(HOME, key, state);
   return { ok: true, ingested: newEvents, session_id: sessionId, archive, project_key: key };
 }
@@ -351,6 +478,107 @@ async function handleStopFailure(payload) {
   return { ok: true, snapshot };
 }
 
+// Cost guards before we spend an LLM call on extraction.
+const EXTRACT_MIN_EVENTS = 6; // need enough to be worth extracting from
+const EXTRACT_MIN_AGE_MS = 0; // not used directly; see EXTRACT_MAX_LATENCY_MS
+const EXTRACT_MAX_LATENCY_MS = 5 * 60 * 1000; // events must be <5min old to count as "in flight"
+
+// Build a short transcript from the most recent conversation events.
+// Uses the pre-extracted `summary` field; falls back to a snippet of the
+// raw payload for events that have no summary (tool calls etc).
+function buildTranscript(db, projectKey, sessionId, { limit = 6 } = {}) {
+  const rows = db
+    .prepare(
+      `
+    SELECT role, summary, payload, kind, created_at
+    FROM conversation_events
+    WHERE project_key = ? AND session_id = ?
+    ORDER BY line_no DESC LIMIT ?
+  `,
+    )
+    .all(projectKey, sessionId, limit);
+  // Reverse so the transcript reads oldest → newest.
+  rows.reverse();
+  const out = [];
+  for (const r of rows) {
+    if (!r.summary) continue;
+    const who =
+      r.role === 'user'
+        ? 'USER'
+        : r.role === 'assistant'
+          ? 'ASSISTANT'
+          : (r.role || 'SYSTEM').toUpperCase();
+    out.push(`${who}: ${r.summary}`);
+  }
+  return out.join('\n\n');
+}
+
+// Pull the most-recent event timestamp for the session. Used by the
+// cost guard: if the latest exchange is older than EXTRACT_MAX_LATENCY_MS
+// the user is no longer in flight, so we skip extraction.
+function latestEventAgeMs(db, projectKey, sessionId) {
+  const row = db
+    .prepare(
+      `
+    SELECT created_at FROM conversation_events
+    WHERE project_key = ? AND session_id = ?
+    ORDER BY line_no DESC LIMIT 1
+  `,
+    )
+    .get(projectKey, sessionId);
+  if (!row || !row.created_at) return Infinity;
+  const t = Date.parse(row.created_at);
+  if (!Number.isFinite(t)) return Infinity;
+  return Date.now() - t;
+}
+
+// Triggered after the ingest pass. Cost guards:
+//   - env opt-out (KIMI_MEMORY_AUTO_EXTRACT=off) → no-op
+//   - config opt-out ([kimi-memory] disable_auto_extract = true) → no-op
+//   - session has fewer than EXTRACT_MIN_EVENTS events → skip
+//   - latest event older than EXTRACT_MAX_LATENCY_MS → skip
+//   - LLM call timed out / failed → skip (counted via result.skipped)
+//   - candidates are deduped against existing memories via the hybrid
+//     recall (#1); duplicates are dropped, never re-saved
+async function handleAutoExtract(cwd, sessionId) {
+  if (!cwd || !sessionId) return { skipped: 'missing_cwd_or_session', saved: 0 };
+  const key = deriveProjectKey(cwd);
+  await ensureProjectDir(HOME, key);
+  const db = openDb(path.join(HOME, 'kimi-memory', key, 'memory.sqlite'));
+  try {
+    const count = db
+      .prepare(
+        'SELECT COUNT(*) AS n FROM conversation_events WHERE project_key = ? AND session_id = ?',
+      )
+      .get(key, sessionId).n;
+    if (count < EXTRACT_MIN_EVENTS) return { skipped: 'too_few_events', count };
+    const age = latestEventAgeMs(db, key, sessionId);
+    if (age > EXTRACT_MAX_LATENCY_MS) return { skipped: 'stale_session', age_ms: age };
+    const transcript = buildTranscript(db, key, sessionId, { limit: 6 });
+    if (!transcript) return { skipped: 'no_summary_text' };
+    const existingTitles = db
+      .prepare(
+        "SELECT title FROM memories WHERE project_key = ? AND status = 'active' AND (title IS NOT NULL AND title != '') ORDER BY updated_at DESC LIMIT 50",
+      )
+      .all(key)
+      .map((r) => r.title);
+    const r = await runAutoExtract({
+      homeDir: HOME,
+      cwd,
+      projectKey: key,
+      db,
+      transcript,
+      existingTitles,
+      saveMemory,
+      searchMemories,
+    });
+    return r;
+  } catch (e) {
+    await logDiag('warn', 'auto_extract threw', { error: e && e.message });
+    return { skipped: 'extract_threw', error: e && e.message };
+  }
+}
+
 const HANDLERS = {
   SessionStart: handleSessionStart,
   UserPromptSubmit: handleUserPromptSubmit,
@@ -363,7 +591,8 @@ const HANDLERS = {
 
 async function main() {
   const raw = await readStdin(256 * 1024);
-  const parsed = raw.length === 0 ? {} : (safeJsonParse(raw).ok ? safeJsonParse(raw).value : { _raw: raw });
+  const parsed =
+    raw.length === 0 ? {} : safeJsonParse(raw).ok ? safeJsonParse(raw).value : { _raw: raw };
   const handler = HANDLERS[EVENT];
   if (!handler) {
     await logDiag('warn', 'no handler for event', { event: EVENT });
@@ -375,11 +604,19 @@ async function main() {
   } catch (err) {
     // Fail open: log and exit 0 so Kimi isn't blocked.
     await logDiag('error', 'handler threw', { event: EVENT, error: err && err.message });
-    try { process.stdout.write(`[kimi-memory] hook ${EVENT} failed: ${err && err.message}\n`); } catch { /* ignore */ }
+    try {
+      process.stdout.write(`[kimi-memory] hook ${EVENT} failed: ${err && err.message}\n`);
+    } catch {
+      /* ignore */
+    }
   } finally {
     // Release cached SQLite handles so subsequent hooks / processes
     // do not race with WAL cleanup.
-    try { closeDb(); } catch { /* ignore */ }
+    try {
+      closeDb();
+    } catch {
+      /* ignore */
+    }
   }
 }
 
@@ -390,10 +627,20 @@ async function main() {
 // stuck on I/O we cannot recover from, and we'd rather emit a clean
 // exit than be killed mid-write.
 const t = setTimeout(() => {
-  try { process.stderr.write('[kimi-memory:hook:' + EVENT + '] timeout, exiting\n'); } catch { /* ignore */ }
-  try { closeDb(); } catch { /* ignore */ }
+  try {
+    process.stderr.write('[kimi-memory:hook:' + EVENT + '] timeout, exiting\n');
+  } catch {
+    /* ignore */
+  }
+  try {
+    closeDb();
+  } catch {
+    /* ignore */
+  }
   process.exit(0);
 }, 8000);
 t.unref?.();
 
-main().then(() => process.exit(0)).catch(() => process.exit(0));
+main()
+  .then(() => process.exit(0))
+  .catch(() => process.exit(0));

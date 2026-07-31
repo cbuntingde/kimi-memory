@@ -40,6 +40,11 @@ import {
   listMemories,
   deleteMemory,
   searchMemories,
+  similarMemories,
+  reinforceMemory,
+  decayMemories,
+  listConclusionsFor,
+  getParents,
   setWorkingMemory,
   getWorkingMemory,
   clearWorkingMemory,
@@ -53,12 +58,12 @@ import {
   memoryCounts,
   loadIngestState,
   saveIngestState,
+  mergeMemory,
+  linkMemory,
+  unlinkMemory,
+  listEdges,
 } from './persist.js';
-import {
-  locateSessionArchive,
-  walkWire,
-  readSessionIndex,
-} from './wire.js';
+import { locateSessionArchive, walkWire, readSessionIndex } from './wire.js';
 import {
   resolveProjectRoot,
   validateType,
@@ -75,17 +80,29 @@ import {
   validateId,
   validatePriority,
   validateScope,
+  validateEdgeKind,
+  validateEdgeDirection,
+  validateWeight,
   toError,
 } from './validation.js';
 
 const TOOL_DEFS = [
   {
     name: 'memory_save',
-    desc: 'Persist a memory entry. type \u2208 working|episodic|semantic|procedural.',
+    desc: 'Persist a memory entry. type \u2208 working|episodic|semantic|procedural|conclusion.',
     input: {
       cwd: z.string().describe('Project root (absolute path). Required.'),
-      scope: z.enum(['project', 'global']).optional().describe('project: per-project durable memory (default). global: cross-project user memory under $KIMI_CODE_HOME/kimi-memory/_global/.'),
-      type: z.enum(['working', 'episodic', 'semantic', 'procedural']).describe('Memory type.'),
+      scope: z
+        .enum(['project', 'global'])
+        .optional()
+        .describe(
+          'project: per-project durable memory (default). global: cross-project user memory under $KIMI_CODE_HOME/kimi-memory/_global/.',
+        ),
+      type: z
+        .enum(['working', 'episodic', 'semantic', 'procedural', 'conclusion'])
+        .describe(
+          'Memory type. conclusion is the higher-order type that synthesizes N underlying memories via the synthesizes[] input.',
+        ),
       title: z.string().max(500).optional(),
       content: z.string().min(1).max(200000).describe('Memory body.'),
       tags: z.array(z.string().min(1).max(64)).max(32).optional(),
@@ -95,6 +112,13 @@ const TOOL_DEFS = [
       priority: z.number().int().optional(),
       expires_at: z.string().optional(),
       supersede: z.boolean().optional(),
+      synthesizes: z
+        .array(z.string().min(4).max(64))
+        .max(500)
+        .optional()
+        .describe(
+          'For type=conclusion: ids of underlying memories this conclusion synthesizes. Recorded in memory_synthesizes for bidirectional lookup.',
+        ),
     },
   },
   {
@@ -102,7 +126,12 @@ const TOOL_DEFS = [
     desc: 'Keyword search across the active scope\u2019s durable memories using FTS5.',
     input: {
       cwd: z.string().describe('Project root (absolute path). Required.'),
-      scope: z.enum(['project', 'global', 'all']).optional().describe('project: this project only. global: _global DB only. all: project + global, project hits first (default all).'),
+      scope: z
+        .enum(['project', 'global', 'all'])
+        .optional()
+        .describe(
+          'project: this project only. global: _global DB only. all: project + global, project hits first (default all).',
+        ),
       query: z.string().min(1).max(500).describe('Search query.'),
       type: z.enum(['working', 'episodic', 'semantic', 'procedural']).optional(),
       limit: z.number().int().min(1).max(200).optional(),
@@ -113,8 +142,13 @@ const TOOL_DEFS = [
     desc: 'List durable memories in the active scope.',
     input: {
       cwd: z.string().describe('Project root (absolute path). Required.'),
-      scope: z.enum(['project', 'global', 'all']).optional().describe('project: this project only. global: _global DB only. all: project + global, project first (default all).'),
-      type: z.enum(['working', 'episodic', 'semantic', 'procedural']).optional(),
+      scope: z
+        .enum(['project', 'global', 'all'])
+        .optional()
+        .describe(
+          'project: this project only. global: _global DB only. all: project + global, project first (default all).',
+        ),
+      type: z.enum(['working', 'episodic', 'semantic', 'procedural', 'conclusion']).optional(),
       status: z.enum(['active', 'superseded', 'deleted']).optional(),
       limit: z.number().int().min(1).max(500).optional(),
       offset: z.number().int().min(0).optional(),
@@ -126,7 +160,12 @@ const TOOL_DEFS = [
     desc: 'Fetch a single memory by id from the active scope.',
     input: {
       cwd: z.string().describe('Project root (absolute path). Required.'),
-      scope: z.enum(['project', 'global', 'all']).optional().describe('project: this project only. global: _global DB only. all: project first, then global (default all).'),
+      scope: z
+        .enum(['project', 'global', 'all'])
+        .optional()
+        .describe(
+          'project: this project only. global: _global DB only. all: project first, then global (default all).',
+        ),
       id: z.string().min(4).max(64).describe('Memory id.'),
     },
   },
@@ -135,7 +174,10 @@ const TOOL_DEFS = [
     desc: 'Patch a memory\u2019s fields. Provide only fields to change.',
     input: {
       cwd: z.string().describe('Project root (absolute path). Required.'),
-      scope: z.enum(['project', 'global']).optional().describe('project: this project only (default). global: _global DB only.'),
+      scope: z
+        .enum(['project', 'global'])
+        .optional()
+        .describe('project: this project only (default). global: _global DB only.'),
       id: z.string().min(4).max(64).describe('Memory id.'),
       title: z.string().max(500).optional(),
       content: z.string().min(1).max(200000).optional(),
@@ -153,7 +195,10 @@ const TOOL_DEFS = [
     desc: 'Soft-delete a memory by id. Pass hard=true for permanent removal.',
     input: {
       cwd: z.string().describe('Project root (absolute path). Required.'),
-      scope: z.enum(['project', 'global']).optional().describe('project: this project only (default). global: _global DB only.'),
+      scope: z
+        .enum(['project', 'global'])
+        .optional()
+        .describe('project: this project only (default). global: _global DB only.'),
       id: z.string().min(4).max(64).describe('Memory id.'),
       hard: z.boolean().optional(),
     },
@@ -163,7 +208,11 @@ const TOOL_DEFS = [
     desc: 'Set a named working-memory slot for the current focus. Project-scoped only.',
     input: {
       cwd: z.string().describe('Project root (absolute path). Required.'),
-      slot: z.string().min(1).max(64).describe('Slot name, e.g. current_focus, active_task, recent_decision.'),
+      slot: z
+        .string()
+        .min(1)
+        .max(64)
+        .describe('Slot name, e.g. current_focus, active_task, recent_decision.'),
       value: z.string().min(1).max(20000).describe('Slot value.'),
     },
   },
@@ -217,8 +266,15 @@ const TOOL_DEFS = [
     desc: 'Incrementally ingest a Kimi session wire.jsonl into the project. Idempotent: safe to re-run; only new bytes are read. Project-scoped only.',
     input: {
       cwd: z.string().describe('Project root (absolute path). Required.'),
-      session_id: z.string().min(1).max(128).describe('Session id (the directory name under sessions/).'),
-      work_dir_key: z.string().optional().describe('Optional pre-hashed work-dir key; if absent we derive it from cwd.'),
+      session_id: z
+        .string()
+        .min(1)
+        .max(128)
+        .describe('Session id (the directory name under sessions/).'),
+      work_dir_key: z
+        .string()
+        .optional()
+        .describe('Optional pre-hashed work-dir key; if absent we derive it from cwd.'),
       force: z.boolean().optional().describe('Re-ingest from byte 0 even when the cursor matches.'),
     },
   },
@@ -234,19 +290,182 @@ const TOOL_DEFS = [
     desc: 'Save multiple memories atomically in a single transaction. All-or-nothing; rolls back on any error. Within a batch, later items can supersede earlier ones that share the same (type, title).',
     input: {
       cwd: z.string().describe('Project root (absolute path). Required.'),
-      scope: z.enum(['project', 'global']).optional().describe('project: per-project durable memory (default). global: cross-project user memory under $KIMI_CODE_HOME/kimi-memory/_global/.'),
-      items: z.array(z.object({
-        type: z.enum(['working', 'episodic', 'semantic', 'procedural']).describe('Memory type.'),
-        title: z.string().max(500).optional(),
-        content: z.string().min(1).max(200000).describe('Memory body.'),
-        tags: z.array(z.string().min(1).max(64)).max(32).optional(),
-        metadata: z.record(z.string(), z.any()).optional(),
-        provenance: z.record(z.string(), z.any()).optional(),
-        confidence: z.number().min(0).max(1).optional(),
-        priority: z.number().int().optional(),
-        expires_at: z.string().optional(),
-        supersede: z.boolean().optional(),
-      })).min(1).max(500).describe('Memories to save in one transaction.'),
+      scope: z
+        .enum(['project', 'global'])
+        .optional()
+        .describe(
+          'project: per-project durable memory (default). global: cross-project user memory under $KIMI_CODE_HOME/kimi-memory/_global/.',
+        ),
+      items: z
+        .array(
+          z.object({
+            type: z
+              .enum(['working', 'episodic', 'semantic', 'procedural'])
+              .describe('Memory type.'),
+            title: z.string().max(500).optional(),
+            content: z.string().min(1).max(200000).describe('Memory body.'),
+            tags: z.array(z.string().min(1).max(64)).max(32).optional(),
+            metadata: z.record(z.string(), z.any()).optional(),
+            provenance: z.record(z.string(), z.any()).optional(),
+            confidence: z.number().min(0).max(1).optional(),
+            priority: z.number().int().optional(),
+            expires_at: z.string().optional(),
+            supersede: z.boolean().optional(),
+          }),
+        )
+        .min(1)
+        .max(500)
+        .describe('Memories to save in one transaction.'),
+    },
+  },
+  {
+    name: 'memory_similar',
+    desc: 'Find memories semantically similar to a given memory id using cosine similarity over stored embeddings. Returns [] if the target has no embedding yet.',
+    input: {
+      cwd: z.string().describe('Project root (absolute path). Required.'),
+      scope: z
+        .enum(['project', 'global', 'all'])
+        .optional()
+        .describe(
+          'project: this project only. global: _global DB only. all: project + global (default all).',
+        ),
+      id: z.string().min(4).max(64).describe('Seed memory id.'),
+      limit: z.number().int().min(1).max(50).optional(),
+      threshold: z
+        .number()
+        .min(0)
+        .max(1)
+        .optional()
+        .describe('Minimum cosine similarity, default 0.6.'),
+    },
+  },
+  {
+    name: 'memory_link',
+    desc: 'Create a typed edge between two memories: kind ∈ {related, supports, contradicts, supersedes, synthesizes}. Idempotent: re-linking the same (from, to, kind) returns the existing edge instead of erroring.',
+    input: {
+      cwd: z.string().describe('Project root (absolute path). Required.'),
+      scope: z
+        .enum(['project', 'global'])
+        .optional()
+        .describe('project: per-project durable memory (default). global: _global DB only.'),
+      from_id: z.string().min(4).max(64).describe('Source memory id.'),
+      to_id: z.string().min(4).max(64).describe('Target memory id.'),
+      kind: z
+        .enum(['related', 'supports', 'contradicts', 'supersedes', 'synthesizes'])
+        .describe('Edge kind.'),
+      weight: z
+        .number()
+        .min(0)
+        .max(10)
+        .optional()
+        .describe('Optional edge weight in [0, 10]. Default 1.0.'),
+    },
+  },
+  {
+    name: 'memory_unlink',
+    desc: 'Remove an edge by its id (the value returned by memory_link or memory_edges).',
+    input: {
+      cwd: z.string().describe('Project root (absolute path). Required.'),
+      scope: z
+        .enum(['project', 'global'])
+        .optional()
+        .describe('project: per-project durable memory (default). global: _global DB only.'),
+      edge_id: z.string().min(4).max(64).describe('Edge id to remove.'),
+    },
+  },
+  {
+    name: 'memory_edges',
+    desc: 'List every typed edge touching a memory in the active scope. direction ∈ {out, in, both}; kind is an optional filter.',
+    input: {
+      cwd: z.string().describe('Project root (absolute path). Required.'),
+      scope: z
+        .enum(['project', 'global', 'all'])
+        .optional()
+        .describe(
+          'project: this project only. global: _global DB only. all: project + global (default all).',
+        ),
+      id: z.string().min(4).max(64).describe('Memory id whose edges should be listed.'),
+      direction: z
+        .enum(['out', 'in', 'both'])
+        .optional()
+        .describe('Edge direction filter. Default both.'),
+      kind: z
+        .enum(['related', 'supports', 'contradicts', 'supersedes', 'synthesizes'])
+        .optional()
+        .describe('Edge kind filter.'),
+    },
+  },
+  {
+    name: 'memory_merge',
+    desc: "Merge one memory into another: fromId becomes soft-superseded with a supersedes edge to intoId, intoId gains the union of tags + a provenance.merge_from entry. Use merged_content to replace intoId's content; otherwise intoId keeps its existing body.",
+    input: {
+      cwd: z.string().describe('Project root (absolute path). Required.'),
+      scope: z
+        .enum(['project', 'global'])
+        .optional()
+        .describe('project: per-project durable memory (default). global: _global DB only.'),
+      into_id: z
+        .string()
+        .min(4)
+        .max(64)
+        .describe('Destination memory id (kept active, gains tags).'),
+      from_id: z
+        .string()
+        .min(4)
+        .max(64)
+        .describe('Source memory id (soft-superseded after merge).'),
+      merged_content: z
+        .string()
+        .min(1)
+        .max(200000)
+        .optional()
+        .describe('Optional replacement content for into_id; omit to keep existing.'),
+      weight: z
+        .number()
+        .min(0)
+        .max(10)
+        .optional()
+        .describe('Optional weight on the new supersedes edge. Default 1.0.'),
+    },
+  },
+  {
+    name: 'memory_reinforce',
+    desc: "Bump a memory's access count + last_accessed_at and nudge confidence upward by ~0.05. Idempotent — call repeatedly when a memory proves useful.",
+    input: {
+      cwd: z.string().describe('Project root (absolute path). Required.'),
+      scope: z
+        .enum(['project', 'global'])
+        .optional()
+        .describe('project: per-project durable memory (default). global: _global DB only.'),
+      id: z.string().min(4).max(64).describe('Memory id to reinforce.'),
+    },
+  },
+  {
+    name: 'memory_conclusions_for',
+    desc: 'Given a memory id, return every active conclusion (type=conclusion) that synthesizes it via memory_synthesizes. Honors project|global|all scope.',
+    input: {
+      cwd: z.string().describe('Project root (absolute path). Required.'),
+      scope: z
+        .enum(['project', 'global', 'all'])
+        .optional()
+        .describe(
+          'project: this project only. global: _global DB only. all: project + global (default all).',
+        ),
+      id: z.string().min(4).max(64).describe('Underlying memory id to look up conclusions for.'),
+      limit: z.number().int().min(1).max(200).optional(),
+    },
+  },
+  {
+    name: 'memory_parents',
+    desc: 'Inverse of memory_conclusions_for: given a conclusion id, return every underlying memory it synthesizes.',
+    input: {
+      cwd: z.string().describe('Project root (absolute path). Required.'),
+      scope: z
+        .enum(['project', 'global'])
+        .optional()
+        .describe('project: per-project durable memory (default). global: _global DB only.'),
+      id: z.string().min(4).max(64).describe('Conclusion memory id.'),
+      limit: z.number().int().min(1).max(500).optional(),
     },
   },
 ];
@@ -276,9 +495,17 @@ function mergeWithScope(projectRows, globalRows, { limit, deriveTimestamp }) {
 export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
   const home = kimiHomeDir || kimiHome();
   const root = pluginRootDir || process.cwd();
-  const log = logger || ((...a) => { try { process.stderr.write('[kimi-memory] ' + a.join(' ') + '\n'); } catch { /* ignore */ } });
+  const log =
+    logger ||
+    ((...a) => {
+      try {
+        process.stderr.write('[kimi-memory] ' + a.join(' ') + '\n');
+      } catch {
+        /* ignore */
+      }
+    });
 
-  const server = new McpServer({ name: 'kimi-memory', version: '0.1.0' });
+  const server = new McpServer({ name: 'kimi-memory', version: '0.2.0' });
 
   // Resolve the database handle and key for a given scope. `cwd` is
   // required for `project` and `all`; for `global` it is audit context
@@ -299,50 +526,60 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
   }
 
   // ---- memory_save ----
-  server.tool(
-    TOOL_DEFS[0].name,
-    TOOL_DEFS[0].input,
-    async (args) => {
-      try {
-        const pr = resolveProjectRoot(args.cwd);
-        if (!pr.ok) return textError(pr.error);
-        const sc = validateScope(args.scope, { read: false });
-        if (!sc.ok) return textError(sc.error);
-        const t = validateType(args.type);
-        if (!t.ok) return textError(t.error);
-        const tags = validateTags(args.tags);
-        if (!tags.ok) return textError(tags.error);
-        const md = validateMetadata(args.metadata);
-        if (!md.ok) return textError(md.error);
-        const pv = validateProvenance(args.provenance);
-        if (!pv.ok) return textError(pv.error);
-        const conf = validateConfidence(args.confidence);
-        if (!conf.ok) return textError(conf.error);
-        const exp = validateExpiresAt(args.expires_at);
-        if (!exp.ok) return textError(exp.error);
-        const prio = validatePriority(args.priority);
-        if (!prio.ok) return textError(prio.error);
-        const content = args.content;
-        if (!content) return textError('content is required');
-        const target = openScopeDb({ cwd: pr.value, scope: sc.value });
-        const provenance = { ...(pv.value || {}), source: (pv.value && pv.value.source) || 'memory_save', cwd: pr.value, scope: sc.value, recorded_at: nowIso() };
-        const mem = saveMemory(target.db, target.projectKey, {
-          type: t.value,
-          title: args.title || '',
-          content,
-          tags: tags.value,
-          metadata: md.value,
-          provenance,
-          confidence: conf.value,
-          status: 'active',
-          priority: prio.value,
-          expires_at: exp.value,
-          supersede: !!args.supersede,
-        });
-        return ok({ operation: 'saved', scope: sc.value, memory: mem, project_key: target.projectKey });
-      } catch (e) { return textError(toError(e).error); }
+  server.tool(TOOL_DEFS[0].name, TOOL_DEFS[0].input, async (args) => {
+    try {
+      const pr = resolveProjectRoot(args.cwd);
+      if (!pr.ok) return textError(pr.error);
+      const sc = validateScope(args.scope, { read: false });
+      if (!sc.ok) return textError(sc.error);
+      const t = validateType(args.type);
+      if (!t.ok) return textError(t.error);
+      const tags = validateTags(args.tags);
+      if (!tags.ok) return textError(tags.error);
+      const md = validateMetadata(args.metadata);
+      if (!md.ok) return textError(md.error);
+      const pv = validateProvenance(args.provenance);
+      if (!pv.ok) return textError(pv.error);
+      const conf = validateConfidence(args.confidence);
+      if (!conf.ok) return textError(conf.error);
+      const exp = validateExpiresAt(args.expires_at);
+      if (!exp.ok) return textError(exp.error);
+      const prio = validatePriority(args.priority);
+      if (!prio.ok) return textError(prio.error);
+      const content = args.content;
+      if (!content) return textError('content is required');
+      const target = openScopeDb({ cwd: pr.value, scope: sc.value });
+      const provenance = {
+        ...(pv.value || {}),
+        source: (pv.value && pv.value.source) || 'memory_save',
+        cwd: pr.value,
+        scope: sc.value,
+        recorded_at: nowIso(),
+      };
+      const mem = saveMemory(target.db, target.projectKey, {
+        type: t.value,
+        title: args.title || '',
+        content,
+        tags: tags.value,
+        metadata: md.value,
+        provenance,
+        confidence: conf.value,
+        status: 'active',
+        priority: prio.value,
+        expires_at: exp.value,
+        supersede: !!args.supersede,
+        synthesizes: Array.isArray(args.synthesizes) ? args.synthesizes : undefined,
+      });
+      return ok({
+        operation: 'saved',
+        scope: sc.value,
+        memory: mem,
+        project_key: target.projectKey,
+      });
+    } catch (e) {
+      return textError(toError(e).error);
     }
-  );
+  });
 
   // ---- memory_recall ----
   server.tool(TOOL_DEFS[1].name, TOOL_DEFS[1].input, async (args) => {
@@ -357,21 +594,56 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
       const t = args.type ? validateType(args.type) : { ok: true, value: null };
       if (!t.ok) return textError(t.error);
       const scope = sc.value;
-      const projectHandle = (scope === 'project' || scope === 'all') ? openScopeDb({ cwd: pr.value, scope: 'project' }) : null;
-      const globalHandle = (scope === 'global' || scope === 'all') ? openScopeDb({ cwd: pr.value, scope: 'global' }) : null;
+      const projectHandle =
+        scope === 'project' || scope === 'all'
+          ? openScopeDb({ cwd: pr.value, scope: 'project' })
+          : null;
+      const globalHandle =
+        scope === 'global' || scope === 'all'
+          ? openScopeDb({ cwd: pr.value, scope: 'global' })
+          : null;
       const opts = { type: t.value, limit: lim.value };
-      const projectItems = projectHandle ? searchMemories(projectHandle.db, projectHandle.projectKey, args.query, opts) : [];
-      const globalItems = globalHandle ? searchMemories(globalHandle.db, GLOBAL_PROJECT_KEY, args.query, opts) : [];
+      const projectItems = projectHandle
+        ? await searchMemories(projectHandle.db, projectHandle.projectKey, args.query, opts)
+        : [];
+      const globalItems = globalHandle
+        ? await searchMemories(globalHandle.db, GLOBAL_PROJECT_KEY, args.query, opts)
+        : [];
       if (scope === 'project') {
-        return ok({ operation: 'recalled', scope, items: projectItems, count: projectItems.length, project_key: projectHandle.projectKey });
+        return ok({
+          operation: 'recalled',
+          scope,
+          items: projectItems,
+          count: projectItems.length,
+          project_key: projectHandle.projectKey,
+        });
       }
       if (scope === 'global') {
-        return ok({ operation: 'recalled', scope, items: globalItems.map((m) => ({ ...m, scope: 'global' })), count: globalItems.length, project_key: GLOBAL_PROJECT_KEY });
+        return ok({
+          operation: 'recalled',
+          scope,
+          items: globalItems.map((m) => ({ ...m, scope: 'global' })),
+          count: globalItems.length,
+          project_key: GLOBAL_PROJECT_KEY,
+        });
       }
       // scope === 'all'
-      const merged = mergeWithScope(projectItems, globalItems, { limit: lim.value, deriveTimestamp: (r) => r.updated_at });
-      return ok({ operation: 'recalled', scope, items: merged.items, count: merged.items.length, project_count: merged.project_count, global_count: merged.global_count, project_key: projectHandle.projectKey });
-    } catch (e) { return textError(toError(e).error); }
+      const merged = mergeWithScope(projectItems, globalItems, {
+        limit: lim.value,
+        deriveTimestamp: (r) => r.updated_at,
+      });
+      return ok({
+        operation: 'recalled',
+        scope,
+        items: merged.items,
+        count: merged.items.length,
+        project_count: merged.project_count,
+        global_count: merged.global_count,
+        project_key: projectHandle.projectKey,
+      });
+    } catch (e) {
+      return textError(toError(e).error);
+    }
   });
 
   // ---- memory_list ----
@@ -390,21 +662,62 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
       const sc = validateScope(args.scope, { read: true });
       if (!sc.ok) return textError(sc.error);
       const scope = sc.value;
-      const projectHandle = (scope === 'project' || scope === 'all') ? openScopeDb({ cwd: pr.value, scope: 'project' }) : null;
-      const globalHandle = (scope === 'global' || scope === 'all') ? openScopeDb({ cwd: pr.value, scope: 'global' }) : null;
-      const opts = { type: t.value, status: st.value, limit: lim.value, offset: off.value, includeExpired: !!args.includeExpired };
-      const projectItems = projectHandle ? listMemories(projectHandle.db, projectHandle.projectKey, opts) : [];
-      const globalItems = globalHandle ? listMemories(globalHandle.db, GLOBAL_PROJECT_KEY, opts) : [];
+      const projectHandle =
+        scope === 'project' || scope === 'all'
+          ? openScopeDb({ cwd: pr.value, scope: 'project' })
+          : null;
+      const globalHandle =
+        scope === 'global' || scope === 'all'
+          ? openScopeDb({ cwd: pr.value, scope: 'global' })
+          : null;
+      const opts = {
+        type: t.value,
+        status: st.value,
+        limit: lim.value,
+        offset: off.value,
+        includeExpired: !!args.includeExpired,
+      };
+      const projectItems = projectHandle
+        ? listMemories(projectHandle.db, projectHandle.projectKey, opts)
+        : [];
+      const globalItems = globalHandle
+        ? listMemories(globalHandle.db, GLOBAL_PROJECT_KEY, opts)
+        : [];
       if (scope === 'project') {
-        return ok({ operation: 'listed', scope, items: projectItems, count: projectItems.length, project_key: projectHandle.projectKey });
+        return ok({
+          operation: 'listed',
+          scope,
+          items: projectItems,
+          count: projectItems.length,
+          project_key: projectHandle.projectKey,
+        });
       }
       if (scope === 'global') {
-        return ok({ operation: 'listed', scope, items: globalItems.map((m) => ({ ...m, scope: 'global' })), count: globalItems.length, project_key: GLOBAL_PROJECT_KEY });
+        return ok({
+          operation: 'listed',
+          scope,
+          items: globalItems.map((m) => ({ ...m, scope: 'global' })),
+          count: globalItems.length,
+          project_key: GLOBAL_PROJECT_KEY,
+        });
       }
       // scope === 'all'
-      const merged = mergeWithScope(projectItems, globalItems, { limit: lim.value, deriveTimestamp: (r) => r.updated_at });
-      return ok({ operation: 'listed', scope, items: merged.items, count: merged.items.length, project_count: merged.project_count, global_count: merged.global_count, project_key: projectHandle.projectKey });
-    } catch (e) { return textError(toError(e).error); }
+      const merged = mergeWithScope(projectItems, globalItems, {
+        limit: lim.value,
+        deriveTimestamp: (r) => r.updated_at,
+      });
+      return ok({
+        operation: 'listed',
+        scope,
+        items: merged.items,
+        count: merged.items.length,
+        project_count: merged.project_count,
+        global_count: merged.global_count,
+        project_key: projectHandle.projectKey,
+      });
+    } catch (e) {
+      return textError(toError(e).error);
+    }
   });
 
   // ---- memory_get ----
@@ -429,10 +742,18 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
       if (scope === 'global' || scope === 'all') {
         const target = openScopeDb({ cwd: pr.value, scope: 'global' });
         const mem = getMemory(target.db, GLOBAL_PROJECT_KEY, id.value);
-        if (mem) return ok({ operation: 'got', scope, memory: { ...mem, scope: 'global' }, project_key: GLOBAL_PROJECT_KEY });
+        if (mem)
+          return ok({
+            operation: 'got',
+            scope,
+            memory: { ...mem, scope: 'global' },
+            project_key: GLOBAL_PROJECT_KEY,
+          });
       }
       return textError(`memory not found: ${id.value}`);
-    } catch (e) { return textError(toError(e).error); }
+    } catch (e) {
+      return textError(toError(e).error);
+    }
   });
 
   // ---- memory_update ----
@@ -445,7 +766,9 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
       const sc = validateScope(args.scope, { read: false });
       if (!sc.ok) return textError(sc.error);
       const target = openScopeDb({ cwd: pr.value, scope: sc.value });
-      const existing = getMemory(target.db, target.projectKey, id.value, { includeSuperseded: true });
+      const existing = getMemory(target.db, target.projectKey, id.value, {
+        includeSuperseded: true,
+      });
       if (!existing) return textError(`memory not found in ${sc.value} scope: ${id.value}`);
       const merged = { ...existing };
       if (args.title !== undefined) merged.title = asString(args.title);
@@ -455,15 +778,46 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
         if (!t.ok) return textError(t.error);
         merged.tags = t.value;
       }
-      if (args.metadata !== undefined) { const m = validateMetadata(args.metadata); if (!m.ok) return textError(m.error); merged.metadata = m.value; }
-      if (args.provenance !== undefined) { const p = validateProvenance(args.provenance); if (!p.ok) return textError(p.error); merged.provenance = p.value; }
-      if (args.confidence !== undefined) { const c = validateConfidence(args.confidence); if (!c.ok) return textError(c.error); merged.confidence = c.value; }
-      if (args.status !== undefined) { const s = validateStatus(args.status); if (!s.ok) return textError(s.error); merged.status = s.value; }
-      if (args.priority !== undefined) { const p = validatePriority(args.priority); if (!p.ok) return textError(p.error); merged.priority = p.value; }
-      if (args.expires_at !== undefined) { const e2 = validateExpiresAt(args.expires_at); if (!e2.ok) return textError(e2.error); merged.expires_at = e2.value; }
+      if (args.metadata !== undefined) {
+        const m = validateMetadata(args.metadata);
+        if (!m.ok) return textError(m.error);
+        merged.metadata = m.value;
+      }
+      if (args.provenance !== undefined) {
+        const p = validateProvenance(args.provenance);
+        if (!p.ok) return textError(p.error);
+        merged.provenance = p.value;
+      }
+      if (args.confidence !== undefined) {
+        const c = validateConfidence(args.confidence);
+        if (!c.ok) return textError(c.error);
+        merged.confidence = c.value;
+      }
+      if (args.status !== undefined) {
+        const s = validateStatus(args.status);
+        if (!s.ok) return textError(s.error);
+        merged.status = s.value;
+      }
+      if (args.priority !== undefined) {
+        const p = validatePriority(args.priority);
+        if (!p.ok) return textError(p.error);
+        merged.priority = p.value;
+      }
+      if (args.expires_at !== undefined) {
+        const e2 = validateExpiresAt(args.expires_at);
+        if (!e2.ok) return textError(e2.error);
+        merged.expires_at = e2.value;
+      }
       const mem = saveMemory(target.db, target.projectKey, merged);
-      return ok({ operation: 'updated', scope: sc.value, memory: mem, project_key: target.projectKey });
-    } catch (e) { return textError(toError(e).error); }
+      return ok({
+        operation: 'updated',
+        scope: sc.value,
+        memory: mem,
+        project_key: target.projectKey,
+      });
+    } catch (e) {
+      return textError(toError(e).error);
+    }
   });
 
   // ---- memory_delete ----
@@ -477,8 +831,16 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
       if (!sc.ok) return textError(sc.error);
       const target = openScopeDb({ cwd: pr.value, scope: sc.value });
       const okDel = deleteMemory(target.db, target.projectKey, id.value, { hard: !!args.hard });
-      return ok({ operation: 'deleted', scope: sc.value, deleted: okDel, id: id.value, project_key: target.projectKey });
-    } catch (e) { return textError(toError(e).error); }
+      return ok({
+        operation: 'deleted',
+        scope: sc.value,
+        deleted: okDel,
+        id: id.value,
+        project_key: target.projectKey,
+      });
+    } catch (e) {
+      return textError(toError(e).error);
+    }
   });
 
   // ---- working_memory_set/get/clear (project-scoped only) ----
@@ -491,8 +853,17 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
       if (!args.value) return textError('value is required');
       const { db, projectKey } = openScopeDb({ cwd: pr.value, scope: 'project' });
       const r = setWorkingMemory(db, projectKey, slot.value, args.value);
-      return ok({ operation: 'wm_set', slot: r.slot, value: r.value, updated_at: r.updated_at, project_key: projectKey, warning: slot.warning || null });
-    } catch (e) { return textError(toError(e).error); }
+      return ok({
+        operation: 'wm_set',
+        slot: r.slot,
+        value: r.value,
+        updated_at: r.updated_at,
+        project_key: projectKey,
+        warning: slot.warning || null,
+      });
+    } catch (e) {
+      return textError(toError(e).error);
+    }
   });
 
   server.tool(TOOL_DEFS[7].name, TOOL_DEFS[7].input, async (args) => {
@@ -503,8 +874,16 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
       if (!slot.ok) return textError(slot.error);
       const { db, projectKey } = openScopeDb({ cwd: pr.value, scope: 'project' });
       const r = getWorkingMemory(db, projectKey, slot.value);
-      return ok({ operation: 'wm_get', slot: slot.value, value: r ? r.value : null, updated_at: r ? r.updated_at : null, project_key: projectKey });
-    } catch (e) { return textError(toError(e).error); }
+      return ok({
+        operation: 'wm_get',
+        slot: slot.value,
+        value: r ? r.value : null,
+        updated_at: r ? r.updated_at : null,
+        project_key: projectKey,
+      });
+    } catch (e) {
+      return textError(toError(e).error);
+    }
   });
 
   server.tool(TOOL_DEFS[8].name, TOOL_DEFS[8].input, async (args) => {
@@ -516,7 +895,9 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
       const { db, projectKey } = openScopeDb({ cwd: pr.value, scope: 'project' });
       const cleared = clearWorkingMemory(db, projectKey, slot.value);
       return ok({ operation: 'wm_clear', slot: slot.value, cleared, project_key: projectKey });
-    } catch (e) { return textError(toError(e).error); }
+    } catch (e) {
+      return textError(toError(e).error);
+    }
   });
 
   // ---- conversation_list / get / search / ingest (project-scoped only) ----
@@ -529,7 +910,9 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
       const { db, projectKey } = openScopeDb({ cwd: pr.value, scope: 'project' });
       const items = listConversations(db, projectKey, { limit: lim.value });
       return ok({ operation: 'conv_list', items, count: items.length, project_key: projectKey });
-    } catch (e) { return textError(toError(e).error); }
+    } catch (e) {
+      return textError(toError(e).error);
+    }
   });
 
   // ---- conversation_list / get / search / ingest (project-scoped only) ----
@@ -544,9 +927,20 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
       if (!off.ok) return textError(off.error);
       const { db, projectKey } = openScopeDb({ cwd: pr.value, scope: 'project' });
       const meta = getConversation(db, projectKey, args.session_id);
-      const events = getConversationEvents(db, projectKey, args.session_id, { limit: lim.value, since: off.value });
-      return ok({ operation: 'conv_get', conversation: meta, events, count: events.length, project_key: projectKey });
-    } catch (e) { return textError(toError(e).error); }
+      const events = getConversationEvents(db, projectKey, args.session_id, {
+        limit: lim.value,
+        since: off.value,
+      });
+      return ok({
+        operation: 'conv_get',
+        conversation: meta,
+        events,
+        count: events.length,
+        project_key: projectKey,
+      });
+    } catch (e) {
+      return textError(toError(e).error);
+    }
   });
 
   server.tool(TOOL_DEFS[11].name, TOOL_DEFS[11].input, async (args) => {
@@ -559,9 +953,15 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
       const role = args.role ? validateRole(args.role) : { ok: true, value: null };
       if (!role.ok) return textError(role.error);
       const { db, projectKey } = openScopeDb({ cwd: pr.value, scope: 'project' });
-      const items = searchConversationEvents(db, projectKey, args.query, { sessionId: args.session_id, role: role.value, limit: lim.value });
+      const items = searchConversationEvents(db, projectKey, args.query, {
+        sessionId: args.session_id,
+        role: role.value,
+        limit: lim.value,
+      });
       return ok({ operation: 'conv_search', items, count: items.length, project_key: projectKey });
-    } catch (e) { return textError(toError(e).error); }
+    } catch (e) {
+      return textError(toError(e).error);
+    }
   });
 
   server.tool(TOOL_DEFS[12].name, TOOL_DEFS[12].input, async (args) => {
@@ -569,9 +969,19 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
       const pr = resolveProjectRoot(args.cwd);
       if (!pr.ok) return textError(pr.error);
       const { db, projectKey, cwd } = openScopeDb({ cwd: pr.value, scope: 'project' });
-      const r = await ingestOne({ home, db, projectKey, cwd, sessionId: args.session_id, workDirKey: args.work_dir_key, force: !!args.force });
+      const r = await ingestOne({
+        home,
+        db,
+        projectKey,
+        cwd,
+        sessionId: args.session_id,
+        workDirKey: args.work_dir_key,
+        force: !!args.force,
+      });
       return ok({ operation: 'conv_ingest', ...r });
-    } catch (e) { return textError(toError(e).error); }
+    } catch (e) {
+      return textError(toError(e).error);
+    }
   });
 
   // ---- memory_status (project + global, both DBs in one call) ----
@@ -583,9 +993,15 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
       const global = openScopeDb({ cwd: pr.value, scope: 'global' });
       const projectMem = memoryCounts(project.db, project.projectKey);
       const globalMem = memoryCounts(global.db, GLOBAL_PROJECT_KEY);
-      const wm = project.db.prepare("SELECT COUNT(*) AS n FROM working_memory WHERE project_key=?").get(project.projectKey).n;
-      const conv = project.db.prepare("SELECT COUNT(*) AS n FROM conversations WHERE project_key=?").get(project.projectKey).n;
-      const events = project.db.prepare("SELECT COUNT(*) AS n FROM conversation_events WHERE project_key=?").get(project.projectKey).n;
+      const wm = project.db
+        .prepare('SELECT COUNT(*) AS n FROM working_memory WHERE project_key=?')
+        .get(project.projectKey).n;
+      const conv = project.db
+        .prepare('SELECT COUNT(*) AS n FROM conversations WHERE project_key=?')
+        .get(project.projectKey).n;
+      const events = project.db
+        .prepare('SELECT COUNT(*) AS n FROM conversation_events WHERE project_key=?')
+        .get(project.projectKey).n;
       return ok({
         project_key: project.projectKey,
         cwd: pr.value,
@@ -602,7 +1018,9 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
         },
         scopes: { project: project.projectKey, global: GLOBAL_PROJECT_KEY },
       });
-    } catch (e) { return textError(toError(e).error); }
+    } catch (e) {
+      return textError(toError(e).error);
+    }
   });
 
   // ---- memory_save_bulk (transactional batch save) ----
@@ -612,7 +1030,8 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
       if (!pr.ok) return textError(pr.error);
       const sc = validateScope(args.scope, { read: false });
       if (!sc.ok) return textError(sc.error);
-      if (!Array.isArray(args.items) || args.items.length === 0) return textError('items must be a non-empty array');
+      if (!Array.isArray(args.items) || args.items.length === 0)
+        return textError('items must be a non-empty array');
       // Per-item validation: type, content, tags, metadata, provenance,
       // confidence, expires_at, priority. Collect every error before
       // bailing so the caller sees the full list.
@@ -622,7 +1041,8 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
         const ctx = `items[${i}]`;
         const t = validateType(item.type);
         if (!t.ok) return textError(`${ctx}: ${t.error}`);
-        const content = typeof item.content === 'string' && item.content.length > 0 ? item.content : null;
+        const content =
+          typeof item.content === 'string' && item.content.length > 0 ? item.content : null;
         if (!content) return textError(`${ctx}: content is required`);
         const tags = validateTags(item.tags);
         if (!tags.ok) return textError(`${ctx}: ${tags.error}`);
@@ -651,14 +1071,310 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
       }
       const target = openScopeDb({ cwd: pr.value, scope: sc.value });
       // Stamp provenance so every saved row carries the caller's context.
-      const baseProvenance = { source: 'memory_save_bulk', cwd: pr.value, scope: sc.value, recorded_at: nowIso() };
+      const baseProvenance = {
+        source: 'memory_save_bulk',
+        cwd: pr.value,
+        scope: sc.value,
+        recorded_at: nowIso(),
+      };
       const stamped = cleaned.map((item) => ({
         ...item,
         provenance: { ...(item.provenance || {}), ...baseProvenance },
       }));
       const mems = saveMemoryBulk(target.db, target.projectKey, stamped);
-      return ok({ operation: 'saved_bulk', scope: sc.value, memories: mems, count: mems.length, project_key: target.projectKey });
-    } catch (e) { return textError(toError(e).error); }
+      return ok({
+        operation: 'saved_bulk',
+        scope: sc.value,
+        memories: mems,
+        count: mems.length,
+        project_key: target.projectKey,
+      });
+    } catch (e) {
+      return textError(toError(e).error);
+    }
+  });
+
+  // ---- memory_similar (vector-only similarity search) ----
+  server.tool(TOOL_DEFS[15].name, TOOL_DEFS[15].input, async (args) => {
+    try {
+      const pr = resolveProjectRoot(args.cwd);
+      if (!pr.ok) return textError(pr.error);
+      const id = validateId(args.id);
+      if (!id.ok) return textError(id.error);
+      const lim = validateLimit(args.limit, 1, 50, 10);
+      if (!lim.ok) return textError(lim.error);
+      const sc = validateScope(args.scope, { read: true });
+      if (!sc.ok) return textError(sc.error);
+      const threshold =
+        typeof args.threshold === 'number' ? Math.max(0, Math.min(1, args.threshold)) : 0.6;
+      const scope = sc.value;
+      const merged = [];
+      if (scope === 'project' || scope === 'all') {
+        const target = openScopeDb({ cwd: pr.value, scope: 'project' });
+        const items = await similarMemories(target.db, target.projectKey, id.value, {
+          limit: lim.value,
+          threshold,
+        });
+        merged.push(...items.map((m) => ({ ...m, scope: 'project' })));
+      }
+      if (scope === 'global' || scope === 'all') {
+        const target = openScopeDb({ cwd: pr.value, scope: 'global' });
+        const items = await similarMemories(target.db, GLOBAL_PROJECT_KEY, id.value, {
+          limit: lim.value,
+          threshold,
+        });
+        merged.push(...items.map((m) => ({ ...m, scope: 'global' })));
+      }
+      // Sort across scopes by similarity desc, then trim to limit.
+      merged.sort((a, b) => (b.similarity || 0) - (a.similarity || 0));
+      const items = merged.slice(0, lim.value);
+      return ok({
+        operation: 'similar',
+        scope,
+        id: id.value,
+        threshold,
+        items,
+        count: items.length,
+        project_key:
+          scope === 'global'
+            ? GLOBAL_PROJECT_KEY
+            : deriveProjectKey(canonicalizeRoot(pr.value) || pr.value),
+      });
+    } catch (e) {
+      return textError(toError(e).error);
+    }
+  });
+
+  // ---- memory_link (typed edge insert; idempotent) ----
+  server.tool(TOOL_DEFS[16].name, TOOL_DEFS[16].input, async (args) => {
+    try {
+      const pr = resolveProjectRoot(args.cwd);
+      if (!pr.ok) return textError(pr.error);
+      const sc = validateScope(args.scope, { read: false });
+      if (!sc.ok) return textError(sc.error);
+      const fromId = validateId(args.from_id);
+      if (!fromId.ok) return textError(fromId.error);
+      const toId = validateId(args.to_id);
+      if (!toId.ok) return textError(toId.error);
+      if (fromId.value === toId.value) return textError('from_id and to_id must differ');
+      const kind = validateEdgeKind(args.kind);
+      if (!kind.ok) return textError(kind.error);
+      const w = validateWeight(args.weight);
+      if (!w.ok) return textError(w.error);
+      const target = openScopeDb({ cwd: pr.value, scope: sc.value });
+      const edge = linkMemory(target.db, target.projectKey, fromId.value, toId.value, kind.value, {
+        weight: w.value,
+      });
+      return ok({ operation: 'linked', scope: sc.value, edge, project_key: target.projectKey });
+    } catch (e) {
+      return textError(toError(e).error);
+    }
+  });
+
+  // ---- memory_unlink (edge delete by id) ----
+  server.tool(TOOL_DEFS[17].name, TOOL_DEFS[17].input, async (args) => {
+    try {
+      const pr = resolveProjectRoot(args.cwd);
+      if (!pr.ok) return textError(pr.error);
+      const sc = validateScope(args.scope, { read: false });
+      if (!sc.ok) return textError(sc.error);
+      const edgeId = validateId(args.edge_id);
+      if (!edgeId.ok) return textError(edgeId.error);
+      const target = openScopeDb({ cwd: pr.value, scope: sc.value });
+      const removed = unlinkMemory(target.db, target.projectKey, edgeId.value);
+      return ok({
+        operation: 'unlinked',
+        scope: sc.value,
+        edge_id: edgeId.value,
+        removed,
+        project_key: target.projectKey,
+      });
+    } catch (e) {
+      return textError(toError(e).error);
+    }
+  });
+
+  // ---- memory_edges (list edges touching a memory; scope='all' merges) ----
+  server.tool(TOOL_DEFS[18].name, TOOL_DEFS[18].input, async (args) => {
+    try {
+      const pr = resolveProjectRoot(args.cwd);
+      if (!pr.ok) return textError(pr.error);
+      const sc = validateScope(args.scope, { read: true });
+      if (!sc.ok) return textError(sc.error);
+      const id = validateId(args.id);
+      if (!id.ok) return textError(id.error);
+      const dir = validateEdgeDirection(args.direction);
+      if (!dir.ok) return textError(dir.error);
+      const kind = args.kind ? validateEdgeKind(args.kind) : { ok: true, value: null };
+      if (!kind.ok) return textError(kind.error);
+      const scope = sc.value;
+      const merged = [];
+      if (scope === 'project' || scope === 'all') {
+        const target = openScopeDb({ cwd: pr.value, scope: 'project' });
+        const items = listEdges(target.db, target.projectKey, id.value, {
+          direction: dir.value,
+          kind: kind.value,
+        });
+        merged.push(...items.map((e) => ({ ...e, scope: 'project' })));
+      }
+      if (scope === 'global' || scope === 'all') {
+        const target = openScopeDb({ cwd: pr.value, scope: 'global' });
+        const items = listEdges(target.db, GLOBAL_PROJECT_KEY, id.value, {
+          direction: dir.value,
+          kind: kind.value,
+        });
+        merged.push(...items.map((e) => ({ ...e, scope: 'global' })));
+      }
+      // Sort by created_at desc; ties broken by kind alphabetical.
+      merged.sort((a, b) => {
+        const tc = (b.created_at || '').localeCompare(a.created_at || '');
+        return tc !== 0 ? tc : (a.kind || '').localeCompare(b.kind || '');
+      });
+      return ok({
+        operation: 'edges',
+        scope,
+        id: id.value,
+        direction: dir.value,
+        kind: kind.value,
+        items: merged,
+        count: merged.length,
+        project_key:
+          scope === 'global'
+            ? GLOBAL_PROJECT_KEY
+            : deriveProjectKey(canonicalizeRoot(pr.value) || pr.value),
+      });
+    } catch (e) {
+      return textError(toError(e).error);
+    }
+  });
+
+  // ---- memory_merge (soft-supersede fromId into intoId; union tags; record supersedes edge) ----
+  server.tool(TOOL_DEFS[19].name, TOOL_DEFS[19].input, async (args) => {
+    try {
+      const pr = resolveProjectRoot(args.cwd);
+      if (!pr.ok) return textError(pr.error);
+      const sc = validateScope(args.scope, { read: false });
+      if (!sc.ok) return textError(sc.error);
+      const into = validateId(args.into_id);
+      if (!into.ok) return textError(into.error);
+      const from = validateId(args.from_id);
+      if (!from.ok) return textError(from.error);
+      if (into.value === from.value) return textError('into_id and from_id must differ');
+      const w = validateWeight(args.weight);
+      if (!w.ok) return textError(w.error);
+      const target = openScopeDb({ cwd: pr.value, scope: sc.value });
+      const r = mergeMemory(target.db, target.projectKey, into.value, from.value, {
+        mergedContent: typeof args.merged_content === 'string' ? args.merged_content : null,
+        weight: w.value,
+      });
+      return ok({
+        operation: 'merged',
+        scope: sc.value,
+        into: r.into,
+        from: r.from,
+        edge: r.edge,
+        project_key: target.projectKey,
+      });
+    } catch (e) {
+      return textError(toError(e).error);
+    }
+  });
+
+  // ---- memory_reinforce (signal-driven importance bump) ----
+  server.tool(TOOL_DEFS[20].name, TOOL_DEFS[20].input, async (args) => {
+    try {
+      const pr = resolveProjectRoot(args.cwd);
+      if (!pr.ok) return textError(pr.error);
+      const sc = validateScope(args.scope, { read: false });
+      if (!sc.ok) return textError(sc.error);
+      const id = validateId(args.id);
+      if (!id.ok) return textError(id.error);
+      const target = openScopeDb({ cwd: pr.value, scope: sc.value });
+      const memory = reinforceMemory(target.db, target.projectKey, id.value);
+      if (!memory) return textError(`memory not found in ${sc.value} scope: ${id.value}`);
+      return ok({
+        operation: 'reinforced',
+        scope: sc.value,
+        memory,
+        project_key: target.projectKey,
+      });
+    } catch (e) {
+      return textError(toError(e).error);
+    }
+  });
+
+  // ---- memory_conclusions_for (find conclusions that synthesize a memory) ----
+  server.tool(TOOL_DEFS[21].name, TOOL_DEFS[21].input, async (args) => {
+    try {
+      const pr = resolveProjectRoot(args.cwd);
+      if (!pr.ok) return textError(pr.error);
+      const sc = validateScope(args.scope, { read: true });
+      if (!sc.ok) return textError(sc.error);
+      const id = validateId(args.id);
+      if (!id.ok) return textError(id.error);
+      const lim = validateLimit(args.limit, 1, 200, 50);
+      if (!lim.ok) return textError(lim.error);
+      const scope = sc.value;
+      const merged = [];
+      if (scope === 'project' || scope === 'all') {
+        const target = openScopeDb({ cwd: pr.value, scope: 'project' });
+        const items = listConclusionsFor(target.db, target.projectKey, id.value, {
+          limit: lim.value,
+        });
+        merged.push(...items.map((m) => ({ ...m, scope: 'project' })));
+      }
+      if (scope === 'global' || scope === 'all') {
+        const target = openScopeDb({ cwd: pr.value, scope: 'global' });
+        const items = listConclusionsFor(target.db, GLOBAL_PROJECT_KEY, id.value, {
+          limit: lim.value,
+        });
+        merged.push(...items.map((m) => ({ ...m, scope: 'global' })));
+      }
+      merged.sort((a, b) => {
+        const tc = (b.updated_at || '').localeCompare(a.updated_at || '');
+        return tc !== 0 ? tc : (b.priority || 0) - (a.priority || 0);
+      });
+      const items = merged.slice(0, lim.value);
+      return ok({
+        operation: 'conclusions_for',
+        scope,
+        id: id.value,
+        items,
+        count: items.length,
+        project_key:
+          scope === 'global'
+            ? GLOBAL_PROJECT_KEY
+            : deriveProjectKey(canonicalizeRoot(pr.value) || pr.value),
+      });
+    } catch (e) {
+      return textError(toError(e).error);
+    }
+  });
+
+  // ---- memory_parents (inverse: parents of a conclusion) ----
+  server.tool(TOOL_DEFS[22].name, TOOL_DEFS[22].input, async (args) => {
+    try {
+      const pr = resolveProjectRoot(args.cwd);
+      if (!pr.ok) return textError(pr.error);
+      const sc = validateScope(args.scope, { read: false });
+      if (!sc.ok) return textError(sc.error);
+      const id = validateId(args.id);
+      if (!id.ok) return textError(id.error);
+      const lim = validateLimit(args.limit, 1, 500, 200);
+      if (!lim.ok) return textError(lim.error);
+      const target = openScopeDb({ cwd: pr.value, scope: sc.value });
+      const items = getParents(target.db, target.projectKey, id.value, { limit: lim.value });
+      return ok({
+        operation: 'parents',
+        scope: sc.value,
+        id: id.value,
+        items,
+        count: items.length,
+        project_key: target.projectKey,
+      });
+    } catch (e) {
+      return textError(toError(e).error);
+    }
   });
 
   // ---- ingest implementation (also used by hooks via JSON IPC) ----
@@ -671,19 +1387,27 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
     let wdk = workDirKey || prev.work_dir_key || null;
     if (!wdk) {
       const idx = await readSessionIndex(home);
-      const hit = idx.find((e) => e && (e.sessionId === sessionId || e.session_id === sessionId || e.id === sessionId));
+      const hit = idx.find(
+        (e) => e && (e.sessionId === sessionId || e.session_id === sessionId || e.id === sessionId),
+      );
       if (hit && (hit.work_dir_key || hit.workDirKey)) wdk = hit.work_dir_key || hit.workDirKey;
     }
     const filePath = await locateSessionArchive(home, wdk, sessionId);
     if (!filePath) {
-      return { ingested: 0, status: 'archive_not_found', session_id: sessionId, work_dir_key: wdk, project_key: projectKey };
+      return {
+        ingested: 0,
+        status: 'archive_not_found',
+        session_id: sessionId,
+        work_dir_key: wdk,
+        project_key: projectKey,
+      };
     }
     upsertConversation(db, projectKey, sessionId, cwd);
-    const startByte = force ? 0 : (prev.byte_offset || 0);
-    let lastEventAt = force ? null : (prev.last_event_at || null);
+    const startByte = force ? 0 : prev.byte_offset || 0;
+    let lastEventAt = force ? null : prev.last_event_at || null;
     let finalOffset = startByte;
     let newEvents = 0;
-    let lineNo = force ? 0 : (prev.line_count || 0);
+    let lineNo = force ? 0 : prev.line_count || 0;
     const lineBase = lineNo;
     for await (const ev of walkWire(filePath, startByte, lineBase)) {
       finalOffset = ev.nextByteOffset;
@@ -716,7 +1440,10 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
     return { content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }] };
   }
   function textError(message) {
-    return { isError: true, content: [{ type: 'text', text: JSON.stringify({ error: String(message) }) }] };
+    return {
+      isError: true,
+      content: [{ type: 'text', text: JSON.stringify({ error: String(message) }) }],
+    };
   }
 
   return { server, ingestOne, _deps: { kimiHome: home, pluginRoot: root, logger: log } };
