@@ -8,7 +8,7 @@ Two subsystems live in this plugin since the 2026-07-31 merge:
 
 1. **Memory** — three-layer durable store (global user, per-project durable
    - working, per-project session archive) exposed via the `kimi-memory` MCP
-     server. 23 tools.
+     server. 24 tools, including `memory_prune` for orphan-project cleanup.
 2. **Advisor** — keyword detection on `UserPromptSubmit` plus the
    `advisor` skill (anchored recommendation procedure). Zero runtime deps;
    pure ESM + stdlib.
@@ -23,6 +23,11 @@ The advisor subsystem shares this plugin's hooks (`src/hooks/run.js` calls
   `validation.js` is shared input validation, `util.js` is shared helpers,
   `extract.js` runs the auto-extraction LLM call, `backfill.js` rebuilds
   embeddings for older rows, `embedding.js` wraps the MiniLM encoder.
+  Schema is v6: the v6 migration adds a `project_paths` table that
+  records the canonical project root for each project DB so
+  `memory_prune` can detect orphans (project roots that no longer exist
+  on disk). The MCP server and the hook runner stamp this table on
+  every project DB open.
 - `src/mcp/main.js` — stdio entry point for the MCP server.
 - `src/hooks/run.js` — single Node script consumed by every hook entry in
   `hooks/`. The hooks directory only contains thin wrappers that set
@@ -42,7 +47,8 @@ The advisor subsystem shares this plugin's hooks (`src/hooks/run.js` calls
   manifest); `skills/list_memories/SKILL.md` and `skills/advisor/SKILL.md`
   are loaded on demand via `/list_memories`, `/advisor`, or skill reference.
 - `commands/` — Kimi-side slash commands. `list-memories.md`, `advisor.md`,
-  `memos.md` (the last one opens kimi-memos-dashboard in the browser).
+  `memos.md` (the last one opens kimi-memos-dashboard in the browser),
+  `prune.md` (calls `memory_prune` after a dry-run review).
 - `ai-install.md` — agent-facing install procedure. The URL
   `https://raw.githubusercontent.com/cbuntingde/kimi-memory/main/ai-install.md`
   is the recommended paste-into-Kimi input; the agent fetches it and

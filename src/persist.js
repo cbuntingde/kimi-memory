@@ -22,7 +22,7 @@ import {
   cosineSimilarity,
 } from './embedding.js';
 
-const SCHEMA_VERSION = 5;
+const SCHEMA_VERSION = 6;
 
 // Schema migrations. Each entry is idempotent: it inspects the live
 // schema, no-ops when its target shape is already in place, and
@@ -209,6 +209,28 @@ const MIGRATIONS = [
     if (!idxSynth)
       db.exec('CREATE INDEX idx_memory_synthesizes_child ON memory_synthesizes(child_id)');
   },
+
+  // v6: project_paths registry. Records the canonical project root for
+  // every project_key that has ever opened this DB. Memory_prune reads
+  // this table to find project DBs whose canonical root no longer
+  // exists on disk (orphans from deleted projects). Idempotent: create-
+  // table-if-missing plus index-if-missing.
+  function migrateAddProjectPaths(db) {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS project_paths (
+        project_key    TEXT PRIMARY KEY,
+        canonical_root TEXT NOT NULL,
+        first_seen_at  TEXT NOT NULL,
+        last_seen_at   TEXT NOT NULL
+      )
+    `);
+    const idx = db
+      .prepare(
+        "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_project_paths_root'",
+      )
+      .get();
+    if (!idx) db.exec('CREATE INDEX idx_project_paths_root ON project_paths(canonical_root)');
+  },
 ];
 
 const SCHEMA_SQL = `
@@ -296,6 +318,19 @@ CREATE TABLE IF NOT EXISTS conversation_events (
   PRIMARY KEY (session_id, project_key, line_no)
 );
 CREATE INDEX IF NOT EXISTS idx_events_role ON conversation_events(session_id, project_key, role);
+
+-- v6: per-DB project_paths registry. Each row pins a project_key to the
+-- canonical project root the DB was last opened with. Memory_prune uses
+-- this to find orphan DBs whose project no longer exists on disk. The
+-- global DB has no canonical root of its own; its project_paths table
+-- stays empty.
+CREATE TABLE IF NOT EXISTS project_paths (
+  project_key    TEXT PRIMARY KEY,
+  canonical_root TEXT NOT NULL,
+  first_seen_at  TEXT NOT NULL,
+  last_seen_at   TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_project_paths_root ON project_paths(canonical_root);
 `;
 
 // Path-keyed handle cache. Each hook or MCP call may legitimately open
@@ -1405,6 +1440,35 @@ export async function saveIngestState(kimiHomeDir, projectKey, state) {
 // Count-only breakdown for one database (project or global). Pass the
 // already-open db handle plus the project_key value (a SHA-256 prefix
 // for project DBs, or the literal "_global" string for the global DB).
+// Record (or refresh) the canonical project root for `projectKey` in
+// this DB. Idempotent: re-recording the same root only updates
+// `last_seen_at`. Called by the MCP server's `openScopeDb` and the
+// hook runner every time a project DB is opened with a cwd.
+export function recordProjectPath(db, projectKey, canonicalRoot) {
+  if (!projectKey || !canonicalRoot) return;
+  const now = nowIso();
+  db.prepare(
+    `
+    INSERT INTO project_paths (project_key, canonical_root, first_seen_at, last_seen_at)
+    VALUES (?, ?, ?, ?)
+    ON CONFLICT(project_key) DO UPDATE SET
+      canonical_root = excluded.canonical_root,
+      last_seen_at   = excluded.last_seen_at
+  `,
+  ).run(projectKey, canonicalRoot, now, now);
+}
+
+// List every (project_key, canonical_root) pair this DB has ever seen.
+// Memory_prune uses this to map a project DB file back to a path on
+// disk and decide whether the project still exists.
+export function listProjectPaths(db) {
+  return db
+    .prepare(
+      'SELECT project_key, canonical_root, first_seen_at, last_seen_at FROM project_paths ORDER BY last_seen_at DESC',
+    )
+    .all();
+}
+
 export function memoryCounts(db, projectKey) {
   const total = db
     .prepare('SELECT COUNT(*) AS n FROM memories WHERE project_key=?')

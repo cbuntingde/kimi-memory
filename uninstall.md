@@ -167,3 +167,8 @@ step 3.
 - The plugin's source tree is plain ESM with no native build step;
   removing the managed copy and the local checkout is sufficient for a
   full uninstall on any supported platform.
+- For a softer cleanup that keeps the install but removes databases for
+  projects that no longer exist on disk, use `memory_prune(scope:
+"all-projects", apply: true)` via the MCP server or run
+  `/kimi-memory:prune`. The global database and the active project are
+  preserved; only orphan project DBs are removed.

@@ -1,7 +1,7 @@
 {
   "name": "kimi-memory",
-  "version": "0.2.0",
-  "description": "Kimi Code plugin: three-layer local memory (global user, per-project durable + working, per-project session archives) plus an integrated advisor subsystem for reflective prompts. Exposed via MCP tools, lifecycle hooks, and slash commands.",
+  "version": "0.3.0",
+  "description": "Kimi Code plugin: three-layer local memory (global user, per-project durable + working, per-project session archives) plus an integrated advisor subsystem for reflective prompts, with memory_prune for orphan-project cleanup. Exposed via MCP tools, lifecycle hooks, and slash commands.",
   "license": "MIT",
   "private": true,
   "type": "module",

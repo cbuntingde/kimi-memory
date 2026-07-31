@@ -85,7 +85,7 @@ Every MCP call requires the active project's absolute root as `cwd`. This preven
 
 ## Memory tools
 
-The plugin exposes **23 MCP tools** over the `kimi-memory` stdio server. Durable memory (scope-aware — defaults shown):
+The plugin exposes **24 MCP tools** over the `kimi-memory` stdio server. Durable memory (scope-aware — defaults shown):
 
 - `memory_save(scope, type, ...)` — default `scope: "project"`. Accepts `synthesizes: [childId, ...]` for the `conclusion` type to record which lower-level memories it was derived from.
 - `memory_recall(scope, query, ...)` — default `scope: "all"` (project hits first, then global). Hybrid search: FTS5 keyword match blended with cosine over stored embeddings when an embedding exists. Falls back to FTS5-only when `KIMI_MEMORY_EMBEDDINGS=off` or the model fails to load.
@@ -121,7 +121,11 @@ Combined summary:
 
 - `memory_status` — returns project + global durable-memory counts in one call.
 
-Successful memory operations return explicit operation metadata (`operation: "saved"|"saved_bulk"|"recalled"|"listed"|"got"|"updated"|"deleted"`), `scope`, item counts, and the affected memory `id` so callers can observe what was persisted.
+Maintenance (orphan-project cleanup):
+
+- `memory_prune(cwd, scope?, apply?)` — find (and optionally delete) project databases whose canonical project root no longer exists on disk. `scope` is `"project"` (default — only the active project) or `"all-projects"` (every project DB in the data root except the active one). `apply` defaults to `false` (dry run). The active project and the global database are never removed. Driven by the `project_paths` table that the MCP server and the hook runner update on every project DB open.
+
+Successful memory operations return explicit operation metadata (`operation: "saved"|"saved_bulk"|"recalled"|"listed"|"got"|"updated"|"deleted"|"pruned"`), `scope`, item counts, and the affected memory `id` so callers can observe what was persisted.
 
 ### Supersede semantics
 
@@ -310,6 +314,22 @@ Working-memory slots are appended as `- WM <slot>: <value>` lines, then nothing 
 
 Soft deletion is the default for memories. `memory_delete` with `hard: true` permanently removes the selected memory row.
 
+## Orphan-project cleanup
+
+When a project is deleted, moved, or rebuilt at a different path, its
+per-project database at
+`$KIMI_CODE_HOME/kimi-memory/<project-key>/memory.sqlite` stays on disk
+because the SHA-256 key was path-derived and the new path no longer
+hashes to the same key. `memory_prune` walks the data root, looks up
+each project DB's recorded canonical root in the `project_paths` table
+(stamped automatically on every project DB open by the MCP server and
+the hook runner), and reports any DB whose root no longer exists. The
+default `apply: false` is a dry run; re-run with `apply: true` to delete.
+
+The active project is always reported as `kept-active` regardless of
+`apply`. The global database is never in scope. To remove the
+install entirely, follow [`uninstall.md`](uninstall.md).
+
 ## Uninstall and data retention
 
 The complete uninstall procedure (slash command, managed-copy removal,
@@ -325,6 +345,13 @@ in [`uninstall.md`](uninstall.md). The short version:
   and `$KIMI_CODE_HOME/kimi-memory/_global/`. Wipe the whole tree with
   `rm -rf "$KIMI_CODE_HOME/kimi-memory/"` only when you want to erase
   every memory this plugin has stored.
+
+For a softer cleanup of just the orphan-project databases (project
+directories whose canonical root no longer exists on disk), use
+`memory_prune(scope: "all-projects")` for a dry run, then re-run with
+`apply: true` to remove the orphans. The global database and the active
+project's database are always preserved. The user-facing wrapper is the
+`/kimi-memory:prune` slash command.
 
 ## Development
 

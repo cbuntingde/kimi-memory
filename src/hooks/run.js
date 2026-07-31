@@ -35,6 +35,7 @@ import {
   updateConversationProgress,
   upsertConversation,
   decayMemories,
+  recordProjectPath,
 } from '../persist.js';
 import { locateSessionArchive, walkWire, readSessionIndex } from '../wire.js';
 import { runAutoExtract } from '../extract.js';
@@ -425,6 +426,10 @@ async function safeHandleStop(payload, cwd) {
     };
   }
   const db = openDb(path.join(HOME, 'kimi-memory', key, 'memory.sqlite'));
+  // Stamp the canonical project root so memory_prune (run via the MCP
+  // server or /kimi-memory:prune) can later detect orphan project DBs.
+  // No-op if `cwd` is missing or non-canonical.
+  if (cwd) recordProjectPath(db, key, cwd);
   upsertConversation(db, key, sessionId, cwd);
   const startByte = prev.byte_offset || 0;
   let lineNo = prev.line_count || 0;

@@ -110,7 +110,7 @@ test('plugin manifest reflects the merged memory + advisor displayName', () => {
 });
 
 test('manifest version matches package.json and package-lock.json', () => {
-  assert.equal(manifest.version, '0.2.0');
+  assert.equal(manifest.version, '0.3.0');
   assert.equal(pkg.version, manifest.version);
   assert.equal(lock.packages[''].version, manifest.version);
 });
@@ -165,7 +165,7 @@ test('_diagnostics/ is git-ignored so plugin-local log files do not dirty checko
 });
 
 test('commands/*.md have valid frontmatter so /plugins can derive descriptions', () => {
-  for (const name of ['list-memories.md', 'advisor.md', 'memos.md']) {
+  for (const name of ['list-memories.md', 'advisor.md', 'memos.md', 'prune.md']) {
     const p = path.join(root, 'commands', name);
     const body = readFileSync(p, 'utf8');
     assert.match(body, /^---\n[\s\S]*?\n---\n/, name + ' is missing YAML frontmatter');
@@ -211,4 +211,22 @@ test('README exposes the paste-able AI-driven install URL', () => {
     /https:\/\/raw\.githubusercontent\.com\/cbuntingde\/kimi-memory\/main\/ai-install\.md/,
     'README must include the raw URL to ai-install.md so the user can paste it into Kimi Code',
   );
+});
+
+test('memory_prune tool is registered, wired, and documented', () => {
+  const serverSrc = readFileSync(path.join(root, 'src', 'server.js'), 'utf8');
+  assert.match(serverSrc, /name: 'memory_prune'/, 'TOOL_DEFS must include memory_prune');
+  assert.match(
+    serverSrc,
+    /server\.tool\(\s*TOOL_DEFS\[(\d+)\]\.name, TOOL_DEFS\[\1\]\.input/,
+    'memory_prune must be wired into server.tool (same line)',
+  );
+  // The long description must mention it.
+  const long = (manifest.interface && manifest.interface.longDescription) || '';
+  assert.match(long, /memory_prune/, 'longDescription must mention memory_prune');
+  assert.match(long, /Tools \(24\):/, 'longDescription must claim Tools (24)');
+  // The slash command exists and links to the tool.
+  const pruneCmd = readFileSync(path.join(root, 'commands', 'prune.md'), 'utf8');
+  assert.match(pruneCmd, /memory_prune\(/);
+  assert.match(pruneCmd, /# \/kimi-memory:prune/);
 });

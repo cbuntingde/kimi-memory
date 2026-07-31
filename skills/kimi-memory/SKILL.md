@@ -81,6 +81,10 @@ Aggregate:
 
 - `memory_status` — returns project durable counts plus a parallel `global.memories` summary.
 
+Maintenance (orphan-project cleanup):
+
+- `memory_prune(cwd, scope?, apply?)` — find and optionally delete project DBs whose canonical root no longer exists on disk. `scope` is `"project"` (default — active only) or `"all-projects"`. `apply` defaults to `false` (dry run). The active project is always preserved; the global DB is never touched. Use this after deleting a project to clean up the per-project database, or run `/kimi-memory:prune` for a guided UI flow.
+
 ## Typical flow
 
 1. At `SessionStart` the plugin surfaces a compact status line + a brief summary like `Loaded 2 recent memories. (1 project, 1 global.)` (or `No recent memories.`) plus working-memory slots. Use the **counts** on the status line to decide what to look at; pull full content via `memory_recall` if needed.

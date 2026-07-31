@@ -244,3 +244,6 @@ travels as provenance context, never as the storage target.
   `README.md` § "Storage and privacy"
 - Complete uninstall (managed copy, memory databases, model cache):
   `uninstall.md`
+- Soft cleanup of orphan project DBs (project root no longer exists on
+  disk): `memory_prune(scope: "all-projects", apply: true)` or the
+  `/kimi-memory:prune` slash command.
