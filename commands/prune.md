@@ -54,14 +54,16 @@ before touching the filesystem. Review the list, then re-run with
   if the path exists, the project is alive and the entry should not
   be removed.
 - The global cross-project database (`$KIMI_CODE_HOME/kimi-memory/_global/`)
-  is not in scope. Removing it is the uninstall.md procedure, not
-  prune.
+  is not in scope. Removing it is a separate manual cleanup, not
+  `memory_prune`.
 
 ## Related
 
 - `memory_prune(scope: "project", apply: ...)` — check / clean a single
   project (use this when the user just deleted the active project and
   wants the current directory's memory swept immediately).
-- `uninstall.md` — remove the whole plugin and every database.
+- Manual removal — use `/plugins remove kimi-memory`, then remove the managed
+  copy and data directories described in `README.md` under "Uninstall and
+  data retention".
 - `memory_status` — counts of memories per scope; pair with prune when
   the user asks "is there anything old I should clean up?".

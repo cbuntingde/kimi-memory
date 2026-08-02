@@ -10,7 +10,7 @@
   "mcpServers": {
     "kimi-memory": {
       "command": "node",
-      "args": ["./src/mcp/main.js"],
+      "args": ["./src/mcp/launcher.js"],
       "cwd": "./"
     }
   },

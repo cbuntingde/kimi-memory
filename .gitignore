@@ -9,9 +9,9 @@ dist/
 _diagnostics/
 
 # Development / planning docs that should not ship with the plugin. The
-# repo's user-facing surface is README.md, ai-install.md, uninstall.md,
-# and CONTRIBUTING.md. Internal notes for AI agents and humans working
-# on the plugin itself stay on disk but out of the public index.
+# repo's user-facing surface is README.md and CONTRIBUTING.md. Internal notes
+# for AI agents and humans working on the plugin itself stay on disk but out
+# of the public index.
 AGENTS.md
 plans/
 todo/

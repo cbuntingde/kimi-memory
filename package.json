@@ -13,9 +13,9 @@
     "kimi-memory": "src/cli.js"
   },
   "scripts": {
-    "start": "node src/mcp/main.js",
+    "start": "node src/mcp/launcher.js",
     "test": "node --test --test-reporter=spec tests/*.test.js",
-    "check": "node --check src/mcp/main.js && node --check src/server.js && node --check src/persist.js && node --check src/embedding.js && node --check src/backfill.js && node --check src/extract.js && node --check src/wire.js && node --check src/project-key.js && node --check src/hooks/run.js && node --check src/advisor/detect.js && node --check src/validation.js && node --check src/util.js && node --check src/cli.js && node --check hooks/session-start.js && node --check hooks/user-prompt-submit.js && node --check hooks/stop.js && node --check hooks/session-end.js && node --check hooks/pre-compact.js && node --check hooks/interrupt.js && node --check hooks/stop-failure.js",
+    "check": "node --check src/mcp/launcher.js && node --check src/mcp/main.js && node --check src/server.js && node --check src/persist.js && node --check src/embedding.js && node --check src/backfill.js && node --check src/extract.js && node --check src/wire.js && node --check src/project-key.js && node --check src/hooks/run.js && node --check src/advisor/detect.js && node --check src/validation.js && node --check src/util.js && node --check src/cli.js && node --check hooks/session-start.js && node --check hooks/user-prompt-submit.js && node --check hooks/stop.js && node --check hooks/session-end.js && node --check hooks/pre-compact.js && node --check hooks/interrupt.js && node --check hooks/stop-failure.js",
     "backfill-embeddings": "node src/backfill.js",
     "format:check": "prettier --check ."
   },

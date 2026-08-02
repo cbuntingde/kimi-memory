@@ -18,7 +18,7 @@ test('manifest has the required high-value fields', () => {
   assert.equal(manifest.name, 'kimi-memory');
   assert.ok(manifest.mcpServers && manifest.mcpServers['kimi-memory']);
   assert.equal(manifest.mcpServers['kimi-memory'].command, 'node');
-  assert.deepEqual(manifest.mcpServers['kimi-memory'].args, ['./src/mcp/main.js']);
+  assert.deepEqual(manifest.mcpServers['kimi-memory'].args, ['./src/mcp/launcher.js']);
   assert.equal(manifest.mcpServers['kimi-memory'].cwd, './');
   assert.ok(Array.isArray(manifest.hooks));
   assert.ok(manifest.skills);
@@ -187,30 +187,17 @@ test('advisor command no longer claims a non-existent /reflect alias', () => {
   );
 });
 
-test('uninstall.md exists, is tracked, and documents the full teardown', () => {
-  const uninstallPath = path.join(root, 'uninstall.md');
-  assert.ok(existsSync(uninstallPath), 'uninstall.md must exist at the repo root');
-  const body = readFileSync(uninstallPath, 'utf8');
-  // The doc must mention the plugin id so /plugins remove kimi-memory is unambiguous.
-  assert.match(body, /\/plugins remove kimi-memory/);
-  assert.match(body, /plugins\/managed\/kimi-memory/);
-  // It must describe the destructive memory wipe so users see what they are deleting.
-  assert.match(body, /\$KIMI_CODE_HOME\/kimi-memory/);
-  assert.match(body, /_global/);
-  // The README and ai-install.md must link to it.
-  const readme = readFileSync(path.join(root, 'README.md'), 'utf8');
-  const aiInstall = readFileSync(path.join(root, 'ai-install.md'), 'utf8');
-  assert.match(readme, /uninstall\.md/);
-  assert.match(aiInstall, /uninstall\.md/);
-});
-
-test('README exposes the paste-able AI-driven install URL', () => {
+test('README documents GitHub installation and inline teardown', () => {
   const readme = readFileSync(path.join(root, 'README.md'), 'utf8');
   assert.match(
     readme,
-    /https:\/\/raw\.githubusercontent\.com\/cbuntingde\/kimi-memory\/main\/ai-install\.md/,
-    'README must include the raw URL to ai-install.md so the user can paste it into Kimi Code',
+    /\/plugins install https:\/\/github\.com\/cbuntingde\/kimi-memory/,
+    'README must include the GitHub plugin install command',
   );
+  assert.match(readme, /\/plugins remove kimi-memory/);
+  assert.match(readme, /plugins\/managed\/kimi-memory/);
+  assert.match(readme, /\$KIMI_CODE_HOME\/kimi-memory/);
+  assert.match(readme, /_global/);
 });
 
 test('memory_prune tool is registered, wired, and documented', () => {
