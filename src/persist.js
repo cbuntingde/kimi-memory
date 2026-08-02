@@ -1428,9 +1428,15 @@ export function clearWorkingMemory(db, projectKey, slot) {
 }
 
 export function listWorkingMemory(db, projectKey) {
+  // The secondary `rowid DESC` sort is a tie-breaker for the common
+  // case where many slots were set in the same millisecond — without
+  // it, slots inserted back-to-back can return in non-deterministic
+  // order across calls, and the UserPromptSubmit preview line for
+  // "current_focus" can flicker. rowid is the auto-incrementing
+  // physical position so the newest write on ties still wins.
   return db
     .prepare(
-      'SELECT slot, value, updated_at FROM working_memory WHERE project_key=? ORDER BY updated_at DESC',
+      'SELECT slot, value, updated_at FROM working_memory WHERE project_key=? ORDER BY updated_at DESC, rowid DESC',
     )
     .all(projectKey);
 }

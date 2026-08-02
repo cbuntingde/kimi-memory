@@ -26,9 +26,12 @@ Collect these before doing anything; every later step depends on them.
 
 1. `kimi --version` prints a version. If not, Kimi Code is missing on this
    host — stop and tell the user.
-2. `node -v` is `>=24.0.0`. The plugin uses `node:sqlite`, which Node 24
-   ships built-in; older majors fail at MCP startup with an unhelpful
-   `ERR_UNKNOWN_BUILTIN` and the failure surfaces only after reload.
+2. `node -v` is `>=24.0.0` and `npm -v` is `>=10.0.0`. The plugin uses
+   `node:sqlite`, which Node 24 ships built-in; older majors fail at MCP
+   startup with an unhelpful `ERR_UNKNOWN_BUILTIN` and the failure
+   surfaces only after reload. `engines.npm` in `package.json` is
+   `>=10.0.0`; older npm versions will warn but the install will
+   succeed.
 3. Resolve `$KIMI_CODE_HOME`. Default `~/.kimi-code/`. If `KIMI_CODE_HOME`
    is exported, trust that and do not probe the default; the two roots
    have independent `installed.json` files.
@@ -223,16 +226,25 @@ travels as provenance context, never as the storage target.
 
 - **No remote sync.** Storage is local SQLite per machine. Backup is
   the user's problem (`$KIMI_CODE_HOME/kimi-memory/`).
-- **No secret enforcement.** `memory_save` accepts anything. The rule
-  against storing API keys, tokens, password strings, `.env` bodies,
-  and PII lives in `AGENTS.md` and the plugin's `skillInstructions`.
-  There is no persist-layer gate; it is a hygiene rule, not a system.
+- **Secret enforcement is server-side, not agent-side.** `saveMemory`
+  runs `looksLikeSecret` on the new title and content and refuses to
+  persist a row that matches a known credential shape (OpenAI,
+  Anthropic, GitHub, AWS, JWT, PEM, `key=…` assignments, `Authorization:
+Bearer` headers). The agent cannot bypass this through a creative
+  prompt — the gate is at the lowest layer. The only opt-out is
+  `KIMI_MEMORY_SECRET_SCAN=off` in the server environment; do not set
+  it unless a fixture genuinely requires a secret-shaped string.
 - **No project scope.** Plugins are per-user only — there is no
   per-repo install. For per-repo MCP, write `.kimi-code/mcp.json` in
   the repo; for per-repo memory, pass that repo's absolute root as
   `cwd` on every memory call.
 - **No cwd auto-capture.** MCP tools do not see Kimi's working
   directory. Always pass `cwd` explicitly; do not assume.
+- **Embedding load is wall-clock bounded.** The first `embedText` call
+  on a cold cache is capped at 4 s (`KIMI_MEMORY_EMBED_TIMEOUT_MS`).
+  A timeout is reported in the row's `last_embed_error` so the
+  operator can see the cause; the hook exits cleanly and the FTS-only
+  fallback handles the recall.
 
 ## References
 

@@ -79,9 +79,24 @@ This repository does not install or enable itself globally.
 
 - `/list_memories` — unqualified Skill shorthand. Calls `memory_list` with `scope: "all"`.
 - `/kimi-memory:list_memories` — guaranteed namespaced plugin-command fallback.
+- `/kimi-memory:advisor` — runs the advisor reflection procedure over the active project (anchored recommendations, no remote calls). Also reachable through natural-language triggers like "would we change anything" or "what would you do differently" — the auto-detect hook emits `[advisor] matched: ...` on the hook status.
+- `/kimi-memory:prune` — dry-run-first cleanup of orphan project databases (projects whose canonical root no longer exists on disk). Always dry-runs first; `--apply` removes after explicit confirmation.
+- `/kimi-memory:memos` — open the companion `kimi-memos-dashboard` in the default browser (read-only view of every kimi-memory SQLite database; the dashboard is a separate plugin that the user must start).
 - Natural language such as "list memories", "remember this decision", or "what did we decide?" invokes the same MCP tools when the Skill matches.
 
 Every MCP call requires the active project's absolute root as `cwd`. This prevents accidental cross-project writes and gives global writes the correct provenance context.
+
+## Environment variables
+
+All optional. Defaults are tuned for production use; these are the override knobs.
+
+| Variable                       | Default | Effect                                                                                                                                                           |
+| ------------------------------ | ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `KIMI_MEMORY_EMBEDDINGS`       | `on`    | Set to `off` to skip the embedding encoder entirely. `memory_recall` falls back to FTS5-only; `memory_similar` returns `[]`.                                     |
+| `KIMI_MEMORY_EMBED_TIMEOUT_MS` | `4000`  | Wall-clock cap on a single embedding call. On timeout the row's `embedding_status` flips to `failed` with `last_embed_error = "embed_timeout: ..."`.             |
+| `KIMI_MEMORY_AUTO_EXTRACT`     | `on`    | Set to `off` to disable the Stop-hook auto-extraction LLM call. Also configurable as `[kimi-memory] disable_auto_extract = true` in `config.toml`.               |
+| `KIMI_MEMORY_SECRET_SCAN`      | `on`    | Set to `off` to bypass the server-side secret check on `saveMemory`. The check refuses to persist a row whose title or content matches a known credential shape. |
+| `KIMI_MEMORY_PERF`             | `on`    | Set to `off` to skip the `tests/16-perf.test.js` benchmarks (5k-corpus baseline). Useful on slow CI hosts.                                                       |
 
 ## Memory tools
 
@@ -127,6 +142,24 @@ Maintenance (orphan-project cleanup):
 
 Successful memory operations return explicit operation metadata (`operation: "saved"|"saved_bulk"|"recalled"|"listed"|"got"|"updated"|"deleted"|"pruned"`), `scope`, item counts, and the affected memory `id` so callers can observe what was persisted.
 
+### Standalone CLI
+
+The same surface is reachable without spinning up the MCP server via the `kimi-memory` bin entry:
+
+```bash
+kimi-memory list    [--cwd <path>] [--scope project|global|all] [--type <type>] [--limit N] [--json] [-q]
+kimi-memory get     <memory-id> [--scope project|global] [--cwd <path>] [--json]
+kimi-memory status  [--cwd <path>] [--json]
+kimi-memory recall  <query> [--cwd <path>] [--limit N] [--per-type] [--json]
+kimi-memory prune   [--cwd <path>] [--all-projects] [--apply] [--json]
+```
+
+`--json` emits machine-readable JSON; `-q` (list only) suppresses per-row output. `--home <dir>` overrides `$KIMI_CODE_HOME` for ops debugging on a non-default data root. The CLI never writes — `prune --apply` is the only mutating command and is gated by the same dry-run-first contract as the MCP `memory_prune` tool.
+
+### Secret scan on save
+
+`saveMemory` runs `looksLikeSecret` on the new title and content and throws `KIMI_MEMORY_SECRET_DETECTED` if either matches a known credential shape (OpenAI, Anthropic, GitHub, AWS, JWT, PEM, `key=…` assignments, `Authorization: Bearer` headers). The check is enforced at the lowest layer so every write path (`memory_save`, `memory_update`, `memory_merge`, `memory_save_bulk`, the auto-extract pass) inherits it. `memory_save_bulk` rolls back the whole batch on a single bad item. The only opt-out is `KIMI_MEMORY_SECRET_SCAN=off` in the server environment — for the rare case where a user genuinely needs to persist a secret-shaped string (a test fixture, an example). False positives are accepted: dropping a candidate that mentions a generic "api_key" is far cheaper than persisting a real one.
+
 ### Supersede semantics
 
 `memory_save` and `memory_save_bulk` both accept `supersede: true`. When set, the plugin looks for the **prior** `(project_key, type, title)` row(s) and:
@@ -150,7 +183,11 @@ Memory types:
 
 ### Schema version
 
-`SCHEMA_VERSION` is `5`. Existing databases are migrated in place on first open; the migration is idempotent and adds the `conclusion` type, the `memory_synthesizes` table, and (when missing) the `memory_edges` table and supporting indexes.
+`SCHEMA_VERSION` is `8`. Existing databases are migrated in place on first open; migrations are idempotent and append a new column or table when missing. The current migration stack covers:
+
+- v6: `project_paths` table — records the canonical project root for each project DB so `memory_prune` can detect orphans.
+- v7: `last_embed_error` column on `memories` — a failed embedding pass is observable via `rowToMemory.embedding_status: 'failed'` instead of staying `pending` forever.
+- v8: `last_canonical_root` + `record_count` columns on `project_paths` — a project that moved is recorded with a move history (the prior canonical root is preserved on re-record).
 
 ## Higher-level features
 
@@ -159,6 +196,8 @@ Memory types:
 The `memories` table carries an optional 384-dim `embedding` (stored as `BLOB`, float32). By default every `memory_save`, `memory_recall`, `memory_save_bulk`, and `memory_merge` call computes an embedding for the title+content and stores it. `memory_recall` runs FTS5 keyword search and cosine similarity in parallel and merges the two ranked lists (deduplicating by id). `memory_similar(scope, id)` returns memories closest to a seed memory's embedding.
 
 The model is `Xenova/all-MiniLM-L6-v2` (quantised, ~25 MB on disk) and is fetched lazily from Hugging Face on first use; the model is cached locally afterwards, so subsequent calls do not require network access. Set `KIMI_MEMORY_EMBEDDINGS=off` to skip embedding entirely (the rest of the surface still works, only similarity is unavailable). When the model fails to load or is opted out, `memory_recall` falls back to FTS5-only and `memory_similar` returns `[]`.
+
+The encoder load is wall-clock bounded at 4 s (`KIMI_MEMORY_EMBED_TIMEOUT_MS` overrides), comfortably under the 5 s hook budget. On a timeout the row's `embedding_status` flips to `failed` and `last_embed_error` records `embed_timeout: ...` so the operator can see the cause without a separate log dive; the next call rides the in-flight load if it eventually lands.
 
 ### Edges and merge
 
@@ -209,9 +248,11 @@ Lifecycle hooks run at `SessionStart`, `UserPromptSubmit`, `Stop`, `SessionEnd`,
 `SessionStart` and `UserPromptSubmit` write a compact status line plus a brief summary line to stdout. The status line always reports project key, active project and global memory counts, working-slot count, conversations, conversation events, ingest status (event count or skip reason), and (for `UserPromptSubmit`) project/global recall hit counts. The summary line is intentionally short so the agent's chat stays uncluttered:
 
 - SessionStart: `Loaded N recent memories. (N project, N global.)` or `No recent memories.`
-- UserPromptSubmit: `Recalled N memory/memories. (N project, N global.)` or `No recall hits.`
+- UserPromptSubmit: `Recalled N memory/memories. (N project, N global.) [semantic: 2, procedural: 1]` (a per-type breakdown appended when there are hits) or `No recall hits.`.
 
-Working-memory slots are still emitted as compact `- WM <slot>: <value>` lines, since the agent's current focus is the one piece of context it consistently needs at session start. The agent can pull full memory content via `memory_recall` whenever it needs the actual bodies — the hook deliberately does not echo them. Raw prompts and memory bodies are never written to stdout.
+The `UserPromptSubmit` summary is followed by up to three `[recall: i/N] "title" (type, scope, score=…) — <body snippet>` lines, sorted by score. The body snippet is the first non-empty line of the memory's `content`, capped at 120 characters, so the user can verify what was recalled without depending on the agent to translate titles into substance. Snippets are bounded; full bodies are pulled by the agent via `memory_recall` only when the snippet is not enough.
+
+Working-memory slots are still emitted as compact `- WM <slot>: <value>` lines, since the agent's current focus is the one piece of context it consistently needs at session start. The hook deliberately does **not** echo full memory bodies, raw prompts, or session transcripts on stdout.
 
 The remaining hooks (`Stop`, `SessionEnd`, `PreCompact`, `Interrupt`, `StopFailure`) are silent on stdout and run only the idempotent project-session ingest. They are fail-open and never block Kimi's lifecycle on a transcript problem.
 
@@ -239,7 +280,7 @@ The plugin is local-first: SQLite databases live under `$KIMI_CODE_HOME/kimi-mem
 - Auto-extraction sends one short LLM call per `Stop` event to the model configured in `$KIMI_CODE_HOME/config.toml`. Disable it via `KIMI_MEMORY_AUTO_EXTRACT=off` or `[kimi-memory] disable_auto_extract = true` in `config.toml`.
 
 - Project conversation archives may contain prompts, model responses, tool arguments, and tool output, so protect the Kimi data directory. Automatic full-conversation archival cannot guarantee that a conversation never contains sensitive text.
-- Memory-save instructions prohibit deliberately saving API keys, passwords, credentials, `.env` contents, and other secrets. The plugin never lazy-creates the global database on a read; it only opens an existing global DB or accepts an explicit global save.
+- Memory-save instructions prohibit deliberately saving API keys, passwords, credentials, `.env` contents, and other secrets. The persist layer also enforces this: `saveMemory` runs `looksLikeSecret` on the new title and content and refuses to land a row that matches a known credential shape. The plugin never lazy-creates the global database on a read; it only opens an existing global DB or accepts an explicit global save.
 
 ## Reading `memory_status`
 
@@ -293,11 +334,19 @@ Loaded 2 recent memories. (1 project, 1 global.)
 ```
 
 ```text
-Recalled 1 memory. (1 global.)
+Recalled 3 memories. (2 project, 1 global.) [semantic: 2, procedural: 1]
 ```
 
 ```text
 No recall hits.
+```
+
+**Recall lines** (up to three on `UserPromptSubmit`, sorted by score, when the summary above reports hits):
+
+```text
+[recall: 1/3] "semantic use tabs" (semantic, project, score=0.78) — indent with tabs not spaces for release
+[recall: 2/3] "Tabs for release" (procedural, project, score=0.50) — run prettier with --use-tabs before tagging
+[recall: 3/3] "User prefers dark mode" (semantic, global, score=0.45) — dark mode is the default for new sessions
 ```
 
 **Advisor match line** (zero or one line on `UserPromptSubmit` only, when the prompt contains a frozen keyword):
@@ -306,9 +355,9 @@ No recall hits.
 [advisor] matched: "would we change" — /advisor or ask naturally; skill `advisor` is loaded
 ```
 
-The frozen keyword list lives in `src/advisor/detect.js`; the advisor subsystem is fail-open and only logs to its own `<plugin-root>/_diagnostics/advisor-hooks.log`.
+The frozen keyword list lives in `src/advisor/detect.js`; a per-sentence negation gate (20+ markers) suppresses matches when the keyword shares a sentence with words like "wouldn't", "not", "never". The advisor subsystem is fail-open and only logs to its own `<plugin-root>/_diagnostics/advisor-hooks.log`.
 
-Working-memory slots are appended as `- WM <slot>: <value>` lines, then nothing else. The hooks never echo memory bodies, raw prompts, or session transcripts. The agent pulls full memory content via `memory_recall` when it actually needs it.
+Working-memory slots are appended as `- WM <slot>: <value>` lines, then nothing else. The hooks do **not** echo full memory bodies, raw prompts, or session transcripts; per-memory recall lines carry a bounded body snippet (capped at 120 chars) so the user can verify the recall without a second round-trip. The agent pulls full memory content via `memory_recall` when the snippet is not enough.
 
 ## Soft deletion
 
@@ -363,7 +412,7 @@ npm run format:check # prettier --check on every tracked file
 npm run backfill-embeddings   # rebuild embeddings for older rows
 ```
 
-The `assets/` directory is reserved for future plugin assets (icons, theme tokens, prompt snippets) and is kept under version control so the manifest and test suite can rely on a stable relative path. The current build ships it empty.
+The `assets/` directory holds the static assets the plugin ships with — currently `icon.svg` (a three-node knowledge-graph display icon) and a small `README.md` describing the contents. The directory is kept under version control so the manifest and test suite can rely on a stable relative path.
 
 ## Official references
 

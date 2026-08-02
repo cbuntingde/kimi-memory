@@ -76,8 +76,11 @@ $KIMI_CODE_HOME/kimi-memory/<project-key>/memory.sqlite   # one per project
 $KIMI_CODE_HOME/kimi-memory/_global/memory.sqlite         # cross-project user memory
 ```
 
-Each project directory also contains diagnostic log files
-(`_diagnostics/hooks.log`, etc.) and an `index/` cache.
+Each project directory also contains a `ingest-state.json` cursor
+(the byte/line offset the hook runner last read up to). Diagnostic logs
+land under `$KIMI_CODE_HOME/kimi-memory/_diagnostics/hooks.log` and
+`<plugin-root>/_diagnostics/advisor-hooks.log` (the latter is a sibling
+of the managed copy and travels with the source checkout).
 
 Erase everything in one go:
 

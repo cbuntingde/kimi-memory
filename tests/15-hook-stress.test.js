@@ -152,14 +152,17 @@ test('SessionStart hook: working-memory preview is bounded to 5 of 6 seeded slot
     const r = spawnSessionStart(home, cwd);
     assert.equal(r.status, 0);
     // Count the "WM slot_N: …" preview lines. The cap is 5, so
-    // exactly 5 of the 6 seeded slots should appear, in their
-    // natural (insertion) order: slot_0 … slot_4.
+    // exactly 5 of the 6 seeded slots should appear. listWorkingMemory
+    // sorts by updated_at DESC with a rowid tie-breaker (newest first),
+    // so the LAST inserted slot is the first in the preview — the
+    // earliest-inserted slot (slot_0) is the one that falls off the
+    // cap.
     const wmMatches = [...r.stdout.matchAll(/^- WM (slot_\d+): /gm)].map((m) => m[1]);
     assert.equal(wmMatches.length, 5, `exactly 5 WM previews, got ${wmMatches.length}`);
     assert.deepEqual(
       wmMatches,
-      ['slot_0', 'slot_1', 'slot_2', 'slot_3', 'slot_4'],
-      'preview keeps insertion order; slot_5 is dropped',
+      ['slot_5', 'slot_4', 'slot_3', 'slot_2', 'slot_1'],
+      'preview is newest-first; slot_0 is dropped',
     );
   } finally {
     rmRf(home);
