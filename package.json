@@ -1,17 +1,21 @@
 {
   "name": "kimi-memory",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Kimi Code plugin: three-layer local memory (global user, per-project durable + working, per-project session archives) plus an integrated advisor subsystem for reflective prompts, with memory_prune for orphan-project cleanup. Exposed via MCP tools, lifecycle hooks, and slash commands.",
   "license": "MIT",
   "private": true,
   "type": "module",
   "engines": {
-    "node": ">=24.0.0"
+    "node": ">=24.0.0",
+    "npm": ">=10.0.0"
+  },
+  "bin": {
+    "kimi-memory": "src/cli.js"
   },
   "scripts": {
     "start": "node src/mcp/main.js",
     "test": "node --test --test-reporter=spec tests/*.test.js",
-    "check": "node --check src/mcp/main.js && node --check src/server.js && node --check src/persist.js && node --check src/embedding.js && node --check src/backfill.js && node --check src/extract.js && node --check src/wire.js && node --check src/project-key.js && node --check src/hooks/run.js && node --check src/advisor/detect.js && node --check src/validation.js && node --check src/util.js && node --check hooks/session-start.js && node --check hooks/user-prompt-submit.js && node --check hooks/stop.js && node --check hooks/session-end.js && node --check hooks/pre-compact.js && node --check hooks/interrupt.js && node --check hooks/stop-failure.js",
+    "check": "node --check src/mcp/main.js && node --check src/server.js && node --check src/persist.js && node --check src/embedding.js && node --check src/backfill.js && node --check src/extract.js && node --check src/wire.js && node --check src/project-key.js && node --check src/hooks/run.js && node --check src/advisor/detect.js && node --check src/validation.js && node --check src/util.js && node --check src/cli.js && node --check hooks/session-start.js && node --check hooks/user-prompt-submit.js && node --check hooks/stop.js && node --check hooks/session-end.js && node --check hooks/pre-compact.js && node --check hooks/interrupt.js && node --check hooks/stop-failure.js",
     "backfill-embeddings": "node src/backfill.js",
     "format:check": "prettier --check ."
   },

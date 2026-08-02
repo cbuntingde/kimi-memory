@@ -30,7 +30,7 @@ Pick the right scope for every fact you save or recall:
 
 ## Hygiene rules
 
-- Never store secrets (API keys, tokens, passwords, credentials, `.env` contents, PII). If asked to remember a secret, refuse and explain.
+- Never store secrets (API keys, tokens, passwords, credentials, `.env` contents, PII). If asked to remember a secret, refuse and explain. The server enforces this too: `memory_save` and `memory_save_bulk` (and `memory_update` / `memory_merge`) run a shape check on title and content and return a `secret_detected: refusing to persist…` error if either matches a known credential shape (OpenAI, Anthropic, GitHub, AWS, JWT, PEM, `key=…` assignments, `Authorization: Bearer` headers). On a bulk save the whole batch is rolled back. The check is bypassed by setting `KIMI_MEMORY_SECRET_SCAN=off` in the server environment — do not do this unless the caller explicitly asks for a secret-shaped fixture.
 - Always pass the project root (the cwd of the current session) as `cwd` — even for `scope: "global"` writes (it stays as provenance/audit context).
 - Always `memory_recall` (default `scope: "all"`) **before** `memory_save` so you don't duplicate. If a recall hit exists, prefer update or `supersede: true`.
 - After a successful `memory_save` / `memory_update` / `memory_delete`, echo the returned `id` and `scope` so the user can see what was persisted.
@@ -88,9 +88,24 @@ Maintenance (orphan-project cleanup):
 ## Typical flow
 
 1. At `SessionStart` the plugin surfaces a compact status line + a brief summary like `Loaded 2 recent memories. (1 project, 1 global.)` (or `No recent memories.`) plus working-memory slots. Use the **counts** on the status line to decide what to look at; pull full content via `memory_recall` if needed.
-2. `UserPromptSubmit` emits the same status line plus a brief recall summary like `Recalled 1 memory. (1 global.)` (or `No recall hits.`). If the summary indicates hits, call `memory_recall` to read the bodies.
+2. `UserPromptSubmit` emits the same status line plus a recall summary that names the types of memories that matched (e.g. `Recalled 3 memories. (2 project, 1 global.) [semantic: 2, procedural: 1]`) and up to three `[recall: i/N] "title" (type, scope, score=…) — <body snippet>` lines so the user can see exactly which memories surfaced. The trailing `— <body snippet>` is the first non-empty line of the memory's body, capped at 120 characters, so the user can verify the recall matched what they expected without depending on the title alone. Pull full bodies via `memory_recall` only when the snippet is not enough.
 3. If the user states something durable: call `memory_save` with the right scope. Echo the returned `operation`, `scope`, and `memory.id`.
 4. Before answering a recall-style question: `memory_recall` (default `scope: "all"`).
 5. When the topic moves on: update or clear the working-memory slot.
 
-The hooks deliberately do **not** echo memory bodies, raw prompts, or session transcripts on stdout. They surface counts and brief summaries only so the chat stays uncluttered.
+The hooks deliberately do **not** echo full memory bodies, raw prompts, or session transcripts on stdout. They surface counts, type breakdowns, and bounded per-memory lines (title + a one-line body snippet) so the user can verify the recall matched, without flooding the chat.
+
+## Memory recall and acknowledgement
+
+When the `UserPromptSubmit` hook emits `[recall: i/N]` lines, the user can see them in the hook status (the same lines you see in your context). The user wants the agent to acknowledge what it remembered in plain language, not just use the content silently. The hook is the single source of truth for what was recalled — trust the `[recall: i/N]` lines: if the hook says a memory was recalled, treat it as recalled, and the user expects you to say so. This is a hard contract, not a guideline.
+
+- **Open with a recall acknowledgement when the hook reported hits.** If the hook printed `[recall: …]` lines, the first sentence of your reply must reference them. Use a fixed phrasing pattern so the acknowledgement is consistent and grep-able:
+  - With hits: open with `From your saved notes: <memory title>.` (or `From your saved notes: <title 1>, <title 2>.` for multiple), then continue with the answer.
+  - With no hits (hook printed `No recall hits.`): open with `No prior notes on this topic.` so the user knows you checked.
+  - Do not invent prior context when the hook reported no hits.
+- **Name each recalled memory by title, not by id or body.** Titles are user-facing labels; the user can read them on the hook line. Bodies are your private evidence. Quote a one-sentence paraphrase of the body when it is useful — never paste the full `content` field back at the user unless they explicitly asked for raw text. The `— <body snippet>` on each recall line is a bounded preview for verification, not raw text to copy.
+- **Stay in the recalled types.** The hook's per-type breakdown (e.g. `[semantic: 2, procedural: 1]`) tells you which memory classes matched. A recall that surfaces only `working`-typed notes is a different signal from one that surfaces `semantic` conventions — call it out: "I have a working note but no convention on this yet." A recall that surfaces only `conclusion` memories means the user already has a higher-order synthesis on file.
+- **Refresh recall only when the prompt needs it.** If the hook's titles (with their body snippets) already cover the question, do not call `memory_recall` again. Pull bodies only when the snippet is not enough. Calls are cheap, but a noisy answer is worse than a focused one.
+- **Save the durable artefact when the conversation produces one.** If the user states a preference, decision, or convention during the exchange, call `memory_save` (or `memory_save_bulk` for many) before the reply ends so the next session can recall it. Echo the returned `id` and `scope` so the user can see what was persisted.
+
+A model reply that uses recalled content without acknowledging it is broken: the user will see a hook line in their transcript and no matching reference in the agent's reply, and the trust in the recall mechanism erodes.

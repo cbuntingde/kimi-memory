@@ -22,6 +22,43 @@ import { nowIso, safeJsonParse, asString } from './util.js';
 const MAX_CANDIDATES_PER_CALL = 3;
 const MAX_INPUT_CHARS = 12000; // ~3k tokens of conversation context
 const LLM_TIMEOUT_MS = 4000; // hard cap on the chat call
+
+// Best-effort secret detection. The README and SKILL.md claim that
+// auto-extraction skips "anything that looks like a secret"; this
+// regex set is the implementation of that claim. The patterns cover
+// the well-known key shapes (OpenAI, Anthropic, GitHub, AWS, JWT,
+// PEM) plus generic `key/token/secret/password` assignments. False
+// positives are accepted: dropping a candidate that mentions a
+// generic "api_key" is far cheaper than persisting a real one.
+const SECRET_PATTERNS = [
+  // Provider-specific key shapes.
+  /\bsk-[A-Za-z0-9]{20,}\b/, // OpenAI
+  /\bsk-ant-[A-Za-z0-9-]{20,}\b/, // Anthropic
+  /\bxox[baprs]-[A-Za-z0-9-]{10,}\b/, // Slack
+  /\bAKIA[0-9A-Z]{16}\b/, // AWS access key
+  /\bghp_[A-Za-z0-9]{36}\b/, // GitHub PAT
+  /\bgithub_pat_[A-Za-z0-9_]{40,}\b/, // GitHub fine-grained PAT
+  /\bglpat-[A-Za-z0-9_-]{20,}\b/, // GitLab PAT
+  /\beyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\b/, // JWT
+  /-----BEGIN [A-Z ]*?PRIVATE KEY-----/, // PEM
+  /-----BEGIN [A-Z ]*?OPENSSH PRIVATE KEY-----/,
+  // Generic key/token/secret/password assignments — must follow a
+  // word boundary and have a non-trivial value (≥8 chars).
+  /(^|[\s,;])(?:api[_-]?key|api[_-]?token|access[_-]?token|auth[_-]?token|client[_-]?secret|secret[_-]?key|secret|password|passwd|pwd)\s*[:=]\s*["']?([A-Za-z0-9_/+=-]{8,})/i,
+  // Bearer / Authorization headers.
+  /Authorization\s*:\s*Bearer\s+[A-Za-z0-9_.-]{20,}/i,
+];
+
+// Returns true if the given text appears to contain a secret. Used
+// to filter auto-extracted candidate memories so a misbehaving model
+// reply does not persist a credential into the durable store.
+export function looksLikeSecret(text) {
+  if (typeof text !== 'string' || !text) return false;
+  for (const p of SECRET_PATTERNS) {
+    if (p.test(text)) return true;
+  }
+  return false;
+}
 const EXTRACT_SYSTEM_PROMPT = `You are a memory extraction module. Read the conversation and decide whether it contains any durable facts worth remembering for the user's future self.
 
 A "durable fact" is a preference, decision, convention, or stable context that would still be useful hours or days later. Skip transient debugging, in-flight tasks, and one-off questions.
@@ -34,11 +71,34 @@ Return [] if nothing qualifies. No prose, no markdown fences — JSON only.`;
 // segments that may contain dots, e.g. [models."minimax/MiniMax-M3"]),
 // basic scalars (string, int, float, bool), string arrays. Sufficient
 // for the config.toml we ship; not a full TOML implementation.
+//
+// The previous comment-stripping regex (#[^"]*$) was unsafe: it
+// matched a # that lives inside a string literal (e.g. key = "abc#def")
+// and truncated the value. The replacement walks the line char by
+// char so a # inside a quoted string is preserved, and a # outside
+// any string is treated as a comment terminator.
+function stripComment(line) {
+  let inQuote = null;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (inQuote) {
+      if (c === inQuote && line[i - 1] !== '\\') inQuote = null;
+      continue;
+    }
+    if (c === '"' || c === "'") {
+      inQuote = c;
+      continue;
+    }
+    if (c === '#') return line.slice(0, i);
+  }
+  return line;
+}
+
 function parseToml(text) {
   const out = {};
   let cur = out;
   for (const raw of text.split(/\r?\n/)) {
-    const line = raw.replace(/#[^"]*$/, '').trim(); // strip non-string comments
+    const line = stripComment(raw).trim();
     if (!line) continue;
     if (line.startsWith('[')) {
       const sec = line.replace(/^\[|\]$/g, '').trim();
@@ -415,6 +475,7 @@ export async function dedupeCandidates({
 //   extracted: 0,
 //   saved: 0,
 //   duplicates: 0,
+//   secrets_dropped: 0,
 //   error: string | null,
 // }
 export async function runAutoExtract({
@@ -433,8 +494,17 @@ export async function runAutoExtract({
   isDisabled = () => process.env.KIMI_MEMORY_AUTO_EXTRACT === 'off',
   isConfigDisabled = (cfg) =>
     !!(cfg && cfg['kimi-memory'] && cfg['kimi-memory'].disable_auto_extract),
+  // Injection seam for tests: replace the secret detector.
+  secretDetector = looksLikeSecret,
 }) {
-  const result = { skipped: null, extracted: 0, saved: 0, duplicates: 0, error: null };
+  const result = {
+    skipped: null,
+    extracted: 0,
+    saved: 0,
+    duplicates: 0,
+    secrets_dropped: 0,
+    error: null,
+  };
   if (isDisabled()) {
     result.skipped = 'env_opt_out';
     return result;
@@ -477,6 +547,15 @@ export async function runAutoExtract({
   result.duplicates = duplicates.length;
 
   for (const cand of kept) {
+    // Secret scrub: the model may echo back a credential the user
+    // typed in the transcript, or it may have invented a key in its
+    // own reply. Either way, a candidate that matches a known secret
+    // shape is dropped on the floor and counted in the result so the
+    // operator can see what was suppressed.
+    if (secretDetector(cand.content) || secretDetector(cand.title)) {
+      result.secrets_dropped += 1;
+      continue;
+    }
     try {
       saveMemory(db, projectKey, {
         type: cand.type,

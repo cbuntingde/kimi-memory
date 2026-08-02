@@ -156,6 +156,22 @@ function truncate(s, n) {
   return s.length > n ? s.slice(0, n) + '…' : s;
 }
 
+// Pick the first non-empty line of a memory body and squeeze it onto
+// one line so it can ride on the bounded [recall: i/N] line. Newlines
+// are collapsed to single spaces; tabs and runs of spaces become one
+// space. The result is trimmed. Returns '' for empty / missing bodies
+// so the caller can omit the trailing " — …" when there is nothing
+// useful to quote.
+function firstContentLine(content) {
+  if (typeof content !== 'string' || !content) return '';
+  const first = content
+    .split(/\r?\n/)
+    .map((line) => line.replace(/\s+/g, ' ').trim())
+    .find((line) => line.length > 0);
+  if (!first) return '';
+  return first.length > 120 ? first.slice(0, 120) + '…' : first;
+}
+
 // Used by the brief summary lines. We deliberately do NOT emit the
 // per-memory content in stdout — the agent can pull full content via
 // `memory_recall` if it needs it, and the chat stays uncluttered.
@@ -254,17 +270,45 @@ function buildWorkingMemoryPreview(projectDb, key) {
 
 async function buildRecallSummary({ projectDb, globalDb, key, prompt }) {
   const tokens = derivePromptTokens(prompt);
-  if (tokens.length === 0) return { summary: null, projectHits: 0, globalHits: 0, query: '' };
+  if (tokens.length === 0) {
+    return {
+      summary: null,
+      projectHits: [],
+      globalHits: [],
+      recallLines: [],
+      perTypeCounts: {},
+      query: '',
+    };
+  }
   const query = tokens.join(' ');
-  let projectHits = [];
-  let globalHits = [];
-  if (projectDb)
-    projectHits = await searchMemories(projectDb, key, query, { limit: PROMPT_RECALL_LIMIT });
-  if (globalDb)
-    globalHits = await searchMemories(globalDb, GLOBAL_PROJECT_KEY, query, {
-      limit: PROMPT_RECALL_LIMIT,
-    });
-  const total = projectHits.length + globalHits.length;
+  // Use perType + includeScore: the hook should surface a balanced
+  // selection across memory types (so the agent sees conventions AND
+  // procedures AND working notes, not five rows of the same type),
+  // and the scores feed the "[recall: i/N]" title lines the user
+  // sees below. PROMPT_RECALL_LIMIT is the per-scope cap.
+  const projectHits = projectDb
+    ? await searchMemories(projectDb, key, query, {
+        limit: PROMPT_RECALL_LIMIT,
+        perType: true,
+        includeScore: true,
+      })
+    : [];
+  const globalHits = globalDb
+    ? await searchMemories(globalDb, GLOBAL_PROJECT_KEY, query, {
+        limit: PROMPT_RECALL_LIMIT,
+        perType: true,
+        includeScore: true,
+      })
+    : [];
+  const allHits = [...projectHits, ...globalHits];
+  const total = allHits.length;
+
+  // Per-type breakdown across both scopes. The agent uses this to
+  // describe the recall in its reply ("I found 2 conventions and a
+  // procedure …"); the human reads the same line on the hook status.
+  const perTypeCounts = {};
+  for (const m of allHits) perTypeCounts[m.type] = (perTypeCounts[m.type] || 0) + 1;
+
   let summary;
   if (total === 0) {
     summary = 'No recall hits.';
@@ -272,9 +316,44 @@ async function buildRecallSummary({ projectDb, globalDb, key, prompt }) {
     const parts = [];
     if (projectHits.length) parts.push(`${projectHits.length} project`);
     if (globalHits.length) parts.push(`${globalHits.length} global`);
-    summary = `Recalled ${pluralize(total, 'memory', 'memories')}. (${parts.join(', ')}.)`;
+    const typeParts = Object.entries(perTypeCounts)
+      .sort((a, b) => b[1] - a[1])
+      .map(([t, n]) => `${t}: ${n}`);
+    const typeStr = typeParts.length ? ` [${typeParts.join(', ')}]` : '';
+    summary =
+      `Recalled ${pluralize(total, 'memory', 'memories')}. (${parts.join(', ')}.) ${typeStr}`.trim();
   }
-  return { summary, projectHits: projectHits.length, globalHits: globalHits.length, query };
+
+  // Per-memory title lines, bounded to the top 3 by score. Each line
+  // is a structured prefix the agent (and the dashboard) can parse,
+  // with a one-line quote of the memory's title and a content snippet
+  // so the user can verify what was recalled without depending on the
+  // agent to translate titles into substance. The total count is
+  // included so the agent can refer to "memory 1/3" naturally.
+  const projectIdSet = new Set(projectHits.map((m) => m.id));
+  const recallLines = [];
+  const topHits = [...allHits].sort((a, b) => (b.score || 0) - (a.score || 0)).slice(0, 3);
+  for (let i = 0; i < topHits.length; i++) {
+    const m = topHits[i];
+    const scope = projectIdSet.has(m.id) ? 'project' : 'global';
+    const raw = (m.title || '').trim() || (m.content || '').slice(0, 80);
+    const truncated = raw.length > 80 ? raw.slice(0, 80) + '…' : raw;
+    const score = m.score != null ? `, score=${m.score.toFixed(2)}` : '';
+    const snippet = firstContentLine(m.content);
+    const tail = snippet ? ` — ${snippet}` : '';
+    recallLines.push(
+      `[recall: ${i + 1}/${total}] "${truncated}" (${m.type}, ${scope}${score})${tail}`,
+    );
+  }
+
+  return {
+    summary,
+    projectHits,
+    globalHits,
+    recallLines,
+    perTypeCounts,
+    query,
+  };
 }
 
 function emitLines(lines) {
@@ -356,10 +435,18 @@ async function handleUserPromptSubmit(payload) {
       cwd,
       counts,
       ingest,
-      recall: { project: recall.projectHits, global: recall.globalHits },
+      recall: {
+        project: recall.projectHits.length,
+        global: recall.globalHits.length,
+      },
     }),
   );
   if (recall.summary) lines.push(recall.summary);
+  // Per-memory title lines so the user (and the agent) can see which
+  // memories the recall surfaced. Bounded to top 3 by score; emits
+  // nothing when there are zero hits (the summary already says
+  // "No recall hits.").
+  for (const l of recall.recallLines) lines.push(l);
   if (advisorMatch) {
     lines.push(
       `[advisor] matched: "${advisorMatch}" — /advisor or ask naturally; skill \`advisor\` is loaded`,
@@ -373,7 +460,12 @@ async function handleUserPromptSubmit(payload) {
     key,
     counts,
     ingest,
-    recall_hits: { project: recall.projectHits, global: recall.globalHits },
+    recall_hits: {
+      project: recall.projectHits.length,
+      global: recall.globalHits.length,
+    },
+    recall_lines: recall.recallLines,
+    per_type: recall.perTypeCounts,
     advisor: advisorMatch,
   };
 }

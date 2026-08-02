@@ -14,14 +14,49 @@
 // unavailable" and continue with whatever path they have. A one-line
 // stderr message is emitted the first time the model fails to load so
 // operators can see it, but the plugin does not crash.
+//
+// Time-bounded load: the first call to `embedText` on a cold cache can
+// spend 30s+ downloading the model and warming the ONNX runtime. The
+// kimi-memory hook has a 5s budget on the per-event side
+// (kimi.plugin.json); without a wall-clock cap the encoder load
+// holds the hook for the full budget before fail-open kicks in. The
+// `Promise.race` against a timer in `embedRaw` lets the caller give
+// up at the budget, let the FTS-only path take over, and continue
+// without blocking the user's session. The actual model load keeps
+// running in the background — the cache is intentionally NOT cleared
+// on a timeout, so a slow-but-eventually-successful load is still
+// usable on the next call.
 
 export const EMBEDDING_DIM = 384;
 export const EMBEDDING_MODEL = 'Xenova/all-MiniLM-L6-v2';
+// Default wall-clock cap for one embed call. Picked at 4s so the
+// persist layer (which is given 5s by the hook runner) can write the
+// `last_embed_error` row before the hook is forced to exit.
+const DEFAULT_EMBED_TIMEOUT_MS = 4000;
+
+function getEmbedTimeoutMs() {
+  const v = process.env.KIMI_MEMORY_EMBED_TIMEOUT_MS;
+  if (v && /^\d+$/.test(v)) {
+    const n = parseInt(v, 10);
+    if (Number.isFinite(n) && n > 0) return n;
+  }
+  return DEFAULT_EMBED_TIMEOUT_MS;
+}
 
 let pipelinePromise = null;
 let pipelineLoaded = false;
+let lastError = null;
+// Test-only injection: a stub that replaces the @huggingface/transformers
+// pipeline() loader. When set, getPipeline returns the stub's promise
+// instead of importing the real package. Used to exercise the timeout
+// race without depending on a 25 MB model download. The stub must
+// resolve to a function with the same shape as a transformers pipeline
+// (i.e. `await pipe(text, { pooling, normalize })` returns a tensor-like
+// value with `.data`).
+let pipelineStub = null;
 
 async function getPipeline() {
+  if (pipelineStub) return pipelineStub();
   if (!pipelinePromise) {
     pipelinePromise = (async () => {
       const { pipeline, env } = await import('@huggingface/transformers');
@@ -30,6 +65,7 @@ async function getPipeline() {
       env.useBrowserCache = false;
       const pipe = await pipeline('feature-extraction', EMBEDDING_MODEL, { quantized: true });
       pipelineLoaded = true;
+      lastError = null;
       return pipe;
     })();
   }
@@ -44,9 +80,50 @@ export function isEmbeddingAvailable() {
 // null on failure. No logging; logging happens in the wrapper.
 async function embedRaw(text) {
   if (!text || !text.trim()) return null;
-  const pipe = await getPipeline();
-  const out = await pipe(text, { pooling: 'mean', normalize: true });
-  return new Float32Array(out.data);
+  const budget = getEmbedTimeoutMs();
+  let timer;
+  const work = (async () => {
+    const pipe = await getPipeline();
+    const out = await pipe(text, { pooling: 'mean', normalize: true });
+    return new Float32Array(out.data);
+  })();
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => {
+      const err = new Error(`embed_timeout: encoder did not finish within ${budget}ms`);
+      err.code = 'KIMI_MEMORY_EMBED_TIMEOUT';
+      reject(err);
+    }, budget);
+  });
+  try {
+    const v = await Promise.race([work, timeout]);
+    if (v && v.length !== EMBEDDING_DIM) {
+      warnOnce(`embedding dim mismatch: got ${v.length}, expected ${EMBEDDING_DIM}`);
+      lastError = `embedding dim mismatch: got ${v.length}, expected ${EMBEDDING_DIM}`;
+      return null;
+    }
+    return v;
+  } catch (e) {
+    const msg = e && e.message ? e.message : String(e);
+    const isTimeout = e && e.code === 'KIMI_MEMORY_EMBED_TIMEOUT';
+    if (isTimeout) {
+      // The load is still in flight in the background; do NOT clear
+      // pipelinePromise — if it lands later, the next embed call will
+      // reuse it. Only a hard rejection from the import or pipe
+      // (e.g. model missing on disk) should invalidate the cache.
+      lastError = msg;
+      warnOnce(`embeddings slow: ${msg}`);
+      return null;
+    }
+    // Real failure (rejection from import, pipe, or runtime): reset
+    // the cache so the next call re-attempts the download.
+    pipelinePromise = null;
+    pipelineLoaded = false;
+    lastError = msg;
+    warnOnce(`embeddings unavailable: ${msg}`);
+    return null;
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
 }
 
 let warnedOnce = false;
@@ -65,24 +142,48 @@ export async function embedText(text) {
   // the model; embedText is a no-op and returns null. Set by tests via
   // _helpers.js; the CLI and MCP server leave it unset.
   if (process.env.KIMI_MEMORY_EMBEDDINGS === 'off') return null;
-  try {
-    const v = await embedRaw(text);
-    if (!v) return null;
-    if (v.length !== EMBEDDING_DIM) {
-      warnOnce(`embedding dim mismatch: got ${v.length}, expected ${EMBEDDING_DIM}`);
-      return null;
-    }
-    return v;
-  } catch (e) {
-    warnOnce(`embeddings unavailable: ${e && e.message ? e.message : e}`);
-    return null;
-  }
+  // `embedRaw` is responsible for the timeout race, the dim check, the
+  // pipeline-reset on real failures, and the warn-once logging. By
+  // contract it never throws: callers see null on any error.
+  return embedRaw(text);
 }
 
 // Synchronous availability probe. Useful for hooks / CLI / tests that
 // want to skip embedding work without paying the model-load latency.
 export function embeddingsAvailable() {
   return pipelineLoaded;
+}
+
+// Synchronous read of the most recent embedding error. Returns null
+// when no error has been observed. Persist layer uses this when a
+// row is left in `embedding_status: 'pending'` to attribute the cause.
+export function lastEmbeddingError() {
+  return lastError;
+}
+
+// Test seam: clear the pipeline cache and any recorded error. Not
+// exported on the public surface (it would let a caller force a
+// re-download, which we want to be opt-in only). Tests use this to
+// reset state between cases.
+export function _resetForTests() {
+  pipelinePromise = null;
+  pipelineLoaded = false;
+  lastError = null;
+  warnedOnce = false;
+  pipelineStub = null;
+}
+
+// Test seam: install a stub pipeline loader. The replacement is a
+// function returning a Promise<pipe> where `pipe` has the same
+// shape as a transformers pipeline. The stub takes over from
+// getPipeline until _resetForTests clears it. The replacement can
+// resolve quickly (a normal pipe stub) or hang (a timeout-race
+// exerciser). Real callers never touch this; only the embedding
+// test suite does.
+export function _setPipelineStubForTests(stub) {
+  pipelineStub = stub;
+  pipelinePromise = null;
+  pipelineLoaded = false;
 }
 
 // BLOB <-> Float32Array helpers. We store the raw little-endian

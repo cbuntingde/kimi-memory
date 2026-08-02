@@ -13,16 +13,18 @@ import { promises as fs, mkdirSync } from 'node:fs';
 import path from 'node:path';
 import { nowIso, hashId, shortId, safeJsonParse } from './util.js';
 import { ensureProjectDir, ingestStatePath } from './project-key.js';
+import { looksLikeSecret } from './extract.js';
 import {
   EMBEDDING_DIM,
   EMBEDDING_MODEL,
   embedText,
+  lastEmbeddingError,
   encodeVector,
   decodeVector,
   cosineSimilarity,
 } from './embedding.js';
 
-const SCHEMA_VERSION = 6;
+const SCHEMA_VERSION = 8;
 
 // Schema migrations. Each entry is idempotent: it inspects the live
 // schema, no-ops when its target shape is already in place, and
@@ -231,6 +233,38 @@ const MIGRATIONS = [
       .get();
     if (!idx) db.exec('CREATE INDEX idx_project_paths_root ON project_paths(canonical_root)');
   },
+
+  // v7: embedding error surface. The async embedding microtask was
+  // previously a black box — a failed download or model load left the
+  // row in `embedding_status: 'pending'` forever with no diagnostic
+  // beyond a one-shot stderr line. Add a `last_embed_error` column so
+  // the failure mode is observable through `memory_status` and via
+  // `rowToMemory`. Cleared to NULL on the next successful embed.
+  function migrateAddEmbedErrorColumn(db) {
+    const cols = db.prepare('PRAGMA table_info(memories)').all();
+    const have = new Set(cols.map((c) => c.name));
+    if (!have.has('last_embed_error')) {
+      db.exec('ALTER TABLE memories ADD COLUMN last_embed_error TEXT');
+    }
+  },
+
+  // v8: project path move history. The v6 design overwrote
+  // canonical_root on every record, which meant a project that
+  // physically moved (and got re-stamped) was no longer detectable as
+  // an orphan. We add `last_canonical_root` so the previous path is
+  // preserved when a re-record happens, and tighten the ON CONFLICT
+  // update to copy the current root to `last_canonical_root` first
+  // (idempotent: same canonical_root means no copy is needed).
+  function migrateAddProjectPathHistory(db) {
+    const cols = db.prepare('PRAGMA table_info(project_paths)').all();
+    const have = new Set(cols.map((c) => c.name));
+    if (!have.has('last_canonical_root')) {
+      db.exec('ALTER TABLE project_paths ADD COLUMN last_canonical_root TEXT');
+    }
+    if (!have.has('record_count')) {
+      db.exec('ALTER TABLE project_paths ADD COLUMN record_count INTEGER NOT NULL DEFAULT 1');
+    }
+  },
 ];
 
 const SCHEMA_SQL = `
@@ -324,11 +358,16 @@ CREATE INDEX IF NOT EXISTS idx_events_role ON conversation_events(session_id, pr
 -- this to find orphan DBs whose project no longer exists on disk. The
 -- global DB has no canonical root of its own; its project_paths table
 -- stays empty.
+--
+-- v8: last_canonical_root records the previous root when a re-record
+-- happens, and record_count tracks how active the project is.
 CREATE TABLE IF NOT EXISTS project_paths (
-  project_key    TEXT PRIMARY KEY,
-  canonical_root TEXT NOT NULL,
-  first_seen_at  TEXT NOT NULL,
-  last_seen_at   TEXT NOT NULL
+  project_key         TEXT PRIMARY KEY,
+  canonical_root      TEXT NOT NULL,
+  first_seen_at       TEXT NOT NULL,
+  last_seen_at        TEXT NOT NULL,
+  last_canonical_root TEXT,
+  record_count        INTEGER NOT NULL DEFAULT 1
 );
 CREATE INDEX IF NOT EXISTS idx_project_paths_root ON project_paths(canonical_root);
 `;
@@ -427,8 +466,11 @@ export function rowToMemory(row) {
     updated_at: row.updated_at,
     expires_at: row.expires_at || null,
     // Lightweight embedding summary — never include the raw BLOB.
-    embedding_status: row.embedding ? 'embedded' : 'pending',
+    // Three states: 'embedded' (BLOB present), 'pending' (no BLOB
+    // yet, no error), 'failed' (no BLOB and a recorded error).
+    embedding_status: row.embedding ? 'embedded' : row.last_embed_error ? 'failed' : 'pending',
     embedding_model: row.embedding_model || null,
+    last_embed_error: row.last_embed_error || null,
     access_count: row.access_count || 0,
     last_accessed_at: row.last_accessed_at || null,
   };
@@ -436,7 +478,36 @@ export function rowToMemory(row) {
 
 // ----- CRUD -----
 
+// Defense in depth: refuse to persist a memory whose title or content
+// matches a known credential shape. The auto-extract path already
+// scrubs candidates before this point, but `memory_save` and
+// `memory_update` are exposed directly to the agent — a misbehaving
+// model reply, a follow-the-instructions prompt-injection, or a user
+// asking the agent to "remember my API key" would otherwise land the
+// secret in the durable store. The check is opt-out via
+// KIMI_MEMORY_SECRET_SCAN=off for the rare case where a user genuinely
+// needs to persist a secret-shaped string (e.g. an example fixture).
+// False positives are accepted: dropping a candidate that mentions a
+// generic "api_key" is far cheaper than persisting a real one.
+function assertNoSecret(input) {
+  if (process.env.KIMI_MEMORY_SECRET_SCAN === 'off') return;
+  const titleMatch = input.title && looksLikeSecret(input.title);
+  const contentMatch = input.content && looksLikeSecret(input.content);
+  if (titleMatch || contentMatch) {
+    const where =
+      titleMatch && contentMatch ? 'title and content' : titleMatch ? 'title' : 'content';
+    const err = new Error(
+      `secret_detected: refusing to persist a memory whose ${where} matches a known credential shape. ` +
+        `Remove the secret and retry, or set KIMI_MEMORY_SECRET_SCAN=off to bypass.`,
+    );
+    err.code = 'KIMI_MEMORY_SECRET_DETECTED';
+    err.where = where;
+    throw err;
+  }
+}
+
 export function saveMemory(db, projectKey, input) {
+  assertNoSecret(input);
   const now = nowIso();
   const id = input.id || memoryId(projectKey, input.type, input.title || '', input.content || '');
   const tags = JSON.stringify(input.tags || []);
@@ -634,26 +705,61 @@ export function getParents(db, projectKey, conclusionId, { limit = 200 } = {}) {
 }
 
 // Async helper: compute embedding for a saved memory and write the
-// four embedding columns. Never throws — the embedding module catches
-// its own errors and warns once.
+// embedding columns. Never throws — failures are recorded in the
+// `last_embed_error` column so the row's `embedding_status` flips
+// from 'pending' to 'failed' and the operator can see why.
 function scheduleEmbeddingUpdate(db, id, title, content) {
   Promise.resolve().then(async () => {
+    let vec = null;
+    let embedErr = null;
     try {
       const text = `${title || ''}\n${content || ''}`.trim().slice(0, 4000);
       if (!text) return;
-      const vec = await embedText(text);
-      if (!vec) return;
-      // Re-check the row still exists; could have been deleted between
-      // save and this microtask.
-      const stillThere = db.prepare('SELECT id FROM memories WHERE id=?').get(id);
-      if (!stillThere) return;
-      db.prepare(
-        `UPDATE memories
-                    SET embedding=?, embedding_model=?, embedding_dim=?, embedded_at=?
+      vec = await embedText(text);
+    } catch (e) {
+      embedErr = e && e.message ? e.message : String(e);
+    }
+    // Re-check the row still exists; could have been deleted between
+    // save and this microtask.
+    let stillThere = null;
+    try {
+      stillThere = db.prepare('SELECT id FROM memories WHERE id=?').get(id);
+    } catch (e) {
+      // The DB itself is unavailable — nothing useful we can do.
+      return;
+    }
+    if (!stillThere) return;
+    try {
+      if (vec) {
+        db.prepare(
+          `UPDATE memories
+                    SET embedding=?, embedding_model=?, embedding_dim=?, embedded_at=?,
+                        last_embed_error=NULL
                     WHERE id=?`,
-      ).run(encodeVector(vec), EMBEDDING_MODEL, EMBEDDING_DIM, nowIso(), id);
+        ).run(encodeVector(vec), EMBEDDING_MODEL, EMBEDDING_DIM, nowIso(), id);
+      } else {
+        // No vector returned and no exception either: the embedding
+        // module is opted out (KIMI_MEMORY_EMBEDDINGS=off), the
+        // encoder timed out within its wall-clock budget, or the
+        // model is unavailable. Prefer the most specific reason
+        // available — `lastEmbeddingError()` carries the timeout
+        // message or the real error from the import / pipe — and
+        // fall back to a generic one for the cold-cache case where
+        // we never reached the encoder at all.
+        const reason =
+          embedErr ||
+          lastEmbeddingError() ||
+          (process.env.KIMI_MEMORY_EMBEDDINGS === 'off'
+            ? 'embeddings disabled (KIMI_MEMORY_EMBEDDINGS=off)'
+            : 'embedding model unavailable');
+        db.prepare(
+          `UPDATE memories
+                    SET last_embed_error=?, embedded_at=?
+                    WHERE id=?`,
+        ).run(reason, nowIso(), id);
+      }
     } catch {
-      // Defensive — embedText is fail-open but be paranoid here too.
+      /* DB write failed; nothing else we can do here */
     }
   });
 }
@@ -757,12 +863,36 @@ export function deleteMemory(db, projectKey, id, { hard = false } = {}) {
   return r.changes > 0;
 }
 
+// Combined-score floor below which a candidate is treated as not
+// relevant. The hybrid score is 0.5 * ftsScore + 0.5 * vecScore; in
+// FTS-only mode (no embeddings) ftsScore is 1/(rank+1), so the
+// threshold roughly means "top 2 FTS hits OR a cosine ≥ ~0.4 OR some
+// combination". Tunable per call via the `minScore` option.
+const MIN_RELEVANCE_SCORE = 0.2;
+
 export async function searchMemories(db, projectKey, query, opts = {}) {
   if (!query || !query.trim()) return [];
   const limit = Math.max(1, Math.min(200, opts.limit || 20));
   const type = opts.type || null;
+  const minScore =
+    Number.isFinite(opts.minScore) && opts.minScore >= 0 && opts.minScore <= 1
+      ? opts.minScore
+      : MIN_RELEVANCE_SCORE;
+  // perType: when true, pick the top `perTypeLimit` rows from EACH
+  // type that has a hit, then sort by score and take the global top
+  // `limit`. Use this when you want a balanced recall (e.g. the
+  // UserPromptSubmit hook, so the agent sees a mix of conventions,
+  // procedures, and working notes rather than the top-N of one type).
+  // The SQL-level `type` filter is ignored when perType is set — a
+  // type filter plus per-type balancing is contradictory.
+  const perType = !!opts.perType;
+  const perTypeLimit = Math.max(1, Math.min(20, opts.perTypeLimit || 2));
+  const includeScore = !!opts.includeScore;
 
   // ---- 1. FTS5 candidates ----
+  // When perType is on we want every type's hits, so we suppress the
+  // SQL-level type filter and bucket in memory below.
+  const ftsType = perType ? null : type;
   const tokens = query
     .toLowerCase()
     .replace(/[^\p{L}\p{N}\s_-]/gu, ' ')
@@ -774,11 +904,13 @@ export async function searchMemories(db, projectKey, query, opts = {}) {
     const fts = tokens.map((t) => `"${t.replace(/"/g, '""')}"*`).join(' ');
     const params = [fts, projectKey];
     let typeClause = '';
-    if (type) {
+    if (ftsType) {
       typeClause = ' AND m.type = ?';
-      params.push(type);
+      params.push(ftsType);
     }
-    params.push(limit);
+    // Cast a wide net for perType: pull up to `limit * 5` rows so
+    // every type has a chance to be represented.
+    params.push(perType ? Math.max(limit * 5, 100) : limit);
     ftsRows.push(
       ...db
         .prepare(
@@ -812,7 +944,7 @@ export async function searchMemories(db, projectKey, query, opts = {}) {
       'embedding_dim = ?',
     ];
     const params = [projectKey, EMBEDDING_DIM];
-    if (type) {
+    if (!perType && type) {
       where.push('type = ?');
       params.push(type);
     }
@@ -855,17 +987,53 @@ export async function searchMemories(db, projectKey, query, opts = {}) {
     }
   }
 
-  const combined = [...merged.values()]
-    .map(({ row, ftsScore, vecScore }) => ({
-      row,
-      score: 0.5 * ftsScore + 0.5 * Math.max(0, Math.min(1, vecScore)),
-    }))
-    .sort((a, b) => b.score - a.score)
-    .slice(0, limit);
+  // ---- 4. Score + relevance filter ----
+  // Drop anything below the relevance threshold so a fuzzy FTS hit
+  // with no semantic similarity (or vice-versa) does not pollute the
+  // recall. Pass minScore=0 to keep every candidate (used by tests).
+  let scored = [...merged.values()].map(({ row, ftsScore, vecScore }) => ({
+    row,
+    ftsScore,
+    vecScore,
+    score: 0.5 * ftsScore + 0.5 * Math.max(0, Math.min(1, vecScore)),
+  }));
+  if (minScore > 0) scored = scored.filter((e) => e.score >= minScore);
 
-  const out = combined.map(({ row }) => rowToMemory(row));
+  // ---- 5. Selection ----
+  let picked;
+  if (perType) {
+    // Bucket by type, take top perTypeLimit per type, then re-sort
+    // by score and trim to the global `limit`. Guarantees the agent
+    // sees at least one row from every type that has a hit.
+    const byType = new Map();
+    for (const e of scored) {
+      const t = e.row.type;
+      if (!byType.has(t)) byType.set(t, []);
+      byType.get(t).push(e);
+    }
+    picked = [];
+    for (const items of byType.values()) {
+      items.sort((a, b) => b.score - a.score);
+      picked.push(...items.slice(0, perTypeLimit));
+    }
+    picked.sort((a, b) => b.score - a.score);
+    picked = picked.slice(0, limit);
+  } else {
+    scored.sort((a, b) => b.score - a.score);
+    picked = scored.slice(0, limit);
+  }
 
-  // ---- 4. Best-effort access bump on the top results ----
+  const out = picked.map(({ row, score, ftsScore, vecScore }) => {
+    const mem = rowToMemory(row);
+    if (includeScore) {
+      mem.score = score;
+      mem.fts_score = ftsScore;
+      mem.vec_score = vecScore;
+    }
+    return mem;
+  });
+
+  // ---- 6. Best-effort access bump on the top results ----
   bumpAccess(
     db,
     projectKey,
@@ -1442,18 +1610,34 @@ export async function saveIngestState(kimiHomeDir, projectKey, state) {
 // for project DBs, or the literal "_global" string for the global DB).
 // Record (or refresh) the canonical project root for `projectKey` in
 // this DB. Idempotent: re-recording the same root only updates
-// `last_seen_at`. Called by the MCP server's `openScopeDb` and the
-// hook runner every time a project DB is opened with a cwd.
+// `last_seen_at` and bumps `record_count`. When the new root differs
+// from the current one, the current root is copied to
+// `last_canonical_root` first so the move is observable by
+// `memory_prune` and any external audit. The `record_count` column
+// lets the prune tool see how active a project is (zero re-records
+// since first_seen_at is a strong "probably orphan" signal).
 export function recordProjectPath(db, projectKey, canonicalRoot) {
   if (!projectKey || !canonicalRoot) return;
   const now = nowIso();
+  // Single statement: on first insert the conflict clause is skipped,
+  // on subsequent inserts with the same root only the counter +
+  // last_seen_at change, and on a different root the old root is
+  // preserved in last_canonical_root before the overwrite.
   db.prepare(
     `
-    INSERT INTO project_paths (project_key, canonical_root, first_seen_at, last_seen_at)
-    VALUES (?, ?, ?, ?)
+    INSERT INTO project_paths (
+      project_key, canonical_root, first_seen_at, last_seen_at,
+      last_canonical_root, record_count
+    ) VALUES (?, ?, ?, ?, NULL, 1)
     ON CONFLICT(project_key) DO UPDATE SET
+      last_canonical_root = CASE
+        WHEN project_paths.canonical_root = excluded.canonical_root
+          THEN project_paths.last_canonical_root
+        ELSE project_paths.canonical_root
+      END,
       canonical_root = excluded.canonical_root,
-      last_seen_at   = excluded.last_seen_at
+      last_seen_at   = excluded.last_seen_at,
+      record_count   = project_paths.record_count + 1
   `,
   ).run(projectKey, canonicalRoot, now, now);
 }
@@ -1464,7 +1648,10 @@ export function recordProjectPath(db, projectKey, canonicalRoot) {
 export function listProjectPaths(db) {
   return db
     .prepare(
-      'SELECT project_key, canonical_root, first_seen_at, last_seen_at FROM project_paths ORDER BY last_seen_at DESC',
+      `SELECT project_key, canonical_root, first_seen_at, last_seen_at,
+              last_canonical_root, record_count
+       FROM project_paths
+       ORDER BY last_seen_at DESC`,
     )
     .all();
 }

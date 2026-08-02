@@ -20,9 +20,13 @@ import {
 import {
   EMBEDDING_DIM,
   EMBEDDING_MODEL,
+  embedText,
   encodeVector,
   decodeVector,
   cosineSimilarity,
+  _setPipelineStubForTests,
+  _resetForTests,
+  lastEmbeddingError,
 } from '../src/embedding.js';
 import { projectDbPath, deriveProjectKey } from '../src/project-key.js';
 
@@ -255,5 +259,156 @@ test('backfillEmbeddings is a no-op when embeddings are disabled', async () => {
   } finally {
     closeDb();
     rmRf(home);
+  }
+});
+
+test('embedText: times out and returns null when the encoder hangs', async () => {
+  // Stub a pipeline that never resolves. The wall-clock budget on
+  // `embedRaw` should fire first, return null, and stamp a timeout
+  // message into `lastEmbeddingError()` for the persist layer.
+  const prevTimeout = process.env.KIMI_MEMORY_EMBED_TIMEOUT_MS;
+  const prevEnvOff = process.env.KIMI_MEMORY_EMBEDDINGS;
+  process.env.KIMI_MEMORY_EMBEDDINGS = 'on'; // make sure opt-out is unset
+  process.env.KIMI_MEMORY_EMBED_TIMEOUT_MS = '50'; // 50ms is plenty
+  _setPipelineStubForTests(
+    () =>
+      new Promise(() => {
+        /* never resolves */
+      }),
+  );
+  try {
+    const t0 = process.hrtime.bigint();
+    const v = await embedText('hello world');
+    const elapsedMs = Number(process.hrtime.bigint() - t0) / 1e6;
+    assert.equal(v, null, 'embedText returns null on timeout');
+    // The whole call must finish well under one second. 200ms is a
+    // generous bound; the actual elapsed time is ~50ms.
+    assert.ok(elapsedMs < 500, `embedText returned in ${elapsedMs.toFixed(1)}ms (budget 500ms)`);
+    const err = lastEmbeddingError();
+    assert.ok(err && /embed_timeout/.test(err), `lastError mentions embed_timeout, got: ${err}`);
+  } finally {
+    _resetForTests();
+    if (prevTimeout === undefined) delete process.env.KIMI_MEMORY_EMBED_TIMEOUT_MS;
+    else process.env.KIMI_MEMORY_EMBED_TIMEOUT_MS = prevTimeout;
+    if (prevEnvOff === undefined) delete process.env.KIMI_MEMORY_EMBEDDINGS;
+    else process.env.KIMI_MEMORY_EMBEDDINGS = prevEnvOff;
+  }
+});
+
+test('embedText: timeout does NOT clear the pipeline cache (slow load may still complete)', async () => {
+  // On a real first run the encoder is slow but eventually succeeds.
+  // A timeout should not invalidate the cache so the NEXT call — once
+  // the load lands — can ride the result without re-downloading.
+  const prevTimeout = process.env.KIMI_MEMORY_EMBED_TIMEOUT_MS;
+  const prevEnvOff = process.env.KIMI_MEMORY_EMBEDDINGS;
+  process.env.KIMI_MEMORY_EMBEDDINGS = 'on';
+  process.env.KIMI_MEMORY_EMBED_TIMEOUT_MS = '20';
+  // Share a single promise across all stub() calls. The test will
+  // resolve it later; until then every embedText call times out.
+  let resolveStub;
+  const sharedStubPromise = new Promise((resolve) => {
+    resolveStub = resolve;
+  });
+  _setPipelineStubForTests(() => sharedStubPromise);
+  try {
+    // First call: times out, returns null, but does NOT clear the stub.
+    const v1 = await embedText('first');
+    assert.equal(v1, null, 'first call times out');
+    assert.ok(/embed_timeout/.test(lastEmbeddingError()), 'lastError mentions timeout');
+    // Now resolve the shared stub promise with a fake pipeline that
+    // returns a tensor of the right shape. The next embedText call
+    // should see the same promise already resolved.
+    resolveStub(async (_text, _opts) => ({
+      data: new Float32Array(EMBEDDING_DIM).fill(0.1),
+    }));
+    // Wait one tick so the resolution propagates.
+    await new Promise((r) => setImmediate(r));
+    const v2 = await embedText('second');
+    assert.ok(v2 && v2.length === EMBEDDING_DIM, 'second call rides the now-resolved loader');
+  } finally {
+    _resetForTests();
+    if (prevTimeout === undefined) delete process.env.KIMI_MEMORY_EMBED_TIMEOUT_MS;
+    else process.env.KIMI_MEMORY_EMBED_TIMEOUT_MS = prevTimeout;
+    if (prevEnvOff === undefined) delete process.env.KIMI_MEMORY_EMBEDDINGS;
+    else process.env.KIMI_MEMORY_EMBEDDINGS = prevEnvOff;
+  }
+});
+
+test('embedText: real rejection from the loader DOES clear the cache', async () => {
+  // Distinguish a timeout (keep the cache) from a hard failure
+  // (clear the cache so the next call retries the download).
+  const prevTimeout = process.env.KIMI_MEMORY_EMBED_TIMEOUT_MS;
+  const prevEnvOff = process.env.KIMI_MEMORY_EMBEDDINGS;
+  process.env.KIMI_MEMORY_EMBEDDINGS = 'on';
+  process.env.KIMI_MEMORY_EMBED_TIMEOUT_MS = '1000'; // long enough not to fire
+  let callCount = 0;
+  _setPipelineStubForTests(() => {
+    callCount += 1;
+    return Promise.reject(new Error('model missing on disk'));
+  });
+  try {
+    const v1 = await embedText('first');
+    assert.equal(v1, null, 'rejection is swallowed, returns null');
+    assert.ok(/model missing on disk/.test(lastEmbeddingError()), 'lastError captures the reason');
+    const v2 = await embedText('second');
+    assert.equal(v2, null, 'second call also returns null');
+    assert.equal(callCount, 2, 'cache was cleared; the loader was called again');
+  } finally {
+    _resetForTests();
+    if (prevTimeout === undefined) delete process.env.KIMI_MEMORY_EMBED_TIMEOUT_MS;
+    else process.env.KIMI_MEMORY_EMBED_TIMEOUT_MS = prevTimeout;
+    if (prevEnvOff === undefined) delete process.env.KIMI_MEMORY_EMBEDDINGS;
+    else process.env.KIMI_MEMORY_EMBEDDINGS = prevEnvOff;
+  }
+});
+
+test('saveMemory writes the timeout reason into last_embed_error', async () => {
+  // End-to-end: a save with the encoder timing out should land
+  // `last_embed_error = 'embed_timeout: ...'` in the row so the
+  // operator can see why the row is in `embedding_status: 'failed'`.
+  // The embed is fire-and-forget via Promise.resolve().then(...) so
+  // the test polls for the row update.
+  const prevTimeout = process.env.KIMI_MEMORY_EMBED_TIMEOUT_MS;
+  const prevEnvOff = process.env.KIMI_MEMORY_EMBEDDINGS;
+  process.env.KIMI_MEMORY_EMBEDDINGS = 'on';
+  process.env.KIMI_MEMORY_EMBED_TIMEOUT_MS = '30';
+  _setPipelineStubForTests(
+    () =>
+      new Promise(() => {
+        /* never resolves */
+      }),
+  );
+  try {
+    const { home, key, dbPath } = freshProject();
+    try {
+      const db = openDb(dbPath);
+      const m = saveMemory(db, key, {
+        type: 'semantic',
+        title: 'note',
+        content: 'a note',
+      });
+      // Poll for the failure row to land. The embed is fire-and-forget
+      // via Promise.resolve().then(...), so a short wait is needed.
+      const start = Date.now();
+      let row;
+      while (Date.now() - start < 2000) {
+        row = db.prepare('SELECT last_embed_error, embedded_at FROM memories WHERE id=?').get(m.id);
+        if (row && row.last_embed_error) break;
+        await new Promise((r) => setTimeout(r, 20));
+      }
+      assert.ok(row, 'row exists');
+      assert.ok(row.last_embed_error, 'last_embed_error was written');
+      assert.match(row.last_embed_error, /embed_timeout/, 'reason names the timeout');
+      assert.ok(row.embedded_at, 'embedded_at was stamped (used as the failure timestamp)');
+    } finally {
+      closeDb();
+      rmRf(home);
+    }
+  } finally {
+    _resetForTests();
+    if (prevTimeout === undefined) delete process.env.KIMI_MEMORY_EMBED_TIMEOUT_MS;
+    else process.env.KIMI_MEMORY_EMBED_TIMEOUT_MS = prevTimeout;
+    if (prevEnvOff === undefined) delete process.env.KIMI_MEMORY_EMBEDDINGS;
+    else process.env.KIMI_MEMORY_EMBEDDINGS = prevEnvOff;
   }
 });
