@@ -1,5 +1,10 @@
 # Project Memory for Kimi Code
 
+<p align="center">
+  <img src="assets/demo-list-calls.png" alt="Kimi assistant running memory_list" width="48%" />
+  <img src="assets/demo-list-output.png" alt="Memory list and summary output" width="48%" />
+</p>
+
 A local Kimi Code plugin that provides three-layer memory — cross-project user memory, per-project durable + working memory, and per-project session archives — through MCP tools and lifecycle hooks.
 
 ## Layered model
