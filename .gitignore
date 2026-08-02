@@ -8,3 +8,22 @@ dist/
 .idea/
 _diagnostics/
 
+# Development / planning docs that should not ship with the plugin. The
+# repo's user-facing surface is README.md, ai-install.md, uninstall.md,
+# and CONTRIBUTING.md. Internal notes for AI agents and humans working
+# on the plugin itself stay on disk but out of the public index.
+AGENTS.md
+plans/
+todo/
+TODO.md
+ROADMAP.md
+
+# Editor / OS scratch files
+*.bak
+*.swp
+*.swo
+*~
+\#*\#
+.DS_Store
+Thumbs.db
+desktop.ini
