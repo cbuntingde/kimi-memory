@@ -39,6 +39,7 @@ import {
 } from '../persist.js';
 import { locateSessionArchive, walkWire, readSessionIndex } from '../wire.js';
 import { runAutoExtract } from '../extract.js';
+import { maybeWriteWorkLog, recordWorkLogResult } from '../work-log.js';
 import { matchAdvisor, logAdvisorDiag } from '../advisor/detect.js';
 
 const EVENT = asString(process.env.KM_HOOK_EVENT) || 'unknown';
@@ -200,6 +201,34 @@ function formatIngestSegment(ingest) {
   return 'skipped';
 }
 
+// Format the auto-extract result for the status line. Keeps it terse —
+// the agent gets the same shape from `memory_recall` if it wants
+// details. Distinguishes "LLM had no candidates" (clean skip) from
+// "LLM returned candidates but we kept N / dropped M / scrubbed K".
+function formatExtractSegment(extract) {
+  if (!extract) return 'none';
+  if (extract.saved && extract.saved > 0)
+    return `saved:${extract.saved}/dup:${extract.duplicates || 0}${
+      extract.secrets_dropped ? `/sec:${extract.secrets_dropped}` : ''
+    }`;
+  if (extract.extracted && extract.extracted > 0)
+    return `kept:0/dup:${extract.duplicates || 0}/of:${extract.extracted}`;
+  if (extract.skipped) return `skip:${extract.skipped}`;
+  if (extract.error) return `err:${extract.error}`;
+  return 'none';
+}
+
+// Format the work-log result for the status line. Same terseness rule
+// as extract — full report goes to `logDiag`.
+function formatWorkLogSegment(wl) {
+  if (!wl) return 'none';
+  if (wl.written && wl.written > 0) {
+    return wl.updated ? 'updated' : 'saved';
+  }
+  if (wl.skipped) return `skip:${wl.skipped}`;
+  return 'none';
+}
+
 // ---- Snapshot builders ----
 
 function buildCounts({ projectDb, globalDb, key }) {
@@ -231,9 +260,13 @@ function zeroCounts() {
   };
 }
 
-function buildStatusLine({ event, key, cwd, counts, ingest, recall }) {
+function buildStatusLine({ event, key, cwd, counts, ingest, recall, extract, workLog }) {
   const ingestSeg = formatIngestSegment(ingest);
   const recallSeg = recall ? ` recall project:${recall.project} global:${recall.global}` : '';
+  // Extract + work-log are surfaced only when set, so the line stays
+  // short for callers that don't plumb them through.
+  const extractSeg = extract ? ` extract=${formatExtractSegment(extract)}` : '';
+  const workLogSeg = workLog ? ` work_log=${formatWorkLogSegment(workLog)}` : '';
   return [
     `[kimi-memory] event=${event}`,
     `project_key=${key}`,
@@ -242,7 +275,7 @@ function buildStatusLine({ event, key, cwd, counts, ingest, recall }) {
     `wm=${counts.wm.length}`,
     `conv=${counts.conv}`,
     `events=${counts.events}`,
-    `ingest=${ingestSeg}${recallSeg}`,
+    `ingest=${ingestSeg}${extractSeg}${workLogSeg}${recallSeg}`,
     `cwd=${cwd}`,
   ].join(' ');
 }
@@ -393,14 +426,35 @@ async function handleSessionStart(payload) {
   }
   const counts = buildCounts({ projectDb, globalDb, key });
   const recentSummary = buildRecentSummary(projectDb, globalDb, key);
+  const { extract: latestExtract, workLog: latestWorkLog } = await readLatestStats(cwd);
   const lines = [];
-  lines.push(buildStatusLine({ event: 'SessionStart', key, cwd, counts, ingest }));
+  lines.push(
+    buildStatusLine({
+      event: 'SessionStart',
+      key,
+      cwd,
+      counts,
+      ingest,
+      extract: latestExtract,
+      workLog: latestWorkLog,
+    }),
+  );
   lines.push(recentSummary);
   const wm = buildWorkingMemoryPreview(projectDb, key);
   for (const l of wm) lines.push(l);
   emitLines(lines);
   if (decay) await logDiag('info', 'decay pass result', { key, decay });
-  return { ok: true, key, counts, recent: recentSummary, wm: wm.length, ingest, decay };
+  return {
+    ok: true,
+    key,
+    counts,
+    recent: recentSummary,
+    wm: wm.length,
+    ingest,
+    decay,
+    extract: latestExtract,
+    workLog: latestWorkLog,
+  };
 }
 
 async function handleUserPromptSubmit(payload) {
@@ -417,6 +471,10 @@ async function handleUserPromptSubmit(payload) {
   const counts = buildCounts({ projectDb, globalDb, key });
   const prompt = payloadPrompt(payload);
   const recall = await buildRecallSummary({ projectDb, globalDb, key, prompt });
+  // Pull the most recent extract + work-log stats so the status line
+  // can advertise what the previous Stop hook did. Cheap file read;
+  // never throws.
+  const { extract: latestExtract, workLog: latestWorkLog } = await readLatestStats(cwd);
   // Advisor keyword detection runs here, in-process, on the same payload
   // the memory recall just used. One matched keyword → one extra stdout
   // line so the agent knows to consider loading skill `advisor`. No-match
@@ -435,6 +493,8 @@ async function handleUserPromptSubmit(payload) {
       cwd,
       counts,
       ingest,
+      extract: latestExtract,
+      workLog: latestWorkLog,
       recall: {
         project: recall.projectHits.length,
         global: recall.globalHits.length,
@@ -488,7 +548,67 @@ async function handleStop(payload) {
     }
   }
   if (extract) await logDiag('info', 'auto_extract result', { extract });
-  return { ok: true, ingest, extract };
+
+  // Work-log piggybacks on the same pass: with conversation_events
+  // updated, today's activity + commits are deterministic sources for a
+  // date-titled episodic memory. Idempotent within the day via
+  // supersede=true. Same fail-open contract — never throws out.
+  let workLog = null;
+  if (ingest && ingest.ok !== false && cwd) {
+    try {
+      const key = deriveProjectKey(cwd);
+      const dbPath = path.join(HOME, 'kimi-memory', key, 'memory.sqlite');
+      const db = safeOpenDb(dbPath);
+      if (db) {
+        workLog = await maybeWriteWorkLog({
+          db,
+          projectKey: key,
+          cwd,
+          saveMemory,
+        });
+        recordWorkLogResult(key, workLog);
+        await logDiag('info', 'work_log result', { key, workLog });
+      }
+    } catch (e) {
+      workLog = { skipped: 'work_log_threw', error: e && e.message };
+      await logDiag('warn', 'work_log threw', { error: e && e.message });
+    }
+  }
+
+  // Persist the latest extract + work-log stats into the per-project
+  // ingest-state file so the next UserPromptSubmit (a separate
+  // process) can surface them on its status line. We keep just enough
+  // to render the segment — full reports still live in the diagnostics
+  // log. Best-effort; any failure here is logged, not thrown.
+  if (cwd && (extract || workLog)) {
+    try {
+      const key = deriveProjectKey(cwd);
+      const state = await loadIngestState(HOME, key);
+      if (!state.sessions) state.sessions = {};
+      if (extract) state.latest_extract = { ...extract, at: nowIso() };
+      if (workLog) state.latest_work_log = { ...workLog, at: nowIso() };
+      await saveIngestState(HOME, key, state);
+    } catch (e) {
+      await logDiag('warn', 'failed to persist latest extract/work_log', {
+        error: e && e.message,
+      });
+    }
+  }
+
+  return { ok: true, ingest, extract, workLog };
+}
+
+// Read the most recently persisted extract + work-log stats for this
+// project. Returns nulls for fields that have never been written.
+async function readLatestStats(cwd) {
+  if (!cwd) return { extract: null, workLog: null };
+  try {
+    const key = deriveProjectKey(cwd);
+    const state = await loadIngestState(HOME, key);
+    return { extract: state.latest_extract || null, workLog: state.latest_work_log || null };
+  } catch {
+    return { extract: null, workLog: null };
+  }
 }
 
 async function safeHandleStop(payload, cwd) {
@@ -576,9 +696,18 @@ async function handleStopFailure(payload) {
 }
 
 // Cost guards before we spend an LLM call on extraction.
-const EXTRACT_MIN_EVENTS = 6; // need enough to be worth extracting from
+//
+// Tuned 2026-08-02: previous bounds (min=6 events, latency=5min) made
+// the extract skip almost every real-world session — long pauses
+// between turns would age the "in-flight" check out, and the minimum
+// excluded single-question research sessions. The new bounds still
+// avoid firing on genuinely tiny or stale sessions; raise the env
+// override `KIMI_MEMORY_EXTRACT_MAX_LATENCY_MS` if a project wants
+// stricter behavior.
+const EXTRACT_MIN_EVENTS = 4; // need enough to be worth extracting from
 const EXTRACT_MIN_AGE_MS = 0; // not used directly; see EXTRACT_MAX_LATENCY_MS
-const EXTRACT_MAX_LATENCY_MS = 5 * 60 * 1000; // events must be <5min old to count as "in flight"
+const EXTRACT_MAX_LATENCY_MS =
+  Number(process.env.KIMI_MEMORY_EXTRACT_MAX_LATENCY_MS) || 30 * 60 * 1000; // events must be <30min old
 
 // Build a short transcript from the most recent conversation events.
 // Uses the pre-extracted `summary` field; falls back to a snippet of the
