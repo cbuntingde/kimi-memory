@@ -539,14 +539,29 @@ test('detectProjectMetadata: returns null when no manifests found', async () => 
   }
 });
 
-test('buildExtractionPrompt: includes projectMeta JSON', () => {
-  const prompt = buildExtractionPrompt('hello', [], { stack: ['node'], buildCommand: 'npm run build' });
-  assert.ok(prompt.user.includes('Project metadata (from manifest files)'));
-  assert.ok(prompt.user.includes('"buildCommand": "npm run build"'));
+test('buildExtractionPrompt: does not include projectMeta in user prompt', () => {
+  // The deterministic path in runAutoExtract consumes projectMeta directly.
+  // The LLM-bound prompt should not carry it.
+  const prompt = buildExtractionPrompt('hello', []);
+  assert.equal(prompt.user.includes('Project metadata'), false);
+  assert.ok(prompt.user.includes('hello'));
+});
+
+test('buildExtractionPrompt: includes existingTitles for dedup', () => {
+  const prompt = buildExtractionPrompt('hello', ['tab indent rule', 'uses jest']);
+  assert.ok(prompt.user.includes('tab indent rule'));
+  assert.ok(prompt.user.includes('uses jest'));
+  assert.ok(prompt.user.includes('avoid repeating'));
 });
 
 test('runAutoExtract: saves deterministic build/stack memories from manifests', async () => {
   const home = mkTempHome();
+  // Provide a minimal config.toml so resolveLlmTarget does not bail
+  // out with `no_default_model` before the deterministic path runs.
+  writeRaw(
+    path.join(home, 'config.toml'),
+    `default_model = "demo-model"\n[models.demo-model]\nprovider = "demo"\nmodel = "demo-model"\n[providers.demo]\napi_key = "test"\nbase_url = "https://example.invalid"\ntype = "openai"\n`,
+  );
   const projectDir = path.join(home, 'proj');
   await fs.mkdir(projectDir, { recursive: true });
   await writeRaw(
