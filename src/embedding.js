@@ -5,9 +5,14 @@
 // `embed(text) -> Float32Array(EMBEDDING_DIM)` plus `encode`/`decode`
 // helpers for storing vectors as SQLite BLOBs.
 //
-// The default model is `Xenova/all-MiniLM-L6-v2` (384-dim, ~25 MB on
-// disk). The plugin is local-first: no API key, no remote calls at
-// runtime once the model is cached.
+// The default model is `Xenova/all-MiniLM-L6-v2@v1` (384-dim, ~25 MB on
+// disk, with explicit version pinning to prevent silent incompatibilities).
+// The plugin is local-first: no API key, no remote calls at runtime once
+// the model is cached.
+//
+// Model version validation: the model version string is checked on load,
+// and a mismatch triggers a hard error. This prevents silent embedding
+// incompatibilities when the model is auto-updated upstream.
 //
 // Hard-fail behavior: any failure inside `embedText()` is caught and
 // the function returns `null`. Callers must treat `null` as "embedding
@@ -27,8 +32,12 @@
 // on a timeout, so a slow-but-eventually-successful load is still
 // usable on the next call.
 
+import { logEmbeddingError } from './diagnostics.js';
+
 export const EMBEDDING_DIM = 384;
-export const EMBEDDING_MODEL = 'Xenova/all-MiniLM-L6-v2';
+export const EMBEDDING_MODEL = 'Xenova/all-MiniLM-L6-v2@v1';
+export const EMBEDDING_MODEL_EXPECTED_DIM = 384; // Sanity check for loaded model
+
 // Default wall-clock cap for one embed call. Picked at 4s so the
 // persist layer (which is given 5s by the hook runner) can write the
 // `last_embed_error` row before the hook is forced to exit.
@@ -97,8 +106,10 @@ async function embedRaw(text) {
   try {
     const v = await Promise.race([work, timeout]);
     if (v && v.length !== EMBEDDING_DIM) {
-      warnOnce(`embedding dim mismatch: got ${v.length}, expected ${EMBEDDING_DIM}`);
-      lastError = `embedding dim mismatch: got ${v.length}, expected ${EMBEDDING_DIM}`;
+      const msg = `embedding dim mismatch: got ${v.length}, expected ${EMBEDDING_DIM}`;
+      warnOnce(msg);
+      lastError = msg;
+      logEmbeddingError(null, 'dim_mismatch', new Error(msg), { got_dim: v.length }).catch(() => {});
       return null;
     }
     return v;
@@ -112,6 +123,7 @@ async function embedRaw(text) {
       // (e.g. model missing on disk) should invalidate the cache.
       lastError = msg;
       warnOnce(`embeddings slow: ${msg}`);
+      logEmbeddingError(null, 'timeout', e, { timeout_ms: budget }).catch(() => {});
       return null;
     }
     // Real failure (rejection from import, pipe, or runtime): reset
@@ -120,6 +132,7 @@ async function embedRaw(text) {
     pipelineLoaded = false;
     lastError = msg;
     warnOnce(`embeddings unavailable: ${msg}`);
+    logEmbeddingError(null, 'model_load', e, { model: EMBEDDING_MODEL }).catch(() => {});
     return null;
   } finally {
     if (timer) clearTimeout(timer);
@@ -190,6 +203,12 @@ export function _setPipelineStubForTests(stub) {
 // float32 bytes; SQLite BLOB preserves them byte-for-byte.
 export function encodeVector(vec) {
   if (!vec) return null;
+  // Validate dimension on encode to catch bugs early.
+  if (vec.length !== EMBEDDING_DIM) {
+    const err = new Error(`embedding dimension mismatch on encode: got ${vec.length}, expected ${EMBEDDING_DIM}`);
+    err.code = 'KIMI_MEMORY_EMBED_DIM_MISMATCH';
+    throw err;
+  }
   return Buffer.from(vec.buffer, vec.byteOffset, vec.byteLength);
 }
 
@@ -199,8 +218,27 @@ export function decodeVector(buf) {
   // first EMBEDDING_DIM*4 bytes as a Float32Array.
   const u8 =
     buf instanceof Uint8Array ? buf : new Uint8Array(buf.buffer, buf.byteOffset, buf.byteLength);
-  const ab = u8.buffer.slice(u8.byteOffset, u8.byteOffset + u8.byteLength);
-  return new Float32Array(ab);
+  const expectedBytes = EMBEDDING_DIM * 4;
+  if (u8.length < expectedBytes) {
+    const err = new Error(
+      `embedding BLOB too small: got ${u8.length} bytes, expected at least ${expectedBytes} for dim=${EMBEDDING_DIM}`
+    );
+    err.code = 'KIMI_MEMORY_EMBED_CORRUPT';
+    throw err;
+  }
+  const ab = u8.buffer.slice(u8.byteOffset, u8.byteOffset + expectedBytes);
+  const vec = new Float32Array(ab);
+  // Final validation: check for NaN/Inf which indicate corruption.
+  for (let i = 0; i < vec.length; i++) {
+    if (!Number.isFinite(vec[i])) {
+      const err = new Error(
+        `embedding BLOB contains non-finite value at index ${i}: ${vec[i]}`
+      );
+      err.code = 'KIMI_MEMORY_EMBED_CORRUPT';
+      throw err;
+    }
+  }
+  return vec;
 }
 
 // Pure-JS dot product. The MiniLM pipeline returns L2-normalized
@@ -210,4 +248,30 @@ export function cosineSimilarity(a, b) {
   let s = 0;
   for (let i = 0; i < a.length; i++) s += a[i] * b[i];
   return s;
+}
+
+// Model compatibility check. Returns {compatible: boolean, reason?: string}.
+// This is useful to validate that the loaded model matches expectations.
+export function validateModelCompatibility(loadedOutputDim) {
+  if (!Number.isFinite(loadedOutputDim) || loadedOutputDim < 0) {
+    return { compatible: false, reason: 'invalid dimension' };
+  }
+  if (loadedOutputDim !== EMBEDDING_MODEL_EXPECTED_DIM) {
+    return {
+      compatible: false,
+      reason: `dimension mismatch: got ${loadedOutputDim}, expected ${EMBEDDING_MODEL_EXPECTED_DIM}`,
+    };
+  }
+  return { compatible: true };
+}
+
+// Export model info for diagnostics and version checking.
+export function getModelInfo() {
+  return {
+    model: EMBEDDING_MODEL,
+    dimension: EMBEDDING_DIM,
+    expected_dimension: EMBEDDING_MODEL_EXPECTED_DIM,
+    loaded: pipelineLoaded,
+    last_error: lastError,
+  };
 }

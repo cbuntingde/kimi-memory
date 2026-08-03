@@ -18,10 +18,11 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { nowIso, safeJsonParse, asString } from './util.js';
-import { parseToml } from './toml.js';
+import { withLlmRetry } from './retry.js';
+import { logAutoExtractError } from './diagnostics.js';
 
 const MAX_CANDIDATES_PER_CALL = 3;
-const MAX_INPUT_CHARS = 8000; // ~2k tokens of conversation context
+const MAX_INPUT_CHARS = 12000; // ~3k tokens of conversation context
 const LLM_TIMEOUT_MS = 4000; // hard cap on the chat call
 
 // Best-effort secret detection. The README and SKILL.md claim that
@@ -60,37 +61,154 @@ export function looksLikeSecret(text) {
   }
   return false;
 }
-const EXTRACT_SYSTEM_PROMPT = `You are a memory extraction module. Read the conversation and decide whether it contains any durable facts worth remembering for the user's future self.
+const EXTRACT_SYSTEM_PROMPT = `You are a memory extraction module. Read the conversation and any project metadata summary provided, and decide whether it contains any durable facts worth remembering for the user's future self.
 
 A "durable fact" is a preference, decision, convention, or stable context that would still be useful hours or days later. Skip transient debugging, in-flight tasks, and one-off questions.
 
-Project build / stack details (build command, test command, dependency update policy, stack summary) are captured separately and intentionally NOT part of this extraction. Focus only on conversation facts.
+In addition to conversation facts, extract project build/stack details when present:
+- build command(s)
+- test command(s)
+- dependency update policy (e.g., "check for latest unless pinned or specified")
+- short stack summary (language, framework, tooling)
 
 Respond with a JSON array. Each entry: { "type": "semantic"|"episodic"|"procedural", "title": "<=80 chars>", "content": "<=500 chars", "tags": ["<short tag>", ...] }.
 Return [] if nothing qualifies. No prose, no markdown fences — JSON only.`;
 
+// ----- minimal TOML parser (covers the kimi-code config.toml subset) -----
+// Handles: comments, bare/quote keys, [section] headers (with quoted
+// segments that may contain dots, e.g. [models."minimax/MiniMax-M3"]),
+// basic scalars (string, int, float, bool), string arrays. Sufficient
+// for the config.toml we ship; not a full TOML implementation.
+//
+// The previous comment-stripping regex (#[^"]*$) was unsafe: it
+// matched a # that lives inside a string literal (e.g. key = "abc#def")
+// and truncated the value. The replacement walks the line char by
+// char so a # inside a quoted string is preserved, and a # outside
+// any string is treated as a comment terminator.
+function stripComment(line) {
+  let inQuote = null;
+  for (let i = 0; i < line.length; i++) {
+    const c = line[i];
+    if (inQuote) {
+      if (c === inQuote && line[i - 1] !== '\\') inQuote = null;
+      continue;
+    }
+    if (c === '"' || c === "'") {
+      inQuote = c;
+      continue;
+    }
+    if (c === '#') return line.slice(0, i);
+  }
+  return line;
+}
+
+function parseToml(text) {
+  const out = {};
+  let cur = out;
+  for (const raw of text.split(/\r?\n/)) {
+    const line = stripComment(raw).trim();
+    if (!line) continue;
+    if (line.startsWith('[')) {
+      const sec = line.replace(/^\[|\]$/g, '').trim();
+      const parts = splitTomlPath(sec);
+      let node = out;
+      for (let i = 0; i < parts.length - 1; i++) {
+        node[parts[i]] = node[parts[i]] || {};
+        node = node[parts[i]];
+      }
+      node[parts[parts.length - 1]] = node[parts[parts.length - 1]] || {};
+      cur = node[parts[parts.length - 1]];
+      continue;
+    }
+    const eq = line.indexOf('=');
+    if (eq < 0) continue;
+    const k = unquoteKey(line.slice(0, eq).trim());
+    const v = parseTomlValue(line.slice(eq + 1).trim());
+    cur[k] = v;
+  }
+  return out;
+}
+// Split a section header like `models."minimax/MiniMax-M2.7"` into
+// ['models', 'minimax/MiniMax-M2.7'] — respecting quoted segments so a
+// `.` inside a quoted name is part of the segment, not a path split.
+function splitTomlPath(s) {
+  const out = [];
+  let buf = '';
+  let inQuote = null;
+  for (let i = 0; i < s.length; i++) {
+    const c = s[i];
+    if (inQuote) {
+      buf += c;
+      if (c === inQuote) inQuote = null;
+      continue;
+    }
+    if (c === '"' || c === "'") {
+      inQuote = c;
+      buf += c;
+      continue;
+    }
+    if (c === '.') {
+      out.push(unquoteKey(buf));
+      buf = '';
+      continue;
+    }
+    buf += c;
+  }
+  if (buf.length > 0) out.push(unquoteKey(buf));
+  return out.filter((p) => p.length > 0);
+}
+function unquoteKey(k) {
+  k = k.trim();
+  if ((k.startsWith('"') && k.endsWith('"')) || (k.startsWith("'") && k.endsWith("'"))) {
+    return k.slice(1, -1);
+  }
+  return k;
+}
+function parseTomlValue(raw) {
+  if (raw.startsWith('"') || raw.startsWith("'")) {
+    const q = raw[0];
+    let out = '';
+    for (let i = 1; i < raw.length; i++) {
+      const c = raw[i];
+      if (c === q) return out;
+      if (c === '\\' && i + 1 < raw.length) {
+        const n = raw[i + 1];
+        out += n === 'n' ? '\n' : n === 't' ? '\t' : n === '\\' ? '\\' : n === '"' ? '"' : n;
+        i++;
+      } else out += c;
+    }
+    return out;
+  }
+  if (raw.startsWith('[')) {
+    const inner = raw.slice(1, raw.lastIndexOf(']'));
+    const items = [];
+    let depth = 0,
+      buf = '';
+    for (const c of inner) {
+      if (c === '[') depth++;
+      if (c === ']') depth--;
+      if (c === ',' && depth === 0) {
+        items.push(buf.trim());
+        buf = '';
+        continue;
+      }
+      buf += c;
+    }
+    if (buf.trim()) items.push(buf.trim());
+    return items.map(parseTomlValue);
+  }
+  if (raw === 'true') return true;
+  if (raw === 'false') return false;
+  if (/^-?\d+$/.test(raw)) return parseInt(raw, 10);
+  if (/^-?\d+\.\d+$/.test(raw)) return parseFloat(raw);
+  return raw;
+}
+
 // Project metadata detector: reads well-known manifests under the
 // project root and returns a compact summary for build/stack extraction.
 // No network, no new dependencies, fail-open.
-//
-// Results are cached per cwd for 30s — manifest files are project-static
-// in practice, and a single hook process can hit this more than once
-// (extract, plus any future caller that wants the same data). TTL keeps
-// memory bounded under heavy test suites without forcing a fresh
-// readFile on every call.
-const _projectMetaCache = new Map();
-const PROJECT_META_TTL_MS = 30_000;
-
-export async function detectProjectMetadata(cwd) {
+async function detectProjectMetadata(cwd) {
   if (!cwd || typeof cwd !== 'string') return null;
-  const cached = _projectMetaCache.get(cwd);
-  if (cached && Date.now() - cached.at < PROJECT_META_TTL_MS) return cached.value;
-  const value = await _detectProjectMetadataUncached(cwd);
-  _projectMetaCache.set(cwd, { at: Date.now(), value });
-  return value;
-}
-
-async function _detectProjectMetadataUncached(cwd) {
   const out = {
     stack: [],
     buildCommand: null,
@@ -102,8 +220,7 @@ async function _detectProjectMetadataUncached(cwd) {
   try {
     const pkgPath = path.join(cwd, 'package.json');
     const pkgText = await fs.readFile(pkgPath, 'utf8');
-    const pkgParsed = safeJsonParse(pkgText);
-    const pkg = pkgParsed.ok ? pkgParsed.value : null;
+    const pkg = safeJsonParse(pkgText).ok ? safeJsonParse(pkgText).value : null;
     if (!pkg || typeof pkg !== 'object') return null;
     const scripts = pkg.scripts && typeof pkg.scripts === 'object' ? pkg.scripts : {};
     out.buildCommand = asString(scripts.build) || null;
@@ -131,8 +248,7 @@ async function _detectProjectMetadataUncached(cwd) {
   try {
     const tsPath = path.join(cwd, 'tsconfig.json');
     const tsText = await fs.readFile(tsPath, 'utf8');
-    const tsParsed = safeJsonParse(tsText);
-    const ts = tsParsed.ok ? tsParsed.value : null;
+    const ts = safeJsonParse(tsText).ok ? safeJsonParse(tsText).value : null;
     if (ts && typeof ts === 'object' && ts.compilerOptions && typeof ts.compilerOptions === 'object') {
       const opts = ts.compilerOptions;
       const bits = [];
@@ -152,6 +268,8 @@ async function _detectProjectMetadataUncached(cwd) {
   if (!out.updatePolicy) out.updatePolicy = 'Check for latest unless pinned or specified in manifest';
   return out;
 }
+
+export { detectProjectMetadata, buildExtractionPrompt };
 
 // Read $KIMI_CODE_HOME/config.toml. Returns {} on missing/unreadable;
 // never throws — auto-extraction must not break the hook. Cached per
@@ -211,25 +329,18 @@ export async function resolveLlmTarget(homeDir) {
 // Build the extraction prompt. existingTitles is a list of titles
 // already in the project's active memories; listing them nudges the
 // model away from duplicates the dedup pass would also catch.
-//
-// Note: project meta (stack, build/test commands, dep policy) is NOT
-// shipped to the LLM. The deterministic path in runAutoExtract reads
-// the manifests and writes the build/stack memories directly, so the
-// LLM only needs the transcript + dedup titles.
-// Bounded to 20 — the dedup pass uses title overlap, and the most
-// recent 20 titles are the strongest signal for "did we already save
-// this fact" without padding the prompt.
-const DEDUP_TITLE_CAP = 20;
-
-export function buildExtractionPrompt(transcript, existingTitles) {
+function buildExtractionPrompt(transcript, existingTitles, projectMeta) {
   const trimmed = String(transcript || '').slice(0, MAX_INPUT_CHARS);
   const titlesLine =
     existingTitles && existingTitles.length
-      ? `\nFor dedup, here are titles already in this project's memory (avoid repeating these):\n- ${existingTitles.slice(0, DEDUP_TITLE_CAP).join('\n- ')}\n`
+      ? `\nFor dedup, here are titles already in this project's memory (avoid repeating these):\n- ${existingTitles.slice(0, 50).join('\n- ')}\n`
       : '';
+  const metaLine = projectMeta
+    ? `\nProject metadata (from manifest files):\n${JSON.stringify(projectMeta, null, 2)}\n`
+    : '';
   return {
     system: EXTRACT_SYSTEM_PROMPT,
-    user: `${titlesLine}Conversation transcript:\n"""\n${trimmed}\n"""\n\nJSON array of candidate memories:`,
+    user: `${titlesLine}${metaLine}Conversation transcript:\n"""\n${trimmed}\n"""\n\nJSON array of candidate memories:`,
   };
 }
 
@@ -445,36 +556,6 @@ export async function dedupeCandidates({
 //   secrets_dropped: 0,
 //   error: string | null,
 // }
-
-// Build the deterministic candidate list from the project's manifest
-// metadata. These facts come from package.json / tsconfig.json, not
-// the LLM, so they save with `supersede: true` (idempotent) and run
-// regardless of LLM success.
-function buildDeterministicCandidates(projectMeta) {
-  if (!projectMeta) return [];
-  const out = [];
-  const stack = projectMeta.stack && projectMeta.stack.length
-    ? projectMeta.stack.join(', ')
-    : 'unknown';
-  out.push({
-    type: 'semantic',
-    title: 'Project build/stack details',
-    content: `Stack: ${stack}. Build: ${projectMeta.buildCommand || 'n/a'}. Test: ${projectMeta.testCommand || 'n/a'}. Update policy: ${projectMeta.updatePolicy || 'n/a'}.`,
-    tags: ['build', 'stack', 'project'],
-    supersede: true,
-  });
-  if (projectMeta.updatePolicy) {
-    out.push({
-      type: 'procedural',
-      title: 'Dependency update policy',
-      content: projectMeta.updatePolicy,
-      tags: ['dependencies', 'updates', 'project'],
-      supersede: true,
-    });
-  }
-  return out;
-}
-
 export async function runAutoExtract({
   homeDir,
   cwd,
@@ -486,6 +567,7 @@ export async function runAutoExtract({
   searchMemories,
   // Injection seam for tests + future override (e.g. KIMI_MEMORY_AUTO_EXTRACT_LLM).
   callLlm = callChat,
+  resolveLlmTargetImpl = resolveLlmTarget,
   now = () => Date.now(),
   // Env-driven opt-outs. Tests can override the default.
   isDisabled = () => process.env.KIMI_MEMORY_AUTO_EXTRACT === 'off',
@@ -519,84 +601,104 @@ export async function runAutoExtract({
     result.skipped = 'config_opt_out';
     return result;
   }
-  const target = await resolveLlmTarget(homeDir);
+  const target = await resolveLlmTargetImpl(homeDir);
   if (target.error) {
     result.skipped = target.error;
     return result;
   }
 
   const projectMeta = await detectProjectMetadata(cwd);
-  // Build the deterministic candidates (project build/stack details)
-  // before the LLM call so the deterministic save still runs even if
-  // the LLM returns no candidates or errors out. The deterministic
-  // path is cheap and idempotent (supersede: true) so there is no
-  // reason to gate it on LLM success.
-  const deterministic = buildDeterministicCandidates(projectMeta);
-
-  const prompt = buildExtractionPrompt(transcript, existingTitles || []);
-  const reply = await callLlm({ ...target, system: prompt.system, user: prompt.user });
+  const prompt = buildExtractionPrompt(transcript, existingTitles || [], projectMeta);
+  
+  let reply;
+  try {
+    // Retry with exponential backoff for transient LLM failures.
+    reply = await withLlmRetry(
+      () => callLlm({ ...target, system: prompt.system, user: prompt.user }),
+      { projectKey, maxAttempts: 3, baseDelayMs: 1000 }
+    );
+  } catch (error) {
+    // LLM call failed after retries; log and continue with no extraction.
+    await logAutoExtractError(
+      projectKey,
+      'llm_failed_after_retries',
+      error,
+      { max_attempts: 3, error_code: error?.code }
+    ).catch(() => {});
+    result.skipped = 'llm_failed_after_retries';
+    result.error = error && error.message ? error.message : String(error);
+    return result;
+  }
+  
   if (!reply) {
-    saveCandidates(deterministic, { confidence: 0.85, priority: 0 });
     result.skipped = 'llm_no_reply';
     return result;
   }
   const candidates = parseExtractionResponse(reply);
   result.extracted = candidates.length;
 
-  let kept = [];
-  if (candidates.length > 0) {
-    const dedup = await dedupeCandidates({
-      db,
-      projectKey,
-      candidates,
-      searchMemories,
+  const { kept, duplicates } = await dedupeCandidates({
+    db,
+    projectKey,
+    candidates,
+    searchMemories,
+  });
+  result.duplicates = duplicates.length;
+
+  const deterministic = [];
+  if (projectMeta) {
+    const stack = projectMeta.stack && projectMeta.stack.length ? projectMeta.stack.join(', ') : 'unknown';
+    deterministic.push({
+      type: 'semantic',
+      title: 'Project build/stack details',
+      content: `Stack: ${stack}. Build: ${projectMeta.buildCommand || 'n/a'}. Test: ${projectMeta.testCommand || 'n/a'}. Update policy: ${projectMeta.updatePolicy || 'n/a'}.`,
+      tags: ['build', 'stack', 'project'],
+      supersede: true,
     });
-    kept = dedup.kept;
-    result.duplicates = dedup.duplicates.length;
+    if (projectMeta.updatePolicy) {
+      deterministic.push({
+        type: 'procedural',
+        title: 'Dependency update policy',
+        content: projectMeta.updatePolicy,
+        tags: ['dependencies', 'updates', 'project'],
+        supersede: true,
+      });
+    }
   }
 
-  // LLM candidates use lower confidence/priority than the deterministic
-  // ones — the model may have invented or mis-extracted, so we mark
-  // them as tentative.
-  saveCandidates(kept, { confidence: 0.6, priority: -1 });
-  saveCandidates(deterministic, { confidence: 0.85, priority: 0 });
-
-  return result;
-
-  function saveCandidates(list, { confidence, priority }) {
-    for (const cand of list) {
-      // Secret scrub: the model may echo back a credential the user
-      // typed in the transcript, or it may have invented a key in its
-      // own reply. Either way, a candidate that matches a known secret
-      // shape is dropped on the floor and counted in the result so the
-      // operator can see what was suppressed.
-      if (secretDetector(cand.content) || secretDetector(cand.title)) {
-        result.secrets_dropped += 1;
-        continue;
-      }
-      try {
-        saveMemory(db, projectKey, {
-          type: cand.type,
-          title: cand.title,
-          content: cand.content,
-          tags: cand.tags,
-          confidence,
-          priority,
-          supersede: cand.supersede === true,
-          provenance: {
-            source: 'auto_extract',
-            model: target.model,
-            provider: target.provider,
-            cwd: cwd || null,
-            recorded_at: nowIso(),
-          },
-        });
-        result.saved += 1;
-      } catch (e) {
-        // Never block: a single failed save is logged via result.error and
-        // the next candidate proceeds.
-        result.error = e && e.message ? e.message : String(e);
-      }
+  const allCandidates = [...kept, ...deterministic];
+  if (allCandidates.length === 0) return result;
+  for (const cand of allCandidates) {
+    // Secret scrub: the model may echo back a credential the user
+    // typed in the transcript, or it may have invented a key in its
+    // own reply. Either way, a candidate that matches a known secret
+    // shape is dropped on the floor and counted in the result so the
+    // operator can see what was suppressed.
+    if (secretDetector(cand.content) || secretDetector(cand.title)) {
+      result.secrets_dropped += 1;
+      continue;
+    }
+    try {
+      saveMemory(db, projectKey, {
+        type: cand.type,
+        title: cand.title,
+        content: cand.content,
+        tags: cand.tags,
+        confidence: 0.6, // lower than the default 0.8 to flag uncertainty
+        priority: -1, // below user-saved rows in the default list order
+        provenance: {
+          source: 'auto_extract',
+          model: target.model,
+          provider: target.provider,
+          cwd: cwd || null,
+          recorded_at: nowIso(),
+        },
+      });
+      result.saved += 1;
+    } catch (e) {
+      // Never block: a single failed save is logged via result.error and
+      // the next candidate proceeds.
+      result.error = e && e.message ? e.message : String(e);
     }
   }
   return result;

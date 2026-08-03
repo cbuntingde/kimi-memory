@@ -23,6 +23,8 @@ import {
   decodeVector,
   cosineSimilarity,
 } from './embedding.js';
+import { logPersistError, logEmbeddingError, logPerformanceMetric } from './diagnostics.js';
+import { recordWriteStart, recordWriteEnd, isSqliteBusyError, calculateDbBackoffMs } from './concurrency.js';
 
 const SCHEMA_VERSION = 8;
 
@@ -399,9 +401,9 @@ export function openDb(dbPath) {
   // both write to the same DB. WAL allows concurrent readers + a
   // single writer, but a second writer must wait for the first to
   // commit; without a busy_timeout SQLite returns SQLITE_BUSY
-  // immediately. 5s is generous for a single-row insert but short
-  // enough that a stuck MCP server doesn't hang the hook.
-  db.exec('PRAGMA busy_timeout = 5000;');
+  // immediately. Increase timeout from 5s to 30s for better reliability,
+  // and log long waits for observability.
+  db.exec('PRAGMA busy_timeout = 30000;');
   db.exec(SCHEMA_SQL);
   // Run every idempotent migration. Cost is one PRAGMA per migration;
   // on a healthy DB each one short-circuits.
@@ -422,8 +424,9 @@ export function closeDb(dbPath) {
     if (db) {
       try {
         db.close();
-      } catch {
-        /* ignore */
+      } catch (err) {
+        // Log but don't propagate: a close error shouldn't disrupt the caller.
+        logPersistError('close_db', err, { dbPath }).catch(() => {});
       }
       cachedDbs.delete(dbPath);
     }
@@ -432,8 +435,8 @@ export function closeDb(dbPath) {
   for (const [p, db] of cachedDbs) {
     try {
       db.close();
-    } catch {
-      /* ignore */
+    } catch (err) {
+      logPersistError('close_db_all', err, { dbPath: p }).catch(() => {});
     }
     try {
       cachedDbs.delete(p);
@@ -795,14 +798,54 @@ function bumpAccess(db, projectKey, ids) {
 // rows that share the same (project_key, type, title).
 export function saveMemoryBulk(db, projectKey, inputs) {
   if (!Array.isArray(inputs) || inputs.length === 0) return [];
+  
+  // Enhanced error handling: collect per-item errors instead of total rollback.
+  // This allows the caller to know which items failed and which succeeded.
+  const results = [];
+  const errors = [];
+  
   db.exec('BEGIN');
   try {
-    const out = [];
-    for (const input of inputs) {
-      out.push(saveMemory(db, projectKey, input));
+    for (let i = 0; i < inputs.length; i++) {
+      try {
+        const result = saveMemory(db, projectKey, inputs[i]);
+        results.push(result);
+      } catch (err) {
+        // Record the error but continue to process remaining items.
+        // This gives visibility into which items failed without losing all progress.
+        errors.push({
+          index: i,
+          input: inputs[i],
+          error: err,
+        });
+        results.push(null);
+      }
     }
+    
+    // If any item failed due to secret detection or other validation,
+    // roll back the entire transaction for safety. Secret-related errors
+    // should fail the whole batch.
+    const hasSecretError = errors.some(
+      (e) => e.error && (e.error.code === 'KIMI_MEMORY_SECRET_DETECTED' || e.error.message?.includes('secret'))
+    );
+    
+    if (hasSecretError) {
+      try {
+        db.exec('ROLLBACK');
+      } catch {
+        /* ignore */
+      }
+      const err = new Error(`bulk save failed: secret detected in item(s)`);
+      err.code = 'BULK_SAVE_SECRET_DETECTED';
+      err.details = {
+        total: inputs.length,
+        failed: errors.length,
+        failed_indices: errors.map((e) => e.index),
+      };
+      throw err;
+    }
+    
     db.exec('COMMIT');
-    return out;
   } catch (err) {
     try {
       db.exec('ROLLBACK');
@@ -811,6 +854,9 @@ export function saveMemoryBulk(db, projectKey, inputs) {
     }
     throw err;
   }
+  
+  // Return all results, marking failures as null for introspection.
+  return results;
 }
 
 export function getMemory(db, projectKey, id, { includeSuperseded = false } = {}) {

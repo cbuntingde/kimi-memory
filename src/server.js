@@ -88,6 +88,7 @@ import {
   validateWeight,
   toError,
 } from './validation.js';
+import { getRecentLogs, getErrorSummary } from './diagnostics.js';
 
 const TOOL_DEFS = [
   {
@@ -126,7 +127,7 @@ const TOOL_DEFS = [
   },
   {
     name: 'memory_recall',
-    desc: 'Keyword search across the active scope\u2019s durable memories using FTS5.',
+    desc: 'Keyword search across the active scope\u2019s durable memories using FTS5. Supports hybrid ranking with title boosting and optional temporal ordering.',
     input: {
       cwd: z.string().describe('Project root (absolute path). Required.'),
       scope: z
@@ -135,9 +136,11 @@ const TOOL_DEFS = [
         .describe(
           'project: this project only. global: _global DB only. all: project + global, project hits first (default all).',
         ),
-      query: z.string().min(1).max(500).describe('Search query.'),
+      query: z.string().min(1).max(500).describe('Search query. Supports basic FTS5 operators: "exact phrase" or -exclude.'),
       type: z.enum(['working', 'episodic', 'semantic', 'procedural']).optional(),
       limit: z.number().int().min(1).max(200).optional(),
+      recent_first: z.boolean().optional().describe('When true, sort by updated_at DESC (most recent first) instead of FTS5 relevance.'),
+      sort_by: z.enum(['relevance', 'recent', 'confidence', 'priority']).optional().describe('Sort order. Default: relevance.'),
     },
   },
   {
@@ -493,6 +496,31 @@ const TOOL_DEFS = [
         .boolean()
         .optional()
         .describe('When true, delete orphan DBs. Default false (dry run).'),
+    },
+  },
+  {
+    name: 'memory_diagnostics',
+    desc: 'Retrieve recent error logs and diagnostic information for hook failures, auto-extract issues, embedding errors, and other system events. Useful for troubleshooting and observability.',
+    input: {
+      hours_back: z
+        .number()
+        .int()
+        .min(1)
+        .max(720)
+        .optional()
+        .describe('How many hours back to summarize errors. Default 24.'),
+      type_filter: z
+        .enum([
+          'hook_error',
+          'auto_extract_error',
+          'embedding_error',
+          'persist_error',
+          'conversation_ingest_error',
+          'config_validation_error',
+        ])
+        .optional()
+        .describe('Filter diagnostics to a specific error type.'),
+      limit: z.number().int().min(1).max(500).optional().describe('Max records to return. Default 100.'),
     },
   },
 ];
@@ -1616,6 +1644,29 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
         ).length,
         removed,
         note: 'global database is preserved (cross-project by definition)',
+      });
+    } catch (e) {
+      return textError(toError(e).error);
+    }
+  });
+
+  // ---- memory_diagnostics (error logs and system observability) ----
+  server.tool(TOOL_DEFS[24].name, TOOL_DEFS[24].input, async (args) => {
+    try {
+      const hoursBack = args.hours_back || 24;
+      const limit = args.limit || 100;
+      const typeFilter = args.type_filter || null;
+
+      const recent = await getRecentLogs(limit, typeFilter);
+      const summary = await getErrorSummary(hoursBack);
+
+      return ok({
+        operation: 'diagnostics',
+        recent_logs: recent,
+        error_summary: summary,
+        hours_back: hoursBack,
+        log_location: path.join(home, 'kimi-memory', '_diagnostics', 'hooks.log'),
+        note: 'Recent logs are ordered most-recent-first. Use type_filter to focus on specific error types.',
       });
     } catch (e) {
       return textError(toError(e).error);
