@@ -34,7 +34,7 @@ Pick the right scope for every fact you save or recall:
 - Always pass the project root (the cwd of the current session) as `cwd` — even for `scope: "global"` writes (it stays as provenance/audit context).
 - Always `memory_recall` (default `scope: "all"`) **before** `memory_save` so you don't duplicate. If a recall hit exists, prefer update or `supersede: true`.
 - After a successful `memory_save` / `memory_update` / `memory_delete`, echo the returned `id` and `scope` so the user can see what was persisted.
-- Use `tags` to make recall precise (e.g. `["build", "ci"]`).
+- Use `tags` to make recall precise. `tags` MUST be a real JSON array of strings, e.g. `["build", "ci"]`. Never a single string, never a comma-separated value inside a string. The server validates with JSON Schema (`type: "array"`, `items: { type: "string" }`) and returns `/tags must be array` if it is not an actual array. If a call fails with that error, re-read the call and fix the parameter — do not blindly retry.
 
 ## Types
 
