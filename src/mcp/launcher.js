@@ -16,14 +16,19 @@ const requiredPackages = [
 ];
 
 if (requiredPackages.some((file) => !existsSync(path.join(pluginRoot, 'node_modules', file)))) {
-  const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm';
+  const isWin = process.platform === 'win32';
+  // On Windows, npm ships as `npm.cmd`. Node >=18 refuses to spawn a
+  // .cmd / .bat shim without `shell: true` (CVE-2024-27980 mitigation),
+  // which surfaces as `spawnSync EINVAL`. Args below are static, so the
+  // shell interpolation is safe.
+  const npm = isWin ? 'npm.cmd' : 'npm';
   const result = spawnSync(
     npm,
     ['ci', '--omit=dev', '--ignore-scripts', '--no-audit', '--no-fund'],
     {
       cwd: pluginRoot,
       stdio: ['ignore', 'ignore', 'inherit'],
-      shell: false,
+      shell: isWin,
     },
   );
 
