@@ -23,7 +23,7 @@ if (requiredPackages.some((file) => !existsSync(path.join(pluginRoot, 'node_modu
     {
       cwd: pluginRoot,
       stdio: ['ignore', 'ignore', 'inherit'],
-      shell: false,
+      shell: process.platform === 'win32',
     },
   );
 
