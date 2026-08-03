@@ -109,31 +109,34 @@ function isPlainObject(v) {
   return v && typeof v === 'object' && !Array.isArray(v);
 }
 
-// First non-empty string under any of the candidate keys, after
-// passing the raw value through `map`. Used by the payload adapters
-// below so each one stays a one-liner over a key list.
-function payloadStringField(payload, keys, map = (v) => v) {
+function payloadProjectRoot(payload) {
   if (!isPlainObject(payload)) return null;
-  for (const key of keys) {
-    const v = payload[key];
-    if (typeof v === 'string' && v.length > 0) return map(v);
+  // PAYLOAD_CWD_KEYS lists every field name Kimi has shipped for the
+  // project's working directory across hook-payload versions. Keep
+  // it in sync with the table above.
+  for (const key of PAYLOAD_CWD_KEYS) {
+    const r = canonicalizeRoot(payload[key]);
+    if (r) return r;
   }
   return null;
 }
 
-function payloadProjectRoot(payload) {
-  // PAYLOAD_CWD_KEYS lists every field name Kimi has shipped for the
-  // project's working directory across hook-payload versions. Keep
-  // it in sync with the table above.
-  return payloadStringField(payload, PAYLOAD_CWD_KEYS, canonicalizeRoot);
-}
-
 function payloadSessionId(payload) {
-  return payloadStringField(payload, PAYLOAD_SESSION_KEYS);
+  if (!isPlainObject(payload)) return null;
+  for (const key of PAYLOAD_SESSION_KEYS) {
+    const v = payload[key];
+    if (typeof v === 'string' && v.length > 0) return v;
+  }
+  return null;
 }
 
 function payloadPrompt(payload) {
-  return payloadStringField(payload, PAYLOAD_PROMPT_KEYS) || '';
+  if (!isPlainObject(payload)) return '';
+  for (const key of PAYLOAD_PROMPT_KEYS) {
+    const v = payload[key];
+    if (typeof v === 'string' && v.length > 0) return v;
+  }
+  return '';
 }
 
 // Open a database only if it already exists. We never lazy-create the
@@ -168,21 +171,6 @@ function firstContentLine(content) {
     .find((line) => line.length > 0);
   if (!first) return '';
   return first.length > 120 ? first.slice(0, 120) + '…' : first;
-}
-
-// Render one memory as a single `[recall: …]` status line. Shared by
-// the per-type recall and the SessionStart build/stack recall so the
-// two paths stay in sync. `tag` (when set) replaces the "i/N" index
-// — used by SessionStart which has no total. `includeScore=false`
-// suppresses the score field for non-ranked previews.
-function formatRecallSnippet(m, { scope, index, total, includeScore = true, tag }) {
-  const raw = (m.title || '').trim() || (m.content || '').slice(0, 80);
-  const truncated = raw.length > 80 ? raw.slice(0, 80) + '…' : raw;
-  const score = includeScore && m.score != null ? `, score=${m.score.toFixed(2)}` : '';
-  const snippet = firstContentLine(m.content);
-  const tail = snippet ? ` — ${snippet}` : '';
-  const slot = tag != null ? tag : `${index + 1}/${total}`;
-  return `[recall: ${slot}] "${truncated}" (${m.type}, ${scope}${score})${tail}`;
 }
 
 // Used by the brief summary lines. We deliberately do NOT emit the
@@ -243,54 +231,18 @@ function formatWorkLogSegment(wl) {
 
 // ---- Snapshot builders ----
 
-// Canonical on-disk paths for this plugin. Used by the hook handlers
-// to open project + global DBs without re-deriving the layout.
-function memoryDbPaths(key) {
-  return {
-    project: path.join(HOME, 'kimi-memory', key, 'memory.sqlite'),
-    global: path.join(HOME, 'kimi-memory', '_global', 'memory.sqlite'),
-  };
-}
-
-// Common preamble for every payload-bearing hook handler: validate
-// the cwd, derive the project key, opportunistically ingest any
-// leftover session archive, and open the project + global DBs. Each
-// caller still does its own counts/decay/prompt handling on top of
-// the returned context.
-async function openHookContext(payload) {
-  const cwd = payloadProjectRoot(payload);
-  if (!cwd) return { ok: false, reason: 'no project cwd in payload' };
-  const key = deriveProjectKey(cwd);
-  await ensureProjectDir(HOME, key);
-  const ingest = await safeHandleStop(payload, cwd);
-  const paths = memoryDbPaths(key);
-  return {
-    ok: true,
-    cwd,
-    key,
-    ingest,
-    projectDb: safeOpenDb(paths.project),
-    globalDb: safeOpenDb(paths.global),
-  };
-}
-
 function buildCounts({ projectDb, globalDb, key }) {
   const project = projectDb ? memoryCounts(projectDb, key) : zeroCounts();
   const global = globalDb ? memoryCounts(globalDb, GLOBAL_PROJECT_KEY) : zeroCounts();
   const wm = projectDb ? listWorkingMemory(projectDb, key) : [];
-  // One round-trip for both conversation + event counts; an absent
-  // projectDb skips the query entirely.
-  let conv = 0;
-  let events = 0;
-  if (projectDb) {
-    const row = projectDb
-      .prepare(
-        'SELECT (SELECT COUNT(*) FROM conversations WHERE project_key=?) AS conv, (SELECT COUNT(*) FROM conversation_events WHERE project_key=?) AS events',
-      )
-      .get(key, key);
-    conv = (row && row.conv) || 0;
-    events = (row && row.events) || 0;
-  }
+  const conv = projectDb
+    ? projectDb.prepare('SELECT COUNT(*) AS n FROM conversations WHERE project_key=?').get(key).n
+    : 0;
+  const events = projectDb
+    ? projectDb
+        .prepare('SELECT COUNT(*) AS n FROM conversation_events WHERE project_key=?')
+        .get(key).n
+    : 0;
   return { project, global, wm, conv, events };
 }
 
@@ -367,25 +319,20 @@ async function buildRecallSummary({ projectDb, globalDb, key, prompt }) {
   // procedures AND working notes, not five rows of the same type),
   // and the scores feed the "[recall: i/N]" title lines the user
   // sees below. PROMPT_RECALL_LIMIT is the per-scope cap.
-  //
-  // Project + global searches are independent (different DBs, same
-  // query string) — run them in parallel.
-  const [projectHits, globalHits] = await Promise.all([
-    projectDb
-      ? searchMemories(projectDb, key, query, {
-          limit: PROMPT_RECALL_LIMIT,
-          perType: true,
-          includeScore: true,
-        })
-      : Promise.resolve([]),
-    globalDb
-      ? searchMemories(globalDb, GLOBAL_PROJECT_KEY, query, {
-          limit: PROMPT_RECALL_LIMIT,
-          perType: true,
-          includeScore: true,
-        })
-      : Promise.resolve([]),
-  ]);
+  const projectHits = projectDb
+    ? await searchMemories(projectDb, key, query, {
+        limit: PROMPT_RECALL_LIMIT,
+        perType: true,
+        includeScore: true,
+      })
+    : [];
+  const globalHits = globalDb
+    ? await searchMemories(globalDb, GLOBAL_PROJECT_KEY, query, {
+        limit: PROMPT_RECALL_LIMIT,
+        perType: true,
+        includeScore: true,
+      })
+    : [];
   const allHits = [...projectHits, ...globalHits];
   const total = allHits.length;
 
@@ -422,7 +369,14 @@ async function buildRecallSummary({ projectDb, globalDb, key, prompt }) {
   for (let i = 0; i < topHits.length; i++) {
     const m = topHits[i];
     const scope = projectIdSet.has(m.id) ? 'project' : 'global';
-    recallLines.push(formatRecallSnippet(m, { scope, index: i, total }));
+    const raw = (m.title || '').trim() || (m.content || '').slice(0, 80);
+    const truncated = raw.length > 80 ? raw.slice(0, 80) + '…' : raw;
+    const score = m.score != null ? `, score=${m.score.toFixed(2)}` : '';
+    const snippet = firstContentLine(m.content);
+    const tail = snippet ? ` — ${snippet}` : '';
+    recallLines.push(
+      `[recall: ${i + 1}/${total}] "${truncated}" (${m.type}, ${scope}${score})${tail}`,
+    );
   }
 
   return {
@@ -447,9 +401,17 @@ function emitLines(lines) {
 // ---- Handlers ----
 
 async function handleSessionStart(payload) {
-  const ctx = await openHookContext(payload);
-  if (!ctx.ok) return ctx;
-  const { cwd, key, ingest, projectDb, globalDb } = ctx;
+  const cwd = payloadProjectRoot(payload);
+  if (!cwd) return { ok: false, reason: 'no project cwd in payload' };
+  // Opportunistic ingest of any leftover archive from a previous
+  // session start mid-archive — usually 0, never blocks the agent.
+  const ingest = await safeHandleStop(payload, cwd);
+  const key = deriveProjectKey(cwd);
+  await ensureProjectDir(HOME, key);
+  const projectDbPath = path.join(HOME, 'kimi-memory', key, 'memory.sqlite');
+  const globalDbPath2 = path.join(HOME, 'kimi-memory', '_global', 'memory.sqlite');
+  const projectDb = safeOpenDb(projectDbPath);
+  const globalDb = safeOpenDb(globalDbPath2);
   // Decay pass on the project DB: the only mutating action at
   // SessionStart. Runs once per SessionStart, idempotent (re-running
   // on already-decayed rows is a no-op). Failures are logged but
@@ -492,7 +454,11 @@ async function handleSessionStart(payload) {
         .sort((a, b) => (b.score || 0) - (a.score || 0))
         .slice(0, 2);
       for (const m of topRecall) {
-        lines.push(formatRecallSnippet(m, { scope: 'project', tag: 'project', includeScore: false }));
+        const raw = (m.title || '').trim() || (m.content || '').slice(0, 80);
+        const truncated = raw.length > 80 ? raw.slice(0, 80) + '…' : raw;
+        const snippet = firstContentLine(m.content);
+        const tail = snippet ? ` — ${snippet}` : '';
+        lines.push(`[recall: project] "${truncated}" (${m.type}, project)${tail}`);
       }
     } catch {
       // recall is best-effort at SessionStart
@@ -516,9 +482,16 @@ async function handleSessionStart(payload) {
 }
 
 async function handleUserPromptSubmit(payload) {
-  const ctx = await openHookContext(payload);
-  if (!ctx.ok) return ctx;
-  const { cwd, key, ingest, projectDb, globalDb } = ctx;
+  const cwd = payloadProjectRoot(payload);
+  if (!cwd) return { ok: false, reason: 'no project cwd in payload' };
+  // Capture the ingest result this time instead of discarding it.
+  const ingest = await safeHandleStop(payload, cwd);
+  const key = deriveProjectKey(cwd);
+  await ensureProjectDir(HOME, key);
+  const projectDbPath = path.join(HOME, 'kimi-memory', key, 'memory.sqlite');
+  const globalDbPath2 = path.join(HOME, 'kimi-memory', '_global', 'memory.sqlite');
+  const projectDb = safeOpenDb(projectDbPath);
+  const globalDb = safeOpenDb(globalDbPath2);
   const counts = buildCounts({ projectDb, globalDb, key });
   const prompt = payloadPrompt(payload);
   const recall = await buildRecallSummary({ projectDb, globalDb, key, prompt });
@@ -585,13 +558,7 @@ async function handleStop(payload) {
   const cwd = payloadProjectRoot(payload);
   if (!cwd) return { ok: false, reason: 'no project cwd in payload' };
   const sessionId = payloadSessionId(payload);
-  // Open the project DB once. Each sub-step (ingest, extract, work-log)
-  // takes this handle instead of reopening, so a single Stop event
-  // uses one SQLite connection rather than two or three.
-  const key = deriveProjectKey(cwd);
-  await ensureProjectDir(HOME, key);
-  const db = safeOpenDb(path.join(HOME, 'kimi-memory', key, 'memory.sqlite'));
-  const ingest = await safeHandleStop(payload, cwd, db);
+  const ingest = await safeHandleStop(payload, cwd);
   // Auto-extract piggybacks on the ingest pass: the conversation_events
   // table is now up to date, so we can read the last few exchanges and
   // ask the LLM whether anything durable is worth saving. Failures here
@@ -599,7 +566,7 @@ async function handleStop(payload) {
   let extract = null;
   if (sessionId && ingest && ingest.ok !== false && !ingest.skipped) {
     try {
-      extract = await handleAutoExtract(cwd, sessionId, db);
+      extract = await handleAutoExtract(cwd, sessionId);
     } catch (e) {
       extract = { skipped: 'extract_threw', error: e && e.message };
     }
@@ -613,6 +580,9 @@ async function handleStop(payload) {
   let workLog = null;
   if (ingest && ingest.ok !== false && cwd) {
     try {
+      const key = deriveProjectKey(cwd);
+      const dbPath = path.join(HOME, 'kimi-memory', key, 'memory.sqlite');
+      const db = safeOpenDb(dbPath);
       if (db) {
         workLog = await maybeWriteWorkLog({
           db,
@@ -665,7 +635,7 @@ async function readLatestStats(cwd) {
   }
 }
 
-async function safeHandleStop(payload, cwd, db = null) {
+async function safeHandleStop(payload, cwd) {
   const key = deriveProjectKey(cwd);
   await ensureProjectDir(HOME, key);
   const sessionId = payloadSessionId(payload);
@@ -691,10 +661,7 @@ async function safeHandleStop(payload, cwd, db = null) {
       project_key: key,
     };
   }
-  // Reuse the caller's handle when given; otherwise open one. Keeps
-  // handleStop's three sub-steps (ingest, extract, work-log) sharing
-  // a single SQLite connection per Stop invocation.
-  if (!db) db = openDb(path.join(HOME, 'kimi-memory', key, 'memory.sqlite'));
+  const db = openDb(path.join(HOME, 'kimi-memory', key, 'memory.sqlite'));
   // Stamp the canonical project root so memory_prune (run via the MCP
   // server or /kimi-memory:prune) can later detect orphan project DBs.
   // No-op if `cwd` is missing or non-canonical.
@@ -823,11 +790,11 @@ function latestEventAgeMs(db, projectKey, sessionId) {
 //   - LLM call timed out / failed → skip (counted via result.skipped)
 //   - candidates are deduped against existing memories via the hybrid
 //     recall (#1); duplicates are dropped, never re-saved
-async function handleAutoExtract(cwd, sessionId, db = null) {
+async function handleAutoExtract(cwd, sessionId) {
   if (!cwd || !sessionId) return { skipped: 'missing_cwd_or_session', saved: 0 };
   const key = deriveProjectKey(cwd);
   await ensureProjectDir(HOME, key);
-  if (!db) db = openDb(path.join(HOME, 'kimi-memory', key, 'memory.sqlite'));
+  const db = openDb(path.join(HOME, 'kimi-memory', key, 'memory.sqlite'));
   try {
     const count = db
       .prepare(
@@ -841,7 +808,7 @@ async function handleAutoExtract(cwd, sessionId, db = null) {
     if (!transcript) return { skipped: 'no_summary_text' };
     const existingTitles = db
       .prepare(
-        "SELECT title FROM memories WHERE project_key = ? AND status = 'active' AND (title IS NOT NULL AND title != '') ORDER BY updated_at DESC LIMIT 20",
+        "SELECT title FROM memories WHERE project_key = ? AND status = 'active' AND (title IS NOT NULL AND title != '') ORDER BY updated_at DESC LIMIT 50",
       )
       .all(key)
       .map((r) => r.title);

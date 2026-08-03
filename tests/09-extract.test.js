@@ -539,29 +539,14 @@ test('detectProjectMetadata: returns null when no manifests found', async () => 
   }
 });
 
-test('buildExtractionPrompt: does not include projectMeta in user prompt', () => {
-  // The deterministic path in runAutoExtract consumes projectMeta directly.
-  // The LLM-bound prompt should not carry it.
-  const prompt = buildExtractionPrompt('hello', []);
-  assert.equal(prompt.user.includes('Project metadata'), false);
-  assert.ok(prompt.user.includes('hello'));
-});
-
-test('buildExtractionPrompt: includes existingTitles for dedup', () => {
-  const prompt = buildExtractionPrompt('hello', ['tab indent rule', 'uses jest']);
-  assert.ok(prompt.user.includes('tab indent rule'));
-  assert.ok(prompt.user.includes('uses jest'));
-  assert.ok(prompt.user.includes('avoid repeating'));
+test('buildExtractionPrompt: includes projectMeta JSON', () => {
+  const prompt = buildExtractionPrompt('hello', [], { stack: ['node'], buildCommand: 'npm run build' });
+  assert.ok(prompt.user.includes('Project metadata (from manifest files)'));
+  assert.ok(prompt.user.includes('"buildCommand": "npm run build"'));
 });
 
 test('runAutoExtract: saves deterministic build/stack memories from manifests', async () => {
   const home = mkTempHome();
-  // Provide a minimal config.toml so resolveLlmTarget does not bail
-  // out with `no_default_model` before the deterministic path runs.
-  writeRaw(
-    path.join(home, 'config.toml'),
-    `default_model = "demo-model"\n[models.demo-model]\nprovider = "demo"\nmodel = "demo-model"\n[providers.demo]\napi_key = "test"\nbase_url = "https://example.invalid"\ntype = "openai"\n`,
-  );
   const projectDir = path.join(home, 'proj');
   await fs.mkdir(projectDir, { recursive: true });
   await writeRaw(
@@ -571,6 +556,20 @@ test('runAutoExtract: saves deterministic build/stack memories from manifests', 
       scripts: { build: 'tsc', test: 'jest' },
       dependencies: { react: '^18.0.0' },
     }),
+  );
+  // Create a config.toml in the home directory.
+  await writeRaw(
+    path.join(home, 'config.toml'),
+    `
+    default_model = "test/model"
+    [providers.test]
+    type = "openai"
+    api_key = "test-key"
+    base_url = "https://test"
+    [models."test/model"]
+    provider = "test"
+    model = "test-model"
+  `,
   );
   try {
     const key = deriveProjectKey(projectDir);
@@ -586,9 +585,9 @@ test('runAutoExtract: saves deterministic build/stack memories from manifests', 
         searchMemories,
         callLlm: async () => '[]',
       });
-      assert.equal(r.skipped, null);
+      assert.equal(r.skipped, null, `skipped should be null but got ${r.skipped}`);
       assert.equal(r.extracted, 0);
-      assert.equal(r.saved, 2);
+      assert.equal(r.saved, 2, `saved should be 2 but got ${r.saved}, error: ${r.error}`);
       assert.equal(r.duplicates, 0);
       const all = listMemories(db, key, {});
       const titles = all.map((m) => m.title).sort();
