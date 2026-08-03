@@ -440,6 +440,30 @@ async function handleSessionStart(payload) {
     }),
   );
   lines.push(recentSummary);
+  // Opportunistic recall of project build/stack memories so the agent
+  // can see saved project context before it acts.
+  if (projectDb) {
+    try {
+      const recallHits = await searchMemories(
+        projectDb,
+        key,
+        'build command stack dependencies update',
+        { limit: 2, perType: true, includeScore: true },
+      );
+      const topRecall = [...recallHits]
+        .sort((a, b) => (b.score || 0) - (a.score || 0))
+        .slice(0, 2);
+      for (const m of topRecall) {
+        const raw = (m.title || '').trim() || (m.content || '').slice(0, 80);
+        const truncated = raw.length > 80 ? raw.slice(0, 80) + '…' : raw;
+        const snippet = firstContentLine(m.content);
+        const tail = snippet ? ` — ${snippet}` : '';
+        lines.push(`[recall: project] "${truncated}" (${m.type}, project)${tail}`);
+      }
+    } catch {
+      // recall is best-effort at SessionStart
+    }
+  }
   const wm = buildWorkingMemoryPreview(projectDb, key);
   for (const l of wm) lines.push(l);
   emitLines(lines);

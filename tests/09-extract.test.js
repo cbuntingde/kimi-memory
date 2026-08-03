@@ -4,6 +4,8 @@
 // used to verify the loader works against the actual config format.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import path from 'node:path';
+import { promises as fs } from 'node:fs';
 import { mkTempHome, rmRf, writeRaw } from './_helpers.js';
 import {
   parseExtractionResponse,
@@ -11,6 +13,8 @@ import {
   resolveLlmTarget,
   runAutoExtract,
   dedupeCandidates,
+  detectProjectMetadata,
+  buildExtractionPrompt,
 } from '../src/extract.js';
 import { openDb, closeDb, saveMemory, listMemories, searchMemories } from '../src/persist.js';
 import { projectDbPath, deriveProjectKey } from '../src/project-key.js';
@@ -488,3 +492,102 @@ test('validateAutoExtractConfig: rejects non-boolean disable_auto_extract', () =
   const bad = validateAutoExtractConfig({ 'kimi-memory': { disable_auto_extract: 'yes' } });
   assert.equal(bad.ok, false);
 });
+
+test('detectProjectMetadata: reads package.json and tsconfig.json', async () => {
+  const home = mkTempHome();
+  const projectDir = path.join(home, 'proj');
+  await fs.mkdir(projectDir, { recursive: true });
+  await writeRaw(
+    path.join(projectDir, 'package.json'),
+    JSON.stringify({
+      name: 'demo',
+      version: '1.0.0',
+      scripts: { build: 'tsc', test: 'jest' },
+      dependencies: { react: '^18.0.0', zod: '~3.0.0' },
+      devDependencies: { typescript: '^5.0.0' },
+      packageManager: 'pnpm@9.0.0',
+    }),
+  );
+  await writeRaw(
+    path.join(projectDir, 'tsconfig.json'),
+    JSON.stringify({
+      compilerOptions: { target: 'ES2022', module: 'ESNext', strict: true },
+    }),
+  );
+  try {
+    const meta = await detectProjectMetadata(projectDir);
+    assert.ok(meta);
+    assert.equal(meta.buildCommand, 'tsc');
+    assert.equal(meta.testCommand, 'jest');
+    assert.ok(meta.stack.includes('pnpm@9.0.0'));
+    assert.ok(meta.stack.some((s) => s.startsWith('tsconfig(')));
+    assert.ok(meta.deps.includes('react'));
+    assert.ok(meta.pinnedDeps.includes('zod'));
+    assert.ok(meta.updatePolicy);
+  } finally {
+    rmRf(home);
+  }
+});
+
+test('detectProjectMetadata: returns null when no manifests found', async () => {
+  const home = mkTempHome();
+  try {
+    const meta = await detectProjectMetadata(path.join(home, 'empty'));
+    assert.equal(meta, null);
+  } finally {
+    rmRf(home);
+  }
+});
+
+test('buildExtractionPrompt: includes projectMeta JSON', () => {
+  const prompt = buildExtractionPrompt('hello', [], { stack: ['node'], buildCommand: 'npm run build' });
+  assert.ok(prompt.user.includes('Project metadata (from manifest files)'));
+  assert.ok(prompt.user.includes('"buildCommand": "npm run build"'));
+});
+
+test('runAutoExtract: saves deterministic build/stack memories from manifests', async () => {
+  const home = mkTempHome();
+  const projectDir = path.join(home, 'proj');
+  await fs.mkdir(projectDir, { recursive: true });
+  await writeRaw(
+    path.join(projectDir, 'package.json'),
+    JSON.stringify({
+      name: 'demo',
+      scripts: { build: 'tsc', test: 'jest' },
+      dependencies: { react: '^18.0.0' },
+    }),
+  );
+  try {
+    const key = deriveProjectKey(projectDir);
+    const db = openDb(projectDbPath(home, key));
+    try {
+      const r = await runAutoExtract({
+        homeDir: home,
+        cwd: projectDir,
+        projectKey: key,
+        db,
+        transcript: 'USER: hi\nASSISTANT: hello',
+        saveMemory,
+        searchMemories,
+        callLlm: async () => '[]',
+      });
+      assert.equal(r.skipped, null);
+      assert.equal(r.extracted, 0);
+      assert.equal(r.saved, 2);
+      assert.equal(r.duplicates, 0);
+      const all = listMemories(db, key, {});
+      const titles = all.map((m) => m.title).sort();
+      assert.deepEqual(titles, ['Dependency update policy', 'Project build/stack details']);
+      const buildMem = all.find((m) => m.title === 'Project build/stack details');
+      assert.ok(buildMem.content.includes('Stack:'));
+      assert.ok(buildMem.content.includes('Build: tsc'));
+      const policyMem = all.find((m) => m.title === 'Dependency update policy');
+      assert.ok(policyMem.content.includes('Check for latest unless pinned'));
+    } finally {
+      closeDb();
+    }
+  } finally {
+    rmRf(home);
+  }
+});
+

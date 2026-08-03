@@ -59,9 +59,15 @@ export function looksLikeSecret(text) {
   }
   return false;
 }
-const EXTRACT_SYSTEM_PROMPT = `You are a memory extraction module. Read the conversation and decide whether it contains any durable facts worth remembering for the user's future self.
+const EXTRACT_SYSTEM_PROMPT = `You are a memory extraction module. Read the conversation and any project metadata summary provided, and decide whether it contains any durable facts worth remembering for the user's future self.
 
 A "durable fact" is a preference, decision, convention, or stable context that would still be useful hours or days later. Skip transient debugging, in-flight tasks, and one-off questions.
+
+In addition to conversation facts, extract project build/stack details when present:
+- build command(s)
+- test command(s)
+- dependency update policy (e.g., "check for latest unless pinned or specified")
+- short stack summary (language, framework, tooling)
 
 Respond with a JSON array. Each entry: { "type": "semantic"|"episodic"|"procedural", "title": "<=80 chars>", "content": "<=500 chars", "tags": ["<short tag>", ...] }.
 Return [] if nothing qualifies. No prose, no markdown fences — JSON only.`;
@@ -196,6 +202,73 @@ function parseTomlValue(raw) {
   return raw;
 }
 
+// Project metadata detector: reads well-known manifests under the
+// project root and returns a compact summary for build/stack extraction.
+// No network, no new dependencies, fail-open.
+async function detectProjectMetadata(cwd) {
+  if (!cwd || typeof cwd !== 'string') return null;
+  const out = {
+    stack: [],
+    buildCommand: null,
+    testCommand: null,
+    deps: [],
+    pinnedDeps: [],
+    updatePolicy: null,
+  };
+  try {
+    const pkgPath = path.join(cwd, 'package.json');
+    const pkgText = await fs.readFile(pkgPath, 'utf8');
+    const pkg = safeJsonParse(pkgText).ok ? safeJsonParse(pkgText).value : null;
+    if (!pkg || typeof pkg !== 'object') return null;
+    const scripts = pkg.scripts && typeof pkg.scripts === 'object' ? pkg.scripts : {};
+    out.buildCommand = asString(scripts.build) || null;
+    out.testCommand = asString(scripts.test) || asString(scripts['test:watch']) || null;
+    const packageManager = asString(pkg.packageManager) || null;
+    if (packageManager) out.stack.push(packageManager);
+    const allDeps = {
+      ...(pkg.dependencies || {}),
+      ...(pkg.devDependencies || {}),
+    };
+    const depNames = Object.keys(allDeps);
+    out.deps = depNames.slice(0, 20);
+    out.pinnedDeps = depNames.filter((d) => /^[\^~]/.test(allDeps[d] || ''));
+    if (pkg.workspaces && Array.isArray(pkg.workspaces) && pkg.workspaces.length) {
+      out.stack.push('workspaces');
+    }
+    const hasTypeScript = depNames.some(
+      (d) => d === 'typescript' || d.startsWith('@types/'),
+    );
+    if (hasTypeScript) out.stack.push('typescript');
+  } catch {
+    // package.json missing or unparseable — ignore
+  }
+
+  try {
+    const tsPath = path.join(cwd, 'tsconfig.json');
+    const tsText = await fs.readFile(tsPath, 'utf8');
+    const ts = safeJsonParse(tsText).ok ? safeJsonParse(tsText).value : null;
+    if (ts && typeof ts === 'object' && ts.compilerOptions && typeof ts.compilerOptions === 'object') {
+      const opts = ts.compilerOptions;
+      const bits = [];
+      if (opts.target) bits.push(`target=${opts.target}`);
+      if (opts.module) bits.push(`module=${opts.module}`);
+      if (opts.jsx) bits.push(`jsx=${opts.jsx}`);
+      if (opts.baseUrl) bits.push(`baseUrl=${opts.baseUrl}`);
+      if (opts.paths) bits.push('paths');
+      if (opts.strict) bits.push('strict');
+      if (bits.length) out.stack.push('tsconfig(' + bits.join(', ') + ')');
+    }
+  } catch {
+    // tsconfig missing or unparseable
+  }
+
+  if (out.stack.length === 0 && !out.buildCommand && !out.testCommand) return null;
+  if (!out.updatePolicy) out.updatePolicy = 'Check for latest unless pinned or specified in manifest';
+  return out;
+}
+
+export { detectProjectMetadata, buildExtractionPrompt };
+
 // Read $KIMI_CODE_HOME/config.toml. Returns {} on missing/unreadable;
 // never throws — auto-extraction must not break the hook. Cached per
 // homeDir for 30s; tests rely on the per-homeDir key to avoid bleed.
@@ -254,15 +327,18 @@ export async function resolveLlmTarget(homeDir) {
 // Build the extraction prompt. existingTitles is a list of titles
 // already in the project's active memories; listing them nudges the
 // model away from duplicates the dedup pass would also catch.
-function buildExtractionPrompt(transcript, existingTitles) {
+function buildExtractionPrompt(transcript, existingTitles, projectMeta) {
   const trimmed = String(transcript || '').slice(0, MAX_INPUT_CHARS);
   const titlesLine =
     existingTitles && existingTitles.length
       ? `\nFor dedup, here are titles already in this project's memory (avoid repeating these):\n- ${existingTitles.slice(0, 50).join('\n- ')}\n`
       : '';
+  const metaLine = projectMeta
+    ? `\nProject metadata (from manifest files):\n${JSON.stringify(projectMeta, null, 2)}\n`
+    : '';
   return {
     system: EXTRACT_SYSTEM_PROMPT,
-    user: `Existing memory titles:${titlesLine}\nConversation transcript:\n"""\n${trimmed}\n"""\n\nJSON array of candidate memories:`,
+    user: `${titlesLine}${metaLine}Conversation transcript:\n"""\n${trimmed}\n"""\n\nJSON array of candidate memories:`,
   };
 }
 
@@ -528,7 +604,8 @@ export async function runAutoExtract({
     return result;
   }
 
-  const prompt = buildExtractionPrompt(transcript, existingTitles || []);
+  const projectMeta = await detectProjectMetadata(cwd);
+  const prompt = buildExtractionPrompt(transcript, existingTitles || [], projectMeta);
   const reply = await callLlm({ ...target, system: prompt.system, user: prompt.user });
   if (!reply) {
     result.skipped = 'llm_no_reply';
@@ -546,7 +623,29 @@ export async function runAutoExtract({
   });
   result.duplicates = duplicates.length;
 
-  for (const cand of kept) {
+  const deterministic = [];
+  if (projectMeta) {
+    const stack = projectMeta.stack && projectMeta.stack.length ? projectMeta.stack.join(', ') : 'unknown';
+    deterministic.push({
+      type: 'semantic',
+      title: 'Project build/stack details',
+      content: `Stack: ${stack}. Build: ${projectMeta.buildCommand || 'n/a'}. Test: ${projectMeta.testCommand || 'n/a'}. Update policy: ${projectMeta.updatePolicy || 'n/a'}.`,
+      tags: ['build', 'stack', 'project'],
+      supersede: true,
+    });
+    if (projectMeta.updatePolicy) {
+      deterministic.push({
+        type: 'procedural',
+        title: 'Dependency update policy',
+        content: projectMeta.updatePolicy,
+        tags: ['dependencies', 'updates', 'project'],
+        supersede: true,
+      });
+    }
+  }
+
+  const allCandidates = [...kept, ...deterministic];
+  for (const cand of allCandidates) {
     // Secret scrub: the model may echo back a credential the user
     // typed in the transcript, or it may have invented a key in its
     // own reply. Either way, a candidate that matches a known secret
