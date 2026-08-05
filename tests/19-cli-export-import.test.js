@@ -10,7 +10,13 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { pluginRoot, StdioMcp, rmRf } from './_helpers.js';
 import { openDb, closeDb, listMemories } from '../src/persist.js';
-import { deriveProjectKey, projectDbPath, globalDbPath, GLOBAL_PROJECT_KEY, canonicalizeRoot } from '../src/project-key.js';
+import {
+  deriveProjectKey,
+  projectDbPath,
+  globalDbPath,
+  GLOBAL_PROJECT_KEY,
+  canonicalizeRoot,
+} from '../src/project-key.js';
 
 function runCli(args, { cwd, home } = {}) {
   const ownHome = home || mkdtempSync(path.join(tmpdir(), 'pm-export-'));
@@ -46,7 +52,11 @@ async function seed(home, cwd) {
       content: 'Tag → npm ci → push → verify',
       tags: ['release'],
     });
-    await mcp.toolCall('working_memory_set', { cwd, slot: 'current_focus', value: 'export-import test' });
+    await mcp.toolCall('working_memory_set', {
+      cwd,
+      slot: 'current_focus',
+      value: 'export-import test',
+    });
   } finally {
     mcp.stop();
   }
@@ -86,7 +96,9 @@ test('CLI import round-trips: export → import produces an identical dataset', 
   assert.equal(exp.status, 0, 'export must succeed');
 
   // Import into target (which has no DB yet).
-  const imp = runCli(['import', dump, '--cwd', cwd, '--scope', 'project', '--merge'], { home: home2 });
+  const imp = runCli(['import', dump, '--cwd', cwd, '--scope', 'project', '--merge'], {
+    home: home2,
+  });
   assert.equal(imp.status, 0, 'import must succeed; stderr=' + imp.stderr);
 
   // Read the imported DB and confirm.
@@ -145,7 +157,9 @@ test('CLI import --replace wipes the target before loading', async () => {
     mcp.stop();
   }
   // Import with replace should wipe the unrelated memory.
-  const r = runCli(['import', dump, '--cwd', cwd, '--scope', 'project', '--replace', '--yes'], { home });
+  const r = runCli(['import', dump, '--cwd', cwd, '--scope', 'project', '--replace', '--yes'], {
+    home,
+  });
   assert.equal(r.status, 0, 'replace with --yes must succeed; stderr=' + r.stderr);
   const key = deriveProjectKey(cwd);
   const db = openDb(projectDbPath(home, key));

@@ -18,12 +18,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkTempHome, rmRf } from './_helpers.js';
-import {
-  openDb,
-  closeDb,
-  saveMemory,
-  getMemory,
-} from '../src/persist.js';
+import { openDb, closeDb, saveMemory, getMemory } from '../src/persist.js';
 import { retryFailedEmbeddings } from '../src/hooks/embed-retry.js';
 import { projectDbPath, deriveProjectKey } from '../src/project-key.js';
 import { EMBEDDING_DIM, _setPipelineStubForTests, _resetForTests } from '../src/embedding.js';
@@ -95,9 +90,7 @@ test('a successful retry clears last_embed_error and writes the embedding column
         assert.equal(r.scanned, 1);
         assert.equal(r.recovered, 1);
         const row = db
-          .prepare(
-            'SELECT embedding, embedding_dim, last_embed_error FROM memories WHERE id=?',
-          )
+          .prepare('SELECT embedding, embedding_dim, last_embed_error FROM memories WHERE id=?')
           .get(id);
         assert.ok(row.embedding, 'embedding BLOB must be written');
         assert.equal(row.embedding_dim, EMBEDDING_DIM);
@@ -125,9 +118,7 @@ test('a retry that fails again keeps the row in the failed state', async () => {
         assert.equal(r.scanned, 1);
         assert.equal(r.recovered, 0);
         assert.equal(r.failed, 1);
-        const row = db
-          .prepare('SELECT last_embed_error FROM memories WHERE id=?')
-          .get(id);
+        const row = db.prepare('SELECT last_embed_error FROM memories WHERE id=?').get(id);
         assert.ok(row.last_embed_error, 'failure reason must be re-stamped');
       } finally {
         closeDb(dbPath);
@@ -159,7 +150,7 @@ test('retry caps at 5 rows per SessionStart, oldest first', async () => {
         // The 3 unretried rows must remain in failed state.
         const remaining = db
           .prepare(
-            "SELECT COUNT(*) AS n FROM memories WHERE project_key=? AND last_embed_error IS NOT NULL",
+            'SELECT COUNT(*) AS n FROM memories WHERE project_key=? AND last_embed_error IS NOT NULL',
           )
           .get(key).n;
         assert.equal(remaining, 3);

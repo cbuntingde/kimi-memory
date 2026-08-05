@@ -61,9 +61,9 @@ export function analyzeDb(db) {
 // Get database stats for diagnostics.
 export function getDbStats(db) {
   try {
-    const pages = db.prepare("PRAGMA page_count").get();
-    const pageSize = db.prepare("PRAGMA page_size").get();
-    const freePages = db.prepare("PRAGMA freelist_count").get();
+    const pages = db.prepare('PRAGMA page_count').get();
+    const pageSize = db.prepare('PRAGMA page_size').get();
+    const freePages = db.prepare('PRAGMA freelist_count').get();
 
     return {
       page_count: pages.page_count,
@@ -71,9 +71,8 @@ export function getDbStats(db) {
       free_pages: freePages.freelist_count,
       used_pages: pages.page_count - freePages.freelist_count,
       size_bytes: pages.page_count * pageSize.page_size,
-      fragmentation_percent: Math.round(
-        (freePages.freelist_count / pages.page_count) * 100 * 100
-      ) / 100,
+      fragmentation_percent:
+        Math.round((freePages.freelist_count / pages.page_count) * 100 * 100) / 100,
     };
   } catch {
     return null;
@@ -84,10 +83,10 @@ export function getDbStats(db) {
 // Returns [ {id, embedding}, ... ] after encoding all texts.
 export async function batchEmbed(texts, embedFn, options = {}) {
   if (!Array.isArray(texts) || texts.length === 0) return [];
-  
+
   const batchSize = options.batchSize || 50;
   const results = [];
-  
+
   for (let i = 0; i < texts.length; i += batchSize) {
     const batch = texts.slice(i, i + batchSize);
     const encoded = await Promise.all(
@@ -98,58 +97,58 @@ export async function batchEmbed(texts, embedFn, options = {}) {
         } catch {
           return { text, embedding: null };
         }
-      })
+      }),
     );
     results.push(...encoded);
   }
-  
+
   return results;
 }
 
 // Query optimization advice.
 export function getQueryOptimizationAdvice(queryType, rowCount) {
   const advice = [];
-  
+
   if (rowCount > 100000 && queryType === 'full_scan') {
     advice.push('Large dataset: consider adding indexes or narrowing the query scope.');
   }
-  
+
   if (queryType === 'search' && rowCount > 10000) {
     advice.push('FTS5 query on large dataset: ensure indexes on project_key + type.');
   }
-  
+
   if (queryType === 'similarity' && rowCount > 1000) {
     advice.push('Similarity search: limit to a reasonable threshold (0.5+) or smaller result set.');
   }
-  
+
   return advice;
 }
 
 // Connection pool statistics (for multi-process scenarios).
 export function getConnectionStats(cachedDbs) {
   if (!cachedDbs) return null;
-  
+
   const stats = {
     open_connections: cachedDbs.size,
     connections: [],
   };
-  
+
   for (const [path, db] of cachedDbs) {
     stats.connections.push({
       path,
       open: true, // If it's in the cache, it's open
     });
   }
-  
+
   return stats;
 }
 
 // Recommendation engine: suggest actions based on database state.
 export function getMaintenanceRecommendations(stats) {
   const recommendations = [];
-  
+
   if (!stats) return recommendations;
-  
+
   if (stats.fragmentation_percent > 20) {
     recommendations.push({
       action: 'VACUUM',
@@ -157,7 +156,7 @@ export function getMaintenanceRecommendations(stats) {
       priority: 'medium',
     });
   }
-  
+
   if (stats.free_pages > stats.page_count * 0.3) {
     recommendations.push({
       action: 'VACUUM',
@@ -165,7 +164,7 @@ export function getMaintenanceRecommendations(stats) {
       priority: 'low',
     });
   }
-  
+
   if (stats.page_count > 10000) {
     recommendations.push({
       action: 'ANALYZE',
@@ -173,6 +172,6 @@ export function getMaintenanceRecommendations(stats) {
       priority: 'low',
     });
   }
-  
+
   return recommendations;
 }

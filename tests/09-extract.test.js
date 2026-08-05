@@ -540,7 +540,10 @@ test('detectProjectMetadata: returns null when no manifests found', async () => 
 });
 
 test('buildExtractionPrompt: includes projectMeta JSON', () => {
-  const prompt = buildExtractionPrompt('hello', [], { stack: ['node'], buildCommand: 'npm run build' });
+  const prompt = buildExtractionPrompt('hello', [], {
+    stack: ['node'],
+    buildCommand: 'npm run build',
+  });
   assert.ok(prompt.user.includes('Project metadata (from manifest files)'));
   assert.ok(prompt.user.includes('"buildCommand": "npm run build"'));
 });
@@ -604,4 +607,3 @@ test('runAutoExtract: saves deterministic build/stack memories from manifests', 
     rmRf(home);
   }
 });
-

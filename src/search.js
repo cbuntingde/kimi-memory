@@ -5,12 +5,12 @@
 // Allows: "exact phrase", -exclude, term1 term2
 export function normalizeFts5Query(query) {
   if (!query || typeof query !== 'string') return '';
-  
+
   // Already contains FTS5 operators or quoted phrase? Use as-is.
   if (query.includes('"') || query.includes('-') || query.includes('(') || query.includes(')')) {
     return query;
   }
-  
+
   // Simple query: split by spaces and rejoin (basic tokenization).
   // Each term will match with OR logic by default in FTS5.
   const terms = query.trim().split(/\s+/).filter(Boolean);
@@ -95,29 +95,29 @@ export function hasPhrase(query) {
 // Query suggestion based on what the user typed.
 export function suggestQueryFix(query) {
   if (!query) return null;
-  
+
   const suggestions = [];
-  
+
   if (hasNegation(query)) {
     suggestions.push({
       tip: 'Negation supported: use -word to exclude',
       example: 'deploy -test',
     });
   }
-  
+
   if (hasPhrase(query)) {
     suggestions.push({
       tip: 'Phrase search supported: results must contain exact phrase',
       example: '"build process"',
     });
   }
-  
+
   if (!hasPhrase(query) && !hasNegation(query)) {
     suggestions.push({
       tip: 'Try quoted phrases for exact matches: "your phrase here"',
       example: '"specific decision"',
     });
   }
-  
+
   return suggestions.length > 0 ? suggestions : null;
 }
