@@ -70,28 +70,22 @@ export function workLogTitle(projectName, dayIso) {
 export function gatherCommits(cwd, dayIso, { runGit } = {}) {
   return new Promise((resolve) => {
     const since = `${dayIso}T00:00:00Z`;
-    const exec = runGit || ((args, cb) => {
-      execFile('git', args, { cwd, maxBuffer: 1024 * 1024 }, (err, stdout) => cb(err, stdout));
+    const exec =
+      runGit ||
+      ((args, cb) => {
+        execFile('git', args, { cwd, maxBuffer: 1024 * 1024 }, (err, stdout) => cb(err, stdout));
+      });
+    exec(['log', '--since=' + since, '--pretty=format:%h %s', '--no-merges'], (err, stdout) => {
+      if (err || typeof stdout !== 'string') {
+        resolve({ commits: [], error: 'git_failed' });
+        return;
+      }
+      const lines = stdout
+        .split(/\r?\n/)
+        .map((l) => l.trim())
+        .filter((l) => l.length > 0);
+      resolve({ commits: lines, error: null });
     });
-    exec(
-      [
-        'log',
-        '--since=' + since,
-        '--pretty=format:%h %s',
-        '--no-merges',
-      ],
-      (err, stdout) => {
-        if (err || typeof stdout !== 'string') {
-          resolve({ commits: [], error: 'git_failed' });
-          return;
-        }
-        const lines = stdout
-          .split(/\r?\n/)
-          .map((l) => l.trim())
-          .filter((l) => l.length > 0);
-        resolve({ commits: lines, error: null });
-      },
-    );
   });
 }
 
@@ -139,9 +133,7 @@ export function gatherTodaysMemoryTitles(db, projectKey, dayIso) {
 function buildWorkLogContent({ projectName, dayIso, commits, events, sessions, memoryTitles }) {
   const lines = [];
   lines.push(`Work log for ${projectName} on ${dayIso} (UTC).`);
-  lines.push(
-    `Sessions today: ${sessions}; conversation_events today: ${events}.`,
-  );
+  lines.push(`Sessions today: ${sessions}; conversation_events today: ${events}.`);
   lines.push(`Commits today (${commits.length}):`);
   if (commits.length === 0) {
     lines.push('- (none)');

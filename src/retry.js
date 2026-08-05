@@ -8,7 +8,12 @@ import { logAutoExtractRetry, logAutoExtractError } from './diagnostics.js';
 // baseDelayMs: starting delay (e.g. 1000ms)
 // maxDelayMs: cap on delay (e.g. 60000ms)
 // jitterFraction: random factor applied to delay (e.g. 0.1 = ±10%)
-export function calculateBackoffMs(attempt, baseDelayMs = 1000, maxDelayMs = 60000, jitterFraction = 0.1) {
+export function calculateBackoffMs(
+  attempt,
+  baseDelayMs = 1000,
+  maxDelayMs = 60000,
+  jitterFraction = 0.1,
+) {
   if (attempt < 0) return 0;
   const exponential = baseDelayMs * Math.pow(2, attempt);
   const capped = Math.min(exponential, maxDelayMs);
@@ -38,7 +43,7 @@ export async function withRetry(
     jitterFraction = 0.1,
     diagnosticContext = {},
     shouldRetry = () => true,
-  } = {}
+  } = {},
 ) {
   let lastError = null;
 
@@ -64,7 +69,7 @@ export async function withRetry(
           projectKey,
           attempt + 1,
           delayMs,
-          `${operationType}: ${error?.code || error?.name || 'unknown'}`
+          `${operationType}: ${error?.code || error?.name || 'unknown'}`,
         ).catch(() => {});
       }
 
@@ -78,7 +83,10 @@ export async function withRetry(
 
 // Wrapper for auto-extract retry with semantic error classification.
 // Errors are classified as retryable (e.g. network timeout) or permanent (e.g. config missing).
-export async function withAutoExtractRetry(fn, { projectKey, maxAttempts = 3, baseDelayMs = 1000 } = {}) {
+export async function withAutoExtractRetry(
+  fn,
+  { projectKey, maxAttempts = 3, baseDelayMs = 1000 } = {},
+) {
   return withRetry(fn, {
     maxAttempts,
     baseDelayMs,
@@ -120,10 +128,7 @@ export async function withAutoExtractRetry(fn, { projectKey, maxAttempts = 3, ba
 }
 
 // Wrapper for LLM call retry with specific handling for API errors.
-export async function withLlmRetry(
-  fn,
-  { projectKey, maxAttempts = 3, baseDelayMs = 2000 } = {}
-) {
+export async function withLlmRetry(fn, { projectKey, maxAttempts = 3, baseDelayMs = 2000 } = {}) {
   return withRetry(fn, {
     maxAttempts,
     baseDelayMs,
@@ -133,7 +138,11 @@ export async function withLlmRetry(
       const message = error?.message || '';
 
       // Don't retry auth errors.
-      if (message.includes('unauthorized') || message.includes('forbidden') || message.includes('invalid_api_key')) {
+      if (
+        message.includes('unauthorized') ||
+        message.includes('forbidden') ||
+        message.includes('invalid_api_key')
+      ) {
         return false;
       }
 

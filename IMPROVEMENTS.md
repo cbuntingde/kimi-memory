@@ -160,6 +160,7 @@ npm test tests/21-comprehensive-improvements.test.js
 ```
 
 Coverage includes:
+
 - Exponential backoff calculations with jitter
 - Concurrency tracking and contention detection
 - Search query normalization and title boosting
@@ -190,6 +191,7 @@ Coverage includes:
 ## Backward Compatibility
 
 All changes are backward compatible:
+
 - Existing tools work unchanged
 - New tool parameters are optional
 - Database schema unchanged

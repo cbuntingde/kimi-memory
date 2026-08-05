@@ -109,7 +109,9 @@ async function embedRaw(text) {
       const msg = `embedding dim mismatch: got ${v.length}, expected ${EMBEDDING_DIM}`;
       warnOnce(msg);
       lastError = msg;
-      logEmbeddingError(null, 'dim_mismatch', new Error(msg), { got_dim: v.length }).catch(() => {});
+      logEmbeddingError(null, 'dim_mismatch', new Error(msg), { got_dim: v.length }).catch(
+        () => {},
+      );
       return null;
     }
     return v;
@@ -205,7 +207,9 @@ export function encodeVector(vec) {
   if (!vec) return null;
   // Validate dimension on encode to catch bugs early.
   if (vec.length !== EMBEDDING_DIM) {
-    const err = new Error(`embedding dimension mismatch on encode: got ${vec.length}, expected ${EMBEDDING_DIM}`);
+    const err = new Error(
+      `embedding dimension mismatch on encode: got ${vec.length}, expected ${EMBEDDING_DIM}`,
+    );
     err.code = 'KIMI_MEMORY_EMBED_DIM_MISMATCH';
     throw err;
   }
@@ -221,7 +225,7 @@ export function decodeVector(buf) {
   const expectedBytes = EMBEDDING_DIM * 4;
   if (u8.length < expectedBytes) {
     const err = new Error(
-      `embedding BLOB too small: got ${u8.length} bytes, expected at least ${expectedBytes} for dim=${EMBEDDING_DIM}`
+      `embedding BLOB too small: got ${u8.length} bytes, expected at least ${expectedBytes} for dim=${EMBEDDING_DIM}`,
     );
     err.code = 'KIMI_MEMORY_EMBED_CORRUPT';
     throw err;
@@ -231,9 +235,7 @@ export function decodeVector(buf) {
   // Final validation: check for NaN/Inf which indicate corruption.
   for (let i = 0; i < vec.length; i++) {
     if (!Number.isFinite(vec[i])) {
-      const err = new Error(
-        `embedding BLOB contains non-finite value at index ${i}: ${vec[i]}`
-      );
+      const err = new Error(`embedding BLOB contains non-finite value at index ${i}: ${vec[i]}`);
       err.code = 'KIMI_MEMORY_EMBED_CORRUPT';
       throw err;
     }

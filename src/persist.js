@@ -9,7 +9,7 @@
 // string `_global`. Because IDs are derived from `(projectKey, ...)`,
 // an id in one database never collides with an id in the other.
 import { DatabaseSync } from 'node:sqlite';
-import { promises as fs, mkdirSync } from 'node:fs';
+import { promises as fs, mkdirSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { nowIso, hashId, shortId, safeJsonParse } from './util.js';
 import { ensureProjectDir, ingestStatePath } from './project-key.js';
@@ -24,9 +24,14 @@ import {
   cosineSimilarity,
 } from './embedding.js';
 import { logPersistError, logEmbeddingError, logPerformanceMetric } from './diagnostics.js';
-import { recordWriteStart, recordWriteEnd, isSqliteBusyError, calculateDbBackoffMs } from './concurrency.js';
+import {
+  recordWriteStart,
+  recordWriteEnd,
+  isSqliteBusyError,
+  calculateDbBackoffMs,
+} from './concurrency.js';
 
-const SCHEMA_VERSION = 8;
+const SCHEMA_VERSION = 9;
 
 // Schema migrations. Each entry is idempotent: it inspects the live
 // schema, no-ops when its target shape is already in place, and
@@ -267,6 +272,42 @@ const MIGRATIONS = [
       db.exec('ALTER TABLE project_paths ADD COLUMN record_count INTEGER NOT NULL DEFAULT 1');
     }
   },
+
+  // v9: Ebbinghaus-style decay. The legacy decay scaled a single
+  // confidence number by elapsed days past a 30-day grace window —
+  // fine for a filing cabinet, useless for a brain analog. We add two
+  // new columns to the memories table:
+  //
+  //   stability_days     — per-row "how long this memory survives
+  //                        without rehearsal". Grows geometrically on
+  //                        every access (memory_reinforce, recall hit).
+  //                        Capped at 365 days.
+  //   last_rehearsed_at  — last time the memory was actually used.
+  //                        Distinct from last_accessed_at because
+  //                        that field already tracks every read;
+  //                        rehearsal is what re-stabilises the memory
+  //                        for future decay.
+  //
+  // Order matters: ADD COLUMN must precede the UPDATE that backfills
+  // the new column. ALTER TABLE ADD COLUMN with a default value
+  // populates existing rows in SQLite, so the UPDATE is only needed
+  // for nullable columns where we want to seed from updated_at.
+  function migrateAddEbbinghausColumns(db) {
+    const cols = db.prepare('PRAGMA table_info(memories)').all();
+    const have = new Set(cols.map((c) => c.name));
+    if (!have.has('stability_days')) {
+      db.exec('ALTER TABLE memories ADD COLUMN stability_days REAL NOT NULL DEFAULT 30');
+    }
+    if (!have.has('last_rehearsed_at')) {
+      db.exec('ALTER TABLE memories ADD COLUMN last_rehearsed_at TEXT');
+      // Backfill from updated_at for pre-migration rows. Safe because
+      // the column now exists; new saves will overwrite this value.
+      db.exec(
+        `UPDATE memories SET last_rehearsed_at = updated_at
+         WHERE last_rehearsed_at IS NULL OR last_rehearsed_at = ''`,
+      );
+    }
+  },
 ];
 
 const SCHEMA_SQL = `
@@ -476,6 +517,12 @@ export function rowToMemory(row) {
     last_embed_error: row.last_embed_error || null,
     access_count: row.access_count || 0,
     last_accessed_at: row.last_accessed_at || null,
+    // v9 Ebbinghaus fields. Surfaced so the recall layer (and the
+    // dashboard) can read the raw stability and rehearsal time without
+    // re-querying. Null on pre-v9 rows that have not been touched by
+    // the v9 migration yet.
+    stability_days: row.stability_days == null ? null : row.stability_days,
+    last_rehearsed_at: row.last_rehearsed_at || null,
   };
 }
 
@@ -582,7 +629,8 @@ export function saveMemory(db, projectKey, input) {
         priority = COALESCE(?, priority),
         supersedes = COALESCE(?, supersedes),
         expires_at = COALESCE(?, expires_at),
-        updated_at = ?
+        updated_at = ?,
+        last_rehearsed_at = ?
       WHERE id = ?
     `,
     ).run(
@@ -597,13 +645,14 @@ export function saveMemory(db, projectKey, input) {
       supersedesId ?? null,
       expires,
       now,
+      now,
       id,
     );
   } else {
     db.prepare(
       `
-      INSERT INTO memories (id, project_key, type, title, content, tags, metadata, provenance, confidence, status, priority, supersedes, created_at, updated_at, expires_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO memories (id, project_key, type, title, content, tags, metadata, provenance, confidence, status, priority, supersedes, created_at, updated_at, expires_at, last_rehearsed_at)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `,
     ).run(
       id,
@@ -621,6 +670,7 @@ export function saveMemory(db, projectKey, input) {
       now,
       now,
       expires,
+      now,
     );
   }
 
@@ -798,12 +848,12 @@ function bumpAccess(db, projectKey, ids) {
 // rows that share the same (project_key, type, title).
 export function saveMemoryBulk(db, projectKey, inputs) {
   if (!Array.isArray(inputs) || inputs.length === 0) return [];
-  
+
   // Enhanced error handling: collect per-item errors instead of total rollback.
   // This allows the caller to know which items failed and which succeeded.
   const results = [];
   const errors = [];
-  
+
   db.exec('BEGIN');
   try {
     for (let i = 0; i < inputs.length; i++) {
@@ -821,21 +871,29 @@ export function saveMemoryBulk(db, projectKey, inputs) {
         results.push(null);
       }
     }
-    
+
     // If any item failed due to secret detection or other validation,
     // roll back the entire transaction for safety. Secret-related errors
     // should fail the whole batch.
     const hasSecretError = errors.some(
-      (e) => e.error && (e.error.code === 'KIMI_MEMORY_SECRET_DETECTED' || e.error.message?.includes('secret'))
+      (e) =>
+        e.error &&
+        (e.error.code === 'KIMI_MEMORY_SECRET_DETECTED' || e.error.message?.includes('secret')),
     );
-    
+
     if (hasSecretError) {
       try {
         db.exec('ROLLBACK');
       } catch {
         /* ignore */
       }
-      const err = new Error(`bulk save failed: secret detected in item(s)`);
+      // Surface the established `secret_detected:` error code in the
+      // message so callers (and tests) can match the same token the
+      // single-save path uses. The structured `code` field carries
+      // the bulk-specific variant for finer-grained dispatch.
+      const err = new Error(
+        `secret_detected: refusing to persist a batch containing item(s) that match a known credential shape (bulk save failed: ${errors.length} of ${inputs.length} item(s) rejected). Remove the secret and retry.`,
+      );
       err.code = 'BULK_SAVE_SECRET_DETECTED';
       err.details = {
         total: inputs.length,
@@ -844,7 +902,7 @@ export function saveMemoryBulk(db, projectKey, inputs) {
       };
       throw err;
     }
-    
+
     db.exec('COMMIT');
   } catch (err) {
     try {
@@ -854,7 +912,7 @@ export function saveMemoryBulk(db, projectKey, inputs) {
     }
     throw err;
   }
-  
+
   // Return all results, marking failures as null for introspection.
   return results;
 }
@@ -1177,65 +1235,126 @@ export async function backfillEmbeddings(db, projectKey, { batchSize = 50, force
 
 // ----- Importance + decay (signal-driven reinforcement) -----
 
-// Single-row bump for "this memory helped": +1 access, stamp the time,
-// and nudge confidence toward 1.0. The nudge is small (0.05) so a
-// single reinforce isn't enough to rescue a low-quality memory — it
-// rewards consistently-useful memories over many calls, mirroring how
-// a real recall signal accumulates over time.
+// Single-row bump for "this memory helped". On top of the legacy
+// +0.05 confidence nudge, this v9 update grows the row's stability
+// (so the next decay pass demotes it more slowly) and stamps
+// last_rehearsed_at (so the Ebbinghaus timer resets). The growth
+// factor lives in src/decay.js so the formula has a single home.
+import { derivedConfidence, growStability } from './decay.js';
+
 const REINFORCE_DELTA = 0.05;
 
 export function reinforceMemory(db, projectKey, id) {
   const now = nowIso();
   const row = db
-    .prepare("SELECT id, confidence FROM memories WHERE id=? AND project_key=? AND status='active'")
+    .prepare(
+      "SELECT id, confidence, stability_days FROM memories WHERE id=? AND project_key=? AND status='active'",
+    )
     .get(id, projectKey);
   if (!row) return null;
   const next = Math.min(1, Math.max(0, (row.confidence || 0) + REINFORCE_DELTA));
+  const prevStab =
+    row.stability_days == null || !Number.isFinite(row.stability_days) ? null : row.stability_days;
+  const newStab = growStability(prevStab);
   db.prepare(
     `
     UPDATE memories
     SET access_count = access_count + 1,
         last_accessed_at = ?,
-        confidence = ?
+        last_rehearsed_at = ?,
+        confidence = ?,
+        stability_days = ?
     WHERE id = ? AND project_key = ?
   `,
-  ).run(now, next, id, projectKey);
+  ).run(now, now, next, newStab, id, projectKey);
   return getMemory(db, projectKey, id);
 }
 
-// Idempotent, best-effort decay pass. Decreases confidence on every
-// active memory that has not been touched in 30+ days, scaled by the
-// length of the inactivity. Floor 0.1 so a memory never fully "dies"
-// from disuse alone — soft-delete (`memory_delete`) is the right tool
-// for permanent removal. Used by the SessionStart hook (hooks/decay.js)
-// and exposed for dashboards / CLI use.
-const DECAY_DAYS = 30;
-const DECAY_RATE_PER_DAY = 0.05 / DECAY_DAYS; // 5% per 30 days
-const DECAY_FLOOR = 0.1;
+// Debounced auto-reinforce for the hook layer. Same bump as
+// `reinforceMemory`, but only fires if the row hasn't been rehearsed
+// in the last `debounceMs` (default 60s). Avoids hammering the DB
+// when a user re-types the same prompt or the same recall hit repeats.
+//
+// Returns the reinforced row, or null when the row is missing /
+// soft-deleted. When the debounce trips, returns the current row
+// (status quo) so the caller can log a no-op uniformly.
+const REINFORCE_DEBOUNCE_MS = 60_000;
 
-export function decayMemories(db, projectKey, { now = nowIso() } = {}) {
-  // One UPDATE statement covers every row — no per-row roundtrip.
-  // inactivity_days = max(0, days(now - COALESCE(last_accessed_at, updated_at)) - DECAY_DAYS)
-  // so the first 30 days are a grace period; only memories stale beyond
-  // that lose confidence.
-  const r = db
+export function reinforceIfStale(db, projectKey, id, { debounceMs = REINFORCE_DEBOUNCE_MS } = {}) {
+  const row = db
     .prepare(
-      `
-    UPDATE memories
-    SET confidence = MAX(
-      ?,
-      confidence * (1.0 - ? * MAX(
-        0.0,
-        julianday(?) - julianday(COALESCE(last_accessed_at, updated_at)) - ?
-      ))
+      "SELECT id, last_rehearsed_at FROM memories WHERE id=? AND project_key=? AND status='active'",
     )
-    WHERE project_key = ?
-      AND status = 'active'
-      AND julianday(?) - julianday(COALESCE(last_accessed_at, updated_at)) > ?
-  `,
+    .get(id, projectKey);
+  if (!row) return null;
+  const last = row.last_rehearsed_at ? Date.parse(row.last_rehearsed_at) : 0;
+  if (Number.isFinite(last) && Date.now() - last < debounceMs) {
+    return getMemory(db, projectKey, id);
+  }
+  return reinforceMemory(db, projectKey, id);
+}
+
+// SessionStart pass: walks every active memory and rewrites
+// `confidence` from the Ebbinghaus retrievability curve based on
+// (stability_days, last_rehearsed_at, now). Replaces the legacy
+// `decayMemories` linear scaling — same hook call site, different
+// formula.
+//
+// Idempotent: re-running on already-fresh rows is a no-op
+// (retrievability 1.0 → confidence ~1.0 → unchanged). Floor of 0.1
+// matches the legacy DECAY_FLOOR so a cold memory never fully "dies".
+//
+// We do this in JS rather than SQL because the formula uses Math.exp
+// and per-row stability — the per-row branch is what makes the model
+// brain-like (every rehearsal changes the curve).
+export function decayMemories(db, projectKey, { now = new Date() } = {}) {
+  let scanned = 0;
+  let rewritten = 0;
+  let errors = 0;
+  // Pull every active row in one query, walk it in JS, write back the
+  // updated confidence in a single transaction. The hook is fail-open
+  // so any timeout or error here is logged and skipped.
+  const rows = db
+    .prepare(
+      `SELECT id, confidence, stability_days, last_rehearsed_at
+       FROM memories
+       WHERE project_key = ? AND status = 'active'
+         AND (expires_at IS NULL OR datetime(expires_at) > datetime('now'))`,
     )
-    .run(DECAY_FLOOR, DECAY_RATE_PER_DAY, now, DECAY_DAYS, projectKey, now, DECAY_DAYS);
-  return { affected: r.changes };
+    .all(projectKey);
+  scanned = rows.length;
+  if (rows.length === 0) return { scanned, rewritten, errors };
+  const stmt = db.prepare(`UPDATE memories SET confidence = ? WHERE id = ? AND project_key = ?`);
+  try {
+    db.exec('BEGIN');
+    for (const r of rows) {
+      try {
+        const target = derivedConfidence(r.stability_days, r.last_rehearsed_at, now);
+        // Only write when the change is meaningful (≥0.01 absolute).
+        // Avoids burning WAL on rows that are already at the curve.
+        if (Math.abs((r.confidence || 0) - target) >= 0.01) {
+          stmt.run(target, r.id, projectKey);
+          rewritten += 1;
+        }
+      } catch {
+        errors += 1;
+      }
+    }
+    db.exec('COMMIT');
+  } catch (e) {
+    try {
+      db.exec('ROLLBACK');
+    } catch {
+      /* ignore */
+    }
+    return {
+      scanned,
+      rewritten,
+      errors: errors + 1,
+      error: e && e.message ? e.message : String(e),
+    };
+  }
+  return { scanned, rewritten, errors };
 }
 
 // Allowed kinds for memory_edges. Stable, versioned vocabulary — the
@@ -1708,6 +1827,178 @@ export function listProjectPaths(db) {
     .all();
 }
 
+// Re-clone detection: the per-project DB is keyed by a SHA-256 prefix of
+// the canonical project root, so a repo that is deleted and re-cloned
+// to the SAME path is indistinguishable from the original project. The
+// strongest filesystem signal is the directory's birthtime (creation
+// time on Windows, ctime fallback on Unix): if the directory was
+// created strictly AFTER kimi-memory first stamped `first_seen_at`,
+// the project was re-cloned after that stamp and the existing memories
+// belong to a previous incarnation.
+//
+// Returns { isReclone, first_seen_at, dir_birthtime, reason }. The
+// reason is non-null whenever isReclone is true or the check is
+// inconclusive, so the caller can decide whether to surface a warning.
+//
+// Heuristic: a re-clone is signaled when the directory's birthtime is
+// at least 60 seconds newer than first_seen_at AND the directory is
+// less than 7 days old. The 60-second floor absorbs small clock skew
+// (the SessionStart hook fires within milliseconds of mkdir, but the
+// call paths are not perfectly atomic). The 7-day ceiling stops
+// long-lived projects whose birthtime is older than first_seen_at
+// (rare but possible after a host move) from being flagged every
+// time the user opens the project.
+const RECLONE_MIN_GAP_MS = 60_000;
+const RECLONE_MAX_DIR_AGE_MS = 7 * 24 * 60 * 60 * 1000;
+export function detectReclone(db, projectKey, canonicalRoot) {
+  const out = {
+    isReclone: false,
+    first_seen_at: null,
+    dir_birthtime: null,
+    reason: null,
+  };
+  if (!db || !projectKey) return out;
+  const row = db
+    .prepare('SELECT first_seen_at FROM project_paths WHERE project_key=?')
+    .get(projectKey);
+  if (!row) {
+    out.reason = 'no prior record (fresh project)';
+    return out;
+  }
+  out.first_seen_at = row.first_seen_at;
+  if (!canonicalRoot) {
+    out.reason = 'no canonical root in payload';
+    return out;
+  }
+  let stat;
+  try {
+    stat = statSync(canonicalRoot);
+  } catch (e) {
+    out.reason = 'canonical root not on disk: ' + (e && e.code ? e.code : 'unknown');
+    return out;
+  }
+  // birthtimeMs is 0 on some Unix filesystems; fall back to mtimeMs.
+  // On Windows, birthtimeMs is the directory's actual creation time,
+  // which is the strongest "this directory was just made" signal.
+  //
+  // We also clamp to Math.min(birthtimeMs, mtimeMs). On Linux, some
+  // tests (and a few admin tools) backdate mtime via utimes, which
+  // leaves birthtime ahead of mtime; without the min, the directory
+  // would falsely look like it was just created. Using the min gives
+  // the older of the two timestamps, which is the right "when was
+  // this directory first made" signal across all platforms.
+  const dirTime = Math.min(
+    stat.birthtimeMs && stat.birthtimeMs > 0 ? stat.birthtimeMs : stat.mtimeMs,
+    stat.mtimeMs,
+  );
+  out.dir_birthtime = new Date(dirTime).toISOString();
+  const firstSeen = Date.parse(row.first_seen_at);
+  if (!Number.isFinite(firstSeen)) {
+    out.reason = 'first_seen_at is not parseable';
+    return out;
+  }
+  // dirAheadMs is positive when the directory was created AFTER the
+  // first_seen_at stamp — the re-clone signal. Negative values mean
+  // the directory is older than first_seen_at, which is the normal
+  // case for a long-lived project.
+  const dirAheadMs = dirTime - firstSeen;
+  const dirAgeMs = Date.now() - dirTime;
+  if (dirAheadMs > RECLONE_MIN_GAP_MS && dirAgeMs < RECLONE_MAX_DIR_AGE_MS) {
+    out.isReclone = true;
+    out.reason = `directory birthtime is ${Math.round(dirAheadMs / 1000)}s newer than first_seen_at; project was re-cloned after kimi-memory first saw it`;
+    return out;
+  }
+  out.reason =
+    dirAheadMs <= RECLONE_MIN_GAP_MS
+      ? 'directory birthtime predates or matches first_seen_at (no re-clone signal)'
+      : `directory birthtime is older than ${Math.round(RECLONE_MAX_DIR_AGE_MS / (24 * 3600 * 1000))}d (long-lived project, skipping)`;
+  return out;
+}
+
+// Wipe every per-project row for `projectKey` so the next hook / MCP
+// call starts from a clean slate. Use this after a repo is re-cloned
+// to the same canonical path: the project_key is identical to the old
+// project's, so the only way to discard the stale memories, working
+// memory, and session archive is to delete them at the row level.
+//
+// The reset is intentionally narrow:
+//   - It scopes every DELETE to project_key = ?, so a single typo
+//     cannot nuke the global DB or a sibling project.
+//   - It preserves the `project_paths` row but resets first_seen_at
+//     to `now`, so the re-clone warning in the hook stops firing for
+//     this project after the reset.
+//   - It preserves the `last_canonical_root` audit trail (the row
+//     before the reset is what an external auditor can read).
+//   - It does NOT touch the global DB, ingest-state.json, or the DB
+//     file itself: schema + migrations stay in place.
+//
+// Returns a summary so the caller can render a confirmation message.
+export function resetProject(db, projectKey) {
+  if (!db || !projectKey) {
+    throw new Error('resetProject: db and projectKey are required');
+  }
+  const summary = {
+    project_key: projectKey,
+    memories_deleted: 0,
+    working_memory_deleted: 0,
+    conversations_deleted: 0,
+    conversation_events_deleted: 0,
+    memory_edges_deleted: 0,
+    memory_synthesizes_deleted: 0,
+    project_path_preserved: false,
+  };
+  // node:sqlite does not expose a `db.transaction()` helper, so we run
+  // BEGIN / COMMIT manually and roll back on any error. The DELETEs are
+  // per-row and the UPDATE is a single statement, so the transaction
+  // wraps at most a few hundred rows; the round-trip is sub-ms.
+  db.exec('BEGIN');
+  try {
+    summary.memories_deleted = db
+      .prepare('DELETE FROM memories WHERE project_key=?')
+      .run(projectKey).changes;
+    summary.working_memory_deleted = db
+      .prepare('DELETE FROM working_memory WHERE project_key=?')
+      .run(projectKey).changes;
+    summary.conversations_deleted = db
+      .prepare('DELETE FROM conversations WHERE project_key=?')
+      .run(projectKey).changes;
+    summary.conversation_events_deleted = db
+      .prepare('DELETE FROM conversation_events WHERE project_key=?')
+      .run(projectKey).changes;
+    summary.memory_edges_deleted = db
+      .prepare('DELETE FROM memory_edges WHERE project_key=?')
+      .run(projectKey).changes;
+    summary.memory_synthesizes_deleted = db
+      .prepare('DELETE FROM memory_synthesizes WHERE project_key=?')
+      .run(projectKey).changes;
+    // FTS5 mirrors the memories table. Re-seeding it from a now-empty
+    // memories table is a single DELETE; the next memory_save will
+    // re-populate the FTS rows for the new project.
+    db.exec('DELETE FROM memories_fts');
+    // Refresh the project_paths row so first_seen_at reflects the new
+    // incarnation. last_canonical_root is preserved as the audit
+    // breadcrumb of the pre-reset project. record_count is left as-is
+    // (it counts re-records, which we want to keep).
+    const r = db
+      .prepare(
+        `UPDATE project_paths
+         SET first_seen_at = ?, last_seen_at = ?, canonical_root = ?
+         WHERE project_key = ?`,
+      )
+      .run(nowIso(), nowIso(), '', projectKey);
+    summary.project_path_preserved = r.changes > 0;
+    db.exec('COMMIT');
+  } catch (err) {
+    try {
+      db.exec('ROLLBACK');
+    } catch {
+      /* ignore */
+    }
+    throw err;
+  }
+  return summary;
+}
+
 export function memoryCounts(db, projectKey) {
   const total = db
     .prepare('SELECT COUNT(*) AS n FROM memories WHERE project_key=?')
@@ -1777,5 +2068,20 @@ export function projectStatus(db, projectKey) {
     working_memory_slots: wm,
     conversations: conv,
     conversation_events: events,
+  };
+}
+// Row-count snapshot used by the dry-run path of memory_reset_project
+// (and the matching CLI command). Both call sites need the same six
+// counts, so the SELECT statements live here and the call sites
+// decorate the result with `reclone` + `total_rows` as needed.
+export function resetProjectDryRunCounts(db, projectKey) {
+  const get = (sql) => db.prepare(sql).get(projectKey).n;
+  return {
+    memories: get('SELECT COUNT(*) AS n FROM memories WHERE project_key=?'),
+    working_memory: get('SELECT COUNT(*) AS n FROM working_memory WHERE project_key=?'),
+    conversations: get('SELECT COUNT(*) AS n FROM conversations WHERE project_key=?'),
+    conversation_events: get('SELECT COUNT(*) AS n FROM conversation_events WHERE project_key=?'),
+    memory_edges: get('SELECT COUNT(*) AS n FROM memory_edges WHERE project_key=?'),
+    memory_synthesizes: get('SELECT COUNT(*) AS n FROM memory_synthesizes WHERE project_key=?'),
   };
 }

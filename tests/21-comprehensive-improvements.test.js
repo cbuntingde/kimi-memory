@@ -8,23 +8,17 @@ import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-// Import test helpers
-import { withDb, tmpHome } from './_helpers.js';
-
 // Import modules under test
 import { calculateBackoffMs, withRetry } from '../src/retry.js';
-import { 
-  recordWriteStart, recordWriteEnd, getConcurrencyStatus, isSqliteBusyError 
+import {
+  recordWriteStart,
+  recordWriteEnd,
+  getConcurrencyStatus,
+  isSqliteBusyError,
 } from '../src/concurrency.js';
-import { 
-  normalizeFts5Query, buildTitleBoostedQuery, buildOrderByClause 
-} from '../src/search.js';
-import {
-  getConversationsToArchive, getMemoriesToPrune, estimateDbSize
-} from '../src/lifecycle.js';
-import {
-  validateConfig, parseTomlLike, mergeConfigWithEnv
-} from '../src/config.js';
+import { normalizeFts5Query, buildTitleBoostedQuery, buildOrderByClause } from '../src/search.js';
+import { getConversationsToArchive, getMemoriesToPrune, estimateDbSize } from '../src/lifecycle.js';
+import { validateConfig, parseTomlLike, mergeConfigWithEnv } from '../src/config.js';
 
 test('retry: exponential backoff with jitter', () => {
   // Test increasing delays
@@ -44,7 +38,7 @@ test('retry: respects max delay cap', () => {
 
 test('concurrency: track active writes', () => {
   const dbPath = '/test/db.sqlite';
-  
+
   recordWriteStart(dbPath, 'insert_memory');
   let status = getConcurrencyStatus(dbPath);
   assert.equal(status.active_writes, 1, 'should track 1 active write');
@@ -123,7 +117,7 @@ test('lifecycle: identify memories to prune', () => {
 
   const candidates = getMemoriesToPrune(memories, 90);
   assert.equal(candidates.length, 3, 'should identify 3 candidates');
-  
+
   const reasons = candidates.map((c) => c.reason);
   assert(reasons.includes('deleted'), 'should include deleted memories');
   assert(reasons.includes('superseded'), 'should include superseded memories');
@@ -133,7 +127,10 @@ test('lifecycle: identify memories to prune', () => {
 test('lifecycle: estimate database size', () => {
   const estimate = estimateDbSize(1000, 500);
   assert(estimate.total_mb > 0, 'should calculate positive size');
-  assert(estimate.total_bytes === estimate.memories + estimate.embeddings + estimate.indexes, 'total should sum components');
+  assert(
+    estimate.total_bytes === estimate.memories + estimate.embeddings + estimate.indexes,
+    'total should sum components',
+  );
 });
 
 test('config: parse TOML-like values', () => {
@@ -220,7 +217,7 @@ test('search: handle edge cases', () => {
 test('config: handle invalid input', () => {
   const result = validateConfig(null);
   assert(result.ok, 'null config should use defaults');
-  
+
   const result2 = validateConfig({});
   assert(result2.ok, 'empty config should use defaults');
 });

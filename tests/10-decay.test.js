@@ -1,6 +1,8 @@
 // Tests for the importance + decay primitives: reinforceMemory (a
-// signal-driven bump) and decayMemories (a single SQL UPDATE that
-// drops confidence on stale memories).
+// signal-driven bump that grows stability and stamps rehearsal) and
+// decayMemories (an Ebbinghaus-curve rewrite of `confidence` based on
+// stability_days and last_rehearsed_at). Both were upgraded in v9
+// from a linear confidence scaling.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkTempHome, rmRf, StdioMcp } from './_helpers.js';
@@ -12,8 +14,10 @@ import {
   listMemories,
   reinforceMemory,
   decayMemories,
+  reinforceIfStale,
 } from '../src/persist.js';
 import { projectDbPath, deriveProjectKey } from '../src/project-key.js';
+import { retrievability, derivedConfidence, growStability } from '../src/decay.js';
 
 function freshProject() {
   const home = mkTempHome();
@@ -21,13 +25,13 @@ function freshProject() {
   return { home, key, dbPath: projectDbPath(home, key) };
 }
 
-// Stamp last_accessed_at to a specific UTC timestamp so we can test
-// the decay math without waiting real time.
-function touchAt(db, id, iso) {
-  db.prepare('UPDATE memories SET last_accessed_at=?, updated_at=? WHERE id=?').run(iso, iso, id);
-}
-function updateAt(db, id, iso) {
-  db.prepare('UPDATE memories SET updated_at=? WHERE id=?').run(iso, id);
+// Stamp last_rehearsed_at to a specific UTC timestamp so we can test
+// the decay math without waiting real time. The new model reads from
+// last_rehearsed_at, not last_accessed_at.
+function rehearsalAt(db, id, iso) {
+  db.prepare(
+    'UPDATE memories SET last_rehearsed_at=?, last_accessed_at=?, updated_at=? WHERE id=?',
+  ).run(iso, iso, iso, id);
 }
 
 test('reinforceMemory: bumps access_count + last_accessed_at and nudges confidence by 0.05', () => {
@@ -48,6 +52,10 @@ test('reinforceMemory: bumps access_count + last_accessed_at and nudges confiden
     const r2 = reinforceMemory(db, key, m.id);
     assert.equal(r2.access_count, 2);
     assert.ok(Math.abs(r2.confidence - 0.6) < 1e-6);
+    // v9: each reinforce also stamps last_rehearsed_at and grows
+    // stability_days by 1.5x.
+    assert.ok(typeof r2.last_rehearsed_at === 'string');
+    assert.ok(r2.stability_days >= 30 * 1.5 * 1.5 - 1e-6, `stability grew: ${r2.stability_days}`);
   } finally {
     closeDb();
     rmRf(home);
@@ -87,20 +95,72 @@ test('reinforceMemory: only operates on active rows; soft-deleted memories are n
   }
 });
 
+test('reinforceIfStale: debounces within 60s, fires after', async () => {
+  const { home, key, dbPath } = freshProject();
+  try {
+    const db = openDb(dbPath);
+    const m = saveMemory(db, key, {
+      type: 'semantic',
+      title: 'hot',
+      content: 'in flight',
+      confidence: 0.5,
+    });
+    // First call: rehearsal is fresh, so the debounced variant is a
+    // no-op (returns current row, doesn't bump confidence).
+    const r1 = reinforceIfStale(db, key, m.id, { debounceMs: 60_000 });
+    assert.equal(r1.confidence, 0.5);
+    // Manually rewind last_rehearsed_at to before the debounce window.
+    const longAgo = new Date(Date.now() - 120 * 1000).toISOString();
+    db.prepare('UPDATE memories SET last_rehearsed_at=? WHERE id=?').run(longAgo, m.id);
+    const r2 = reinforceIfStale(db, key, m.id, { debounceMs: 60_000 });
+    assert.equal(r2.confidence, 0.55, 'after debounce window, confidence nudged');
+  } finally {
+    closeDb();
+    rmRf(home);
+  }
+});
+
 test('decayMemories: no-op when every memory is fresh', () => {
+  const { home, key, dbPath } = freshProject();
+  try {
+    const db = openDb(dbPath);
+    // Set confidence to 1.0 so the row is already at the curve — a
+    // fresh rehearsal derives confidence ≈ 1.0, so the rewrite would
+    // be a no-op. (Saving at 0.9 would be rewritten upward; that's a
+    // different test below.)
+    saveMemory(db, key, {
+      type: 'semantic',
+      title: 'fresh',
+      content: 'just saved',
+      confidence: 1.0,
+    });
+    const r = decayMemories(db, key);
+    assert.equal(r.scanned, 1, 'one row scanned');
+    assert.equal(r.rewritten, 0, 'fresh row stays at the curve (already ≈1.0)');
+    const after = listMemories(db, key, {})[0];
+    assert.ok(after.confidence >= 0.99, `fresh memory stays near 1.0, got ${after.confidence}`);
+  } finally {
+    closeDb();
+    rmRf(home);
+  }
+});
+
+test('decayMemories: bumps a fresh memory upward when its stored confidence is below the curve', () => {
   const { home, key, dbPath } = freshProject();
   try {
     const db = openDb(dbPath);
     saveMemory(db, key, {
       type: 'semantic',
-      title: 'fresh',
+      title: 'fresh-but-low',
       content: 'just saved',
-      confidence: 0.9,
+      confidence: 0.5,
     });
     const r = decayMemories(db, key);
-    assert.equal(r.affected, 0, 'fresh rows are skipped by the 30-day grace period');
+    // R ≈ 1.0 → derived ≈ 1.0 → 0.5 is well below the curve → rewrite.
+    assert.equal(r.scanned, 1);
+    assert.equal(r.rewritten, 1, 'row rewritten upward to the curve');
     const after = listMemories(db, key, {})[0];
-    assert.equal(after.confidence, 0.9);
+    assert.ok(after.confidence >= 0.99);
   } finally {
     closeDb();
     rmRf(home);
@@ -117,16 +177,16 @@ test('decayMemories: drops confidence on rows that have been idle >30 days', () 
       content: 'ancient',
       confidence: 0.8,
     });
-    // Stamp last_accessed_at to 60 days ago.
     const longAgo = new Date(Date.now() - 60 * 24 * 3600 * 1000).toISOString();
-    touchAt(db, m.id, longAgo);
+    rehearsalAt(db, m.id, longAgo);
     const r = decayMemories(db, key);
-    assert.equal(r.affected, 1, 'one row is decayed');
+    assert.equal(r.scanned, 1, 'one row scanned');
+    assert.equal(r.rewritten, 1, 'one row rewritten');
     const after = getMemory(db, key, m.id, { includeSuperseded: true });
-    // 60 days inactive → 30 days grace then 30 days at 5%/30d ≈ 0.05 → confidence ≈ 0.8 * (1 - 0.05) ≈ 0.76
+    // 60 days idle, 30-day stability → R = exp(-60/30) ≈ 0.135 → confidence ≈ 0.1 + 0.9 * 0.135 ≈ 0.22
     assert.ok(
-      after.confidence > 0.7 && after.confidence < 0.8,
-      `confidence dropped from 0.8 to ~${after.confidence.toFixed(3)}`,
+      after.confidence > 0.15 && after.confidence < 0.5,
+      `confidence dropped from 0.8 to ~${after.confidence.toFixed(3)} (Ebbinghaus curve)`,
     );
   } finally {
     closeDb();
@@ -144,30 +204,12 @@ test('decayMemories: never drops below the 0.1 floor', () => {
       content: 'very old',
       confidence: 0.15,
     });
-    // Way back: 5 years of inactivity.
     const agesAgo = new Date(Date.now() - 5 * 365 * 24 * 3600 * 1000).toISOString();
-    touchAt(db, m.id, agesAgo);
+    rehearsalAt(db, m.id, agesAgo);
     decayMemories(db, key);
     const after = getMemory(db, key, m.id, { includeSuperseded: true });
     assert.ok(after.confidence >= 0.1 - 1e-6, `confidence floored at 0.1, got ${after.confidence}`);
     assert.ok(after.confidence < 0.15, `confidence did drop, got ${after.confidence}`);
-  } finally {
-    closeDb();
-    rmRf(home);
-  }
-});
-
-test('decayMemories: uses updated_at when last_accessed_at is null', () => {
-  const { home, key, dbPath } = freshProject();
-  try {
-    const db = openDb(dbPath);
-    const m = saveMemory(db, key, { type: 'semantic', title: 'never-accessed', content: 'x' });
-    const longAgo = new Date(Date.now() - 90 * 24 * 3600 * 1000).toISOString();
-    updateAt(db, m.id, longAgo);
-    // No last_accessed_at → should still be picked up via updated_at.
-    db.prepare('UPDATE memories SET last_accessed_at=NULL WHERE id=?').run(m.id);
-    const r = decayMemories(db, key);
-    assert.equal(r.affected, 1);
   } finally {
     closeDb();
     rmRf(home);
@@ -185,21 +227,65 @@ test('decayMemories: idempotent — running twice in a row is a no-op the second
       confidence: 0.5,
     });
     const longAgo = new Date(Date.now() - 60 * 24 * 3600 * 1000).toISOString();
-    touchAt(db, m.id, longAgo);
+    rehearsalAt(db, m.id, longAgo);
     const r1 = decayMemories(db, key);
     const r2 = decayMemories(db, key);
-    assert.equal(r1.affected, 1);
-    // After the first pass, the row's confidence was already lowered
-    // and its last_accessed_at still points to the same stale date —
-    // the second pass decays again. The point of "idempotent" here is
-    // that neither pass errors and the row still exists.
-    assert.ok(r2.affected >= 0);
+    assert.equal(r1.rewritten, 1, 'first pass rewrites the stale row');
+    assert.equal(r2.rewritten, 0, 'second pass is a no-op (already on the curve)');
     const after = getMemory(db, key, m.id, { includeSuperseded: true });
     assert.ok(after.confidence >= 0.1);
   } finally {
     closeDb();
     rmRf(home);
   }
+});
+
+test('decayMemories: respects higher stability (long-stable memory decays slower)', () => {
+  const { home, key, dbPath } = freshProject();
+  try {
+    const db = openDb(dbPath);
+    const m = saveMemory(db, key, {
+      type: 'semantic',
+      title: 'stable',
+      content: 'rehearsed often',
+      confidence: 0.5,
+    });
+    // Boost stability to 180 days via 5 reinforces.
+    db.prepare('UPDATE memories SET stability_days=180 WHERE id=?').run(m.id);
+    const longAgo = new Date(Date.now() - 60 * 24 * 3600 * 1000).toISOString();
+    rehearsalAt(db, m.id, longAgo);
+    decayMemories(db, key);
+    const after = getMemory(db, key, m.id, { includeSuperseded: true });
+    // 60 days idle, 180-day stability → R = exp(-60/180) ≈ 0.717 → confidence ≈ 0.1 + 0.9 * 0.717 ≈ 0.745
+    assert.ok(
+      after.confidence > 0.6,
+      `high-stability memory decays slower, got ${after.confidence.toFixed(3)}`,
+    );
+  } finally {
+    closeDb();
+    rmRf(home);
+  }
+});
+
+test('decay.js pure helpers: retrievability + growStability', () => {
+  assert.ok(Math.abs(retrievability(0, 30) - 1.0) < 1e-9);
+  assert.ok(Math.abs(retrievability(30, 30) - Math.exp(-1)) < 1e-9);
+  assert.ok(retrievability(365, 30) < 0.001);
+  // growStability grows by STABILITY_GROWTH (1.5) and caps at 365.
+  assert.ok(Math.abs(growStability(30) - 45) < 1e-9, `30 → 45, got ${growStability(30)}`);
+  assert.ok(growStability(0.5) >= 1, 'tiny stability grows to at least 1');
+  assert.ok(growStability(300) <= 365, 'stability capped at 365');
+  assert.ok(Math.abs(growStability(null) - 45) < 1e-9, 'null grows from initial (30) → 45');
+  // derivedConfidence composes the curve.
+  const now = new Date();
+  const fresh = derivedConfidence(30, now.toISOString(), now);
+  assert.ok(fresh >= 0.99, `fresh rehearsal → ~1.0, got ${fresh}`);
+  const cold = derivedConfidence(
+    30,
+    new Date(Date.now() - 365 * 24 * 3600 * 1000).toISOString(),
+    now,
+  );
+  assert.ok(cold < 0.15, `ancient rehearsal → floor-ish, got ${cold}`);
 });
 
 test('MCP round-trip: memory_reinforce returns the bumped memory', async () => {

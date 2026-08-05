@@ -75,7 +75,7 @@ export async function withWriteTracking(fn, { dbPath, operation, timeoutMs = 500
         setTimeout(() => {
           const err = new Error(
             `write operation timeout after ${timeoutMs}ms: ${operation}. ` +
-              `${count} concurrent writers active.`
+              `${count} concurrent writers active.`,
           );
           err.code = 'WRITE_TIMEOUT';
           reject(err);

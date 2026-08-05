@@ -52,7 +52,8 @@ export function getMemoriesToPrune(memories, daysCutoff = PURGE_DAYS_DEFAULT) {
 // Archive configuration helper.
 export function getArchiveConfig(overrides = {}) {
   return {
-    archive_conversations_after_days: overrides.archive_conversations_after_days || ARCHIVE_DAYS_DEFAULT,
+    archive_conversations_after_days:
+      overrides.archive_conversations_after_days || ARCHIVE_DAYS_DEFAULT,
     purge_superseded_after_days: overrides.purge_superseded_after_days || PURGE_DAYS_DEFAULT,
     purge_deleted_after_days: overrides.purge_deleted_after_days || PURGE_DAYS_DEFAULT,
     archive_format: overrides.archive_format || 'json', // json, jsonl, or sqlite
@@ -63,14 +64,7 @@ export function getArchiveConfig(overrides = {}) {
 // Build archival path for a conversation or batch.
 export function getArchivePath(kimiHome, projectKey, identifier, archiveDate = null) {
   const date = archiveDate ? archiveDate.split('T')[0] : nowIso().split('T')[0];
-  return path.join(
-    kimiHome,
-    'kimi-memory',
-    '_archives',
-    projectKey,
-    date,
-    `${identifier}.json.gz`
-  );
+  return path.join(kimiHome, 'kimi-memory', '_archives', projectKey, date, `${identifier}.json.gz`);
 }
 
 // Lifecycle policy for a database.
@@ -112,7 +106,13 @@ export function estimateDbSize(memoriesCount, embeddingCount) {
     embeddings: embeddingCount * embeddingSize,
     indexes: indexSize,
     total_bytes: memoriesCount * memoryRowSize + embeddingCount * embeddingSize + indexSize,
-    total_mb: Math.round((memoriesCount * memoryRowSize + embeddingCount * embeddingSize + indexSize) / 1024 / 1024 * 100) / 100,
+    total_mb:
+      Math.round(
+        ((memoriesCount * memoryRowSize + embeddingCount * embeddingSize + indexSize) /
+          1024 /
+          1024) *
+          100,
+      ) / 100,
   };
 }
 

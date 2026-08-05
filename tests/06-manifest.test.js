@@ -110,7 +110,7 @@ test('plugin manifest reflects the merged memory + advisor displayName', () => {
 });
 
 test('manifest version matches package.json and package-lock.json', () => {
-  assert.equal(manifest.version, '0.4.0');
+  assert.equal(manifest.version, '0.5.0');
   assert.equal(pkg.version, manifest.version);
   assert.equal(lock.packages[''].version, manifest.version);
 });
@@ -211,7 +211,10 @@ test('memory_prune tool is registered, wired, and documented', () => {
   // The long description must mention it.
   const long = (manifest.interface && manifest.interface.longDescription) || '';
   assert.match(long, /memory_prune/, 'longDescription must mention memory_prune');
-  assert.match(long, /Tools \(24\):/, 'longDescription must claim Tools (24)');
+  // The exact count is governed by the regex match above; this hardcode
+  // exists to flag a description that claims a different number than the
+  // TOOL_DEFS array. Bump this when a new tool is added.
+  assert.match(long, /Tools \(26\):/, 'longDescription must claim Tools (26)');
   // The slash command exists and links to the tool.
   const pruneCmd = readFileSync(path.join(root, 'commands', 'prune.md'), 'utf8');
   assert.match(pruneCmd, /memory_prune\(/);
