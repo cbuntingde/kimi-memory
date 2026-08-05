@@ -138,11 +138,23 @@ const TOOL_DEFS = [
         .describe(
           'project: this project only. global: _global DB only. all: project + global, project hits first (default all).',
         ),
-      query: z.string().min(1).max(500).describe('Search query. Supports basic FTS5 operators: "exact phrase" or -exclude.'),
+      query: z
+        .string()
+        .min(1)
+        .max(500)
+        .describe('Search query. Supports basic FTS5 operators: "exact phrase" or -exclude.'),
       type: z.enum(['working', 'episodic', 'semantic', 'procedural']).optional(),
       limit: z.number().int().min(1).max(200).optional(),
-      recent_first: z.boolean().optional().describe('When true, sort by updated_at DESC (most recent first) instead of FTS5 relevance.'),
-      sort_by: z.enum(['relevance', 'recent', 'confidence', 'priority']).optional().describe('Sort order. Default: relevance.'),
+      recent_first: z
+        .boolean()
+        .optional()
+        .describe(
+          'When true, sort by updated_at DESC (most recent first) instead of FTS5 relevance.',
+        ),
+      sort_by: z
+        .enum(['relevance', 'recent', 'confidence', 'priority'])
+        .optional()
+        .describe('Sort order. Default: relevance.'),
     },
   },
   {
@@ -522,7 +534,13 @@ const TOOL_DEFS = [
         ])
         .optional()
         .describe('Filter diagnostics to a specific error type.'),
-      limit: z.number().int().min(1).max(500).optional().describe('Max records to return. Default 100.'),
+      limit: z
+        .number()
+        .int()
+        .min(1)
+        .max(500)
+        .optional()
+        .describe('Max records to return. Default 100.'),
     },
   },
   {

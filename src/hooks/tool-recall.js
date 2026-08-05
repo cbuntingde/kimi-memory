@@ -23,7 +23,8 @@ import { searchMemories } from '../persist.js';
 const TOOL_RECALL_MAX = 2;
 const TOOL_RECALL_MIN_SCORE = 0.25;
 const PATH_REGEX = /(?:[a-zA-Z]:)?[\\/][^\s"',;]+[\\/][^\s"',;]+/g;
-const SHELL_VERB_REGEX = /\b(pnpm|npm|yarn|bun|node|npx|tsx|ts-node|python|pip|cargo|go|make|cmake|gradle|mvn|docker|kubectl|git|curl|wget|brew|apt|systemctl)\b/g;
+const SHELL_VERB_REGEX =
+  /\b(pnpm|npm|yarn|bun|node|npx|tsx|ts-node|python|pip|cargo|go|make|cmake|gradle|mvn|docker|kubectl|git|curl|wget|brew|apt|systemctl)\b/g;
 
 // Extract a query string from a tool-call payload. The Kimi wire
 // payload may be a JSON object (file_path, command, content…) or a
@@ -53,7 +54,9 @@ function extractQueryFromToolArgs(args) {
     // rows rarely contain the extension; they do contain the stem.
     const stripExt = (s) => s.replace(/\.[a-z0-9]{1,8}$/i, '');
     if (segments.length >= 2) {
-      parts.push(stripExt(segments[segments.length - 2]) + '/' + stripExt(segments[segments.length - 1]));
+      parts.push(
+        stripExt(segments[segments.length - 2]) + '/' + stripExt(segments[segments.length - 1]),
+      );
     }
     if (segments.length >= 1) {
       parts.push(stripExt(segments[segments.length - 1]));
@@ -147,7 +150,11 @@ export async function runToolRecall({
   }
   const projectIdSet = new Set(projectHits.map((m) => m.id));
   const lines = deduped.map((h, i) =>
-    formatHit(h, { index: i, total: deduped.length, scope: projectIdSet.has(h.id) ? 'project' : 'global' }),
+    formatHit(h, {
+      index: i,
+      total: deduped.length,
+      scope: projectIdSet.has(h.id) ? 'project' : 'global',
+    }),
   );
   return { lines, hits: deduped };
 }

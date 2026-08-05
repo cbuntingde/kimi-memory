@@ -159,13 +159,13 @@ Disable via `KIMI_MEMORY_CONSOLIDATE=off` (matches the auto-extract opt-out patt
 
 ## Decay and reinforcement contract
 
-| Operation | Effect |
-| --- | --- |
-| `memory_save` (new row) | `stability_days = 30`, `last_rehearsed_at = now`. |
-| `memory_save` (update) | `last_rehearsed_at = now` (fresh rehearsal on touch). |
-| `memory_reinforce` | `+0.05 confidence`, `stability_days *= 1.5` (capped 365), `last_rehearsed_at = now`. |
-| `memory_recall` (hook auto) | Top project hit auto-reinforced, debounced within 60s. |
-| `SessionStart` decay pass | Each row's `confidence` rewritten from `0.1 + 0.9 * exp(-t/s)`. |
-| `PostToolUse` recall | Tool-call hits are surfaced but **not** reinforced (tool calls are too frequent). |
+| Operation                   | Effect                                                                               |
+| --------------------------- | ------------------------------------------------------------------------------------ |
+| `memory_save` (new row)     | `stability_days = 30`, `last_rehearsed_at = now`.                                    |
+| `memory_save` (update)      | `last_rehearsed_at = now` (fresh rehearsal on touch).                                |
+| `memory_reinforce`          | `+0.05 confidence`, `stability_days *= 1.5` (capped 365), `last_rehearsed_at = now`. |
+| `memory_recall` (hook auto) | Top project hit auto-reinforced, debounced within 60s.                               |
+| `SessionStart` decay pass   | Each row's `confidence` rewritten from `0.1 + 0.9 * exp(-t/s)`.                      |
+| `PostToolUse` recall        | Tool-call hits are surfaced but **not** reinforced (tool calls are too frequent).    |
 
 Schema is `SCHEMA_VERSION = 9`; migrations add `stability_days` and `last_rehearsed_at` to existing rows on first open.

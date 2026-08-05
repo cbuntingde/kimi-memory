@@ -489,7 +489,18 @@ function zeroCounts() {
   };
 }
 
-function buildStatusLine({ event, key, cwd, counts, ingest, recall, extract, workLog, focus, consolidate }) {
+function buildStatusLine({
+  event,
+  key,
+  cwd,
+  counts,
+  ingest,
+  recall,
+  extract,
+  workLog,
+  focus,
+  consolidate,
+}) {
   const ingestSeg = formatIngestSegment(ingest);
   const recallSeg = recall ? ` recall project:${recall.project} global:${recall.global}` : '';
   // Extract + work-log + focus + consolidate are surfaced only when
@@ -1120,7 +1131,16 @@ async function handleStopFailure(payload) {
 // versions may not declare it. When the handler is never invoked
 // the plugin degrades to the current behaviour silently — no error
 // is surfaced because there is nothing for the hook to do.
-const TOOL_ARGS_KEYS = ['tool_input', 'toolInput', 'input', 'args', 'arguments', 'command', 'file_path', 'path'];
+const TOOL_ARGS_KEYS = [
+  'tool_input',
+  'toolInput',
+  'input',
+  'args',
+  'arguments',
+  'command',
+  'file_path',
+  'path',
+];
 
 function payloadToolArgs(payload) {
   if (!isPlainObject(payload)) return null;

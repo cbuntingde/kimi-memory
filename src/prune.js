@@ -23,7 +23,8 @@ export function enumeratePruneCandidates({ home, activeKey, scope, apply }) {
   try {
     entries = readdirSync(memDir, { withFileTypes: true });
   } catch (e) {
-    if (e && e.code === 'ENOENT') return { candidates: [], note: 'no kimi-memory data directory yet' };
+    if (e && e.code === 'ENOENT')
+      return { candidates: [], note: 'no kimi-memory data directory yet' };
     throw e;
   }
   // Always include the active project so the user sees it was checked

@@ -62,7 +62,10 @@ export function daysSince(iso, now) {
 // so future timestamps do not blow up the exp.
 export function retrievability(days, stability) {
   const t = Math.max(0, Number(days) || 0);
-  const s = Math.max(STABILITY_MIN, Math.min(STABILITY_MAX, Number(stability) || STABILITY_INITIAL));
+  const s = Math.max(
+    STABILITY_MIN,
+    Math.min(STABILITY_MAX, Number(stability) || STABILITY_INITIAL),
+  );
   return Math.exp(-t / s);
 }
 
@@ -89,9 +92,7 @@ export function retrievabilityToConfidence(r) {
 // new memory has 30 days of expected durability, not 1.
 export function growStability(prevStability) {
   const prev =
-    prevStability == null || !Number.isFinite(prevStability)
-      ? STABILITY_INITIAL
-      : prevStability;
+    prevStability == null || !Number.isFinite(prevStability) ? STABILITY_INITIAL : prevStability;
   return Math.max(STABILITY_MIN, Math.min(STABILITY_MAX, prev * STABILITY_GROWTH));
 }
 

@@ -27,7 +27,12 @@ import {
   getMemory,
   listWorkingMemory,
 } from '../src/persist.js';
-import { projectDbPath, globalDbPath, deriveProjectKey, GLOBAL_PROJECT_KEY } from '../src/project-key.js';
+import {
+  projectDbPath,
+  globalDbPath,
+  deriveProjectKey,
+  GLOBAL_PROJECT_KEY,
+} from '../src/project-key.js';
 
 function freshHome() {
   return mkTempHome('km-reset-');
@@ -207,10 +212,22 @@ test('resetProject: wipes per-project rows but preserves the project_paths row a
     recordProjectPath(db, key, cwd);
 
     // Sanity: every table has its row.
-    assert.equal(db.prepare('SELECT COUNT(*) AS n FROM memories WHERE project_key=?').get(key).n, 2);
-    assert.equal(db.prepare('SELECT COUNT(*) AS n FROM working_memory WHERE project_key=?').get(key).n, 1);
-    assert.equal(db.prepare('SELECT COUNT(*) AS n FROM conversations WHERE project_key=?').get(key).n, 1);
-    assert.equal(db.prepare('SELECT COUNT(*) AS n FROM conversation_events WHERE project_key=?').get(key).n, 1);
+    assert.equal(
+      db.prepare('SELECT COUNT(*) AS n FROM memories WHERE project_key=?').get(key).n,
+      2,
+    );
+    assert.equal(
+      db.prepare('SELECT COUNT(*) AS n FROM working_memory WHERE project_key=?').get(key).n,
+      1,
+    );
+    assert.equal(
+      db.prepare('SELECT COUNT(*) AS n FROM conversations WHERE project_key=?').get(key).n,
+      1,
+    );
+    assert.equal(
+      db.prepare('SELECT COUNT(*) AS n FROM conversation_events WHERE project_key=?').get(key).n,
+      1,
+    );
 
     const summary = resetProject(db, key);
     assert.equal(summary.memories_deleted, 2);
@@ -220,12 +237,30 @@ test('resetProject: wipes per-project rows but preserves the project_paths row a
     assert.equal(summary.project_path_preserved, true);
 
     // After: every per-project row is gone.
-    assert.equal(db.prepare('SELECT COUNT(*) AS n FROM memories WHERE project_key=?').get(key).n, 0);
-    assert.equal(db.prepare('SELECT COUNT(*) AS n FROM working_memory WHERE project_key=?').get(key).n, 0);
-    assert.equal(db.prepare('SELECT COUNT(*) AS n FROM conversations WHERE project_key=?').get(key).n, 0);
-    assert.equal(db.prepare('SELECT COUNT(*) AS n FROM conversation_events WHERE project_key=?').get(key).n, 0);
-    assert.equal(db.prepare('SELECT COUNT(*) AS n FROM memory_edges WHERE project_key=?').get(key).n, 0);
-    assert.equal(db.prepare('SELECT COUNT(*) AS n FROM memory_synthesizes WHERE project_key=?').get(key).n, 0);
+    assert.equal(
+      db.prepare('SELECT COUNT(*) AS n FROM memories WHERE project_key=?').get(key).n,
+      0,
+    );
+    assert.equal(
+      db.prepare('SELECT COUNT(*) AS n FROM working_memory WHERE project_key=?').get(key).n,
+      0,
+    );
+    assert.equal(
+      db.prepare('SELECT COUNT(*) AS n FROM conversations WHERE project_key=?').get(key).n,
+      0,
+    );
+    assert.equal(
+      db.prepare('SELECT COUNT(*) AS n FROM conversation_events WHERE project_key=?').get(key).n,
+      0,
+    );
+    assert.equal(
+      db.prepare('SELECT COUNT(*) AS n FROM memory_edges WHERE project_key=?').get(key).n,
+      0,
+    );
+    assert.equal(
+      db.prepare('SELECT COUNT(*) AS n FROM memory_synthesizes WHERE project_key=?').get(key).n,
+      0,
+    );
 
     // project_paths is preserved; first_seen_at was reset to now.
     const row = listProjectPaths(db).find((r) => r.project_key === key);

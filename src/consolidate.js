@@ -34,9 +34,7 @@ const COVERAGE_RATIO = 0.75; // an existing conclusion "covers" a cluster if >=7
 
 function tokenizeTags(tags) {
   if (!Array.isArray(tags)) return [];
-  return tags
-    .map((t) => String(t).toLowerCase().trim())
-    .filter((t) => t.length > 0);
+  return tags.map((t) => String(t).toLowerCase().trim()).filter((t) => t.length > 0);
 }
 
 function tagOverlap(a, b) {
@@ -180,10 +178,7 @@ function clusterMemories(memories, { decodeEmbedding }) {
 // child is included so the conclusion carries enough signal that the
 // agent can act on it without recalling every child.
 function buildConclusionBody(cluster) {
-  const lines = [
-    'Synthesised by background consolidation. Cluster of related memories:',
-    '',
-  ];
+  const lines = ['Synthesised by background consolidation. Cluster of related memories:', ''];
   for (const m of cluster) {
     const title = m.title || '(untitled)';
     const first = (m.content || '')

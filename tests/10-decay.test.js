@@ -280,7 +280,11 @@ test('decay.js pure helpers: retrievability + growStability', () => {
   const now = new Date();
   const fresh = derivedConfidence(30, now.toISOString(), now);
   assert.ok(fresh >= 0.99, `fresh rehearsal → ~1.0, got ${fresh}`);
-  const cold = derivedConfidence(30, new Date(Date.now() - 365 * 24 * 3600 * 1000).toISOString(), now);
+  const cold = derivedConfidence(
+    30,
+    new Date(Date.now() - 365 * 24 * 3600 * 1000).toISOString(),
+    now,
+  );
   assert.ok(cold < 0.15, `ancient rehearsal → floor-ish, got ${cold}`);
 });
 

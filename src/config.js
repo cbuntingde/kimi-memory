@@ -32,26 +32,26 @@ export function validateConfig(raw) {
   }
 
   const km = raw['kimi-memory'] || {};
-  
+
   // Validate field types.
   const validatedKm = {};
-  
+
   if (typeof km.disable_auto_extract === 'boolean') {
     validatedKm.disable_auto_extract = km.disable_auto_extract;
   }
-  
+
   if (typeof km.disable_embeddings === 'boolean') {
     validatedKm.disable_embeddings = km.disable_embeddings;
   }
-  
+
   if (typeof km.embed_timeout_ms === 'number' && km.embed_timeout_ms > 0) {
     validatedKm.embed_timeout_ms = km.embed_timeout_ms;
   }
-  
+
   if (typeof km.llm_model === 'string') {
     validatedKm.llm_model = km.llm_model;
   }
-  
+
   if (typeof km.llm_provider === 'string') {
     validatedKm.llm_provider = km.llm_provider;
   }

@@ -24,7 +24,12 @@ import {
   cosineSimilarity,
 } from './embedding.js';
 import { logPersistError, logEmbeddingError, logPerformanceMetric } from './diagnostics.js';
-import { recordWriteStart, recordWriteEnd, isSqliteBusyError, calculateDbBackoffMs } from './concurrency.js';
+import {
+  recordWriteStart,
+  recordWriteEnd,
+  isSqliteBusyError,
+  calculateDbBackoffMs,
+} from './concurrency.js';
 
 const SCHEMA_VERSION = 9;
 
@@ -843,12 +848,12 @@ function bumpAccess(db, projectKey, ids) {
 // rows that share the same (project_key, type, title).
 export function saveMemoryBulk(db, projectKey, inputs) {
   if (!Array.isArray(inputs) || inputs.length === 0) return [];
-  
+
   // Enhanced error handling: collect per-item errors instead of total rollback.
   // This allows the caller to know which items failed and which succeeded.
   const results = [];
   const errors = [];
-  
+
   db.exec('BEGIN');
   try {
     for (let i = 0; i < inputs.length; i++) {
@@ -866,14 +871,16 @@ export function saveMemoryBulk(db, projectKey, inputs) {
         results.push(null);
       }
     }
-    
+
     // If any item failed due to secret detection or other validation,
     // roll back the entire transaction for safety. Secret-related errors
     // should fail the whole batch.
     const hasSecretError = errors.some(
-      (e) => e.error && (e.error.code === 'KIMI_MEMORY_SECRET_DETECTED' || e.error.message?.includes('secret'))
+      (e) =>
+        e.error &&
+        (e.error.code === 'KIMI_MEMORY_SECRET_DETECTED' || e.error.message?.includes('secret')),
     );
-    
+
     if (hasSecretError) {
       try {
         db.exec('ROLLBACK');
@@ -895,7 +902,7 @@ export function saveMemoryBulk(db, projectKey, inputs) {
       };
       throw err;
     }
-    
+
     db.exec('COMMIT');
   } catch (err) {
     try {
@@ -905,7 +912,7 @@ export function saveMemoryBulk(db, projectKey, inputs) {
     }
     throw err;
   }
-  
+
   // Return all results, marking failures as null for introspection.
   return results;
 }
@@ -1247,9 +1254,7 @@ export function reinforceMemory(db, projectKey, id) {
   if (!row) return null;
   const next = Math.min(1, Math.max(0, (row.confidence || 0) + REINFORCE_DELTA));
   const prevStab =
-    row.stability_days == null || !Number.isFinite(row.stability_days)
-      ? null
-      : row.stability_days;
+    row.stability_days == null || !Number.isFinite(row.stability_days) ? null : row.stability_days;
   const newStab = growStability(prevStab);
   db.prepare(
     `
@@ -1275,12 +1280,7 @@ export function reinforceMemory(db, projectKey, id) {
 // (status quo) so the caller can log a no-op uniformly.
 const REINFORCE_DEBOUNCE_MS = 60_000;
 
-export function reinforceIfStale(
-  db,
-  projectKey,
-  id,
-  { debounceMs = REINFORCE_DEBOUNCE_MS } = {},
-) {
+export function reinforceIfStale(db, projectKey, id, { debounceMs = REINFORCE_DEBOUNCE_MS } = {}) {
   const row = db
     .prepare(
       "SELECT id, last_rehearsed_at FROM memories WHERE id=? AND project_key=? AND status='active'",
@@ -1324,9 +1324,7 @@ export function decayMemories(db, projectKey, { now = new Date() } = {}) {
     .all(projectKey);
   scanned = rows.length;
   if (rows.length === 0) return { scanned, rewritten, errors };
-  const stmt = db.prepare(
-    `UPDATE memories SET confidence = ? WHERE id = ? AND project_key = ?`,
-  );
+  const stmt = db.prepare(`UPDATE memories SET confidence = ? WHERE id = ? AND project_key = ?`);
   try {
     db.exec('BEGIN');
     for (const r of rows) {

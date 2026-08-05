@@ -357,7 +357,9 @@ function cmdExport(args) {
     if (existsSync(dbPath)) {
       const db = openDb(dbPath);
       const memories = listMemories(db, key, { limit: 10000, status: null, includeExpired: true });
-      const working = db.prepare('SELECT slot, value FROM working_memory WHERE project_key = ?').all(key);
+      const working = db
+        .prepare('SELECT slot, value FROM working_memory WHERE project_key = ?')
+        .all(key);
       closeDb(dbPath);
       scopes.project = {
         project_key: key,

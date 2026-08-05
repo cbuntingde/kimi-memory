@@ -15,18 +15,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkTempHome, rmRf } from './_helpers.js';
-import {
-  openDb,
-  closeDb,
-  saveMemory,
-  linkMemory,
-} from '../src/persist.js';
+import { openDb, closeDb, saveMemory, linkMemory } from '../src/persist.js';
 import { projectDbPath, deriveProjectKey } from '../src/project-key.js';
 import { runConsolidate } from '../src/consolidate.js';
-import {
-  extractQueryFromToolArgs,
-  runToolRecall,
-} from '../src/hooks/tool-recall.js';
+import { extractQueryFromToolArgs, runToolRecall } from '../src/hooks/tool-recall.js';
 
 function freshProject() {
   const home = mkTempHome();
@@ -45,9 +37,7 @@ function freshProject() {
 // without touching Hugging Face.
 function encodeStubForRow(row) {
   const title = (row.title || '').toLowerCase();
-  const tags = (Array.isArray(row.tags) ? row.tags : []).map((t) =>
-    String(t).toLowerCase(),
-  );
+  const tags = (Array.isArray(row.tags) ? row.tags : []).map((t) => String(t).toLowerCase());
   // Two hash buckets: one for the first word, one for the rest.
   const first = title.split(/\s+/)[0] || '';
   const rest = title.split(/\s+/).slice(1).join(' ');
@@ -60,12 +50,7 @@ function encodeStubForRow(row) {
   const sharedTags = ['build', 'stack', 'project'].filter((t) => tags.includes(t)).length;
   // Length signal.
   const len = Math.min(2, title.length / 30);
-  return new Float32Array([
-    (h1 % 1000) / 1000,
-    (h2 % 1000) / 1000,
-    sharedTags / 3,
-    len,
-  ]);
+  return new Float32Array([(h1 % 1000) / 1000, (h2 % 1000) / 1000, sharedTags / 3, len]);
 }
 
 function installEmbeddingStub() {
@@ -139,7 +124,9 @@ test('consolidate: clusters three related rows with shared tags and synthesises 
     assert.equal(r.clusters, 1);
     // The conclusion row is present and references all three children.
     const conclusions = db
-      .prepare(`SELECT id, type, title FROM memories WHERE project_key=? AND type='conclusion' AND status='active'`)
+      .prepare(
+        `SELECT id, type, title FROM memories WHERE project_key=? AND type='conclusion' AND status='active'`,
+      )
       .all(key);
     assert.equal(conclusions.length, 1);
     assert.match(conclusions[0].title, /Synthesis/);
@@ -192,7 +179,9 @@ test('consolidate: idempotent — a second pass does not create duplicates', asy
     assert.equal(r2.saved, 0, 'no new conclusions on second pass');
     assert.equal(r2.skipped, 1, 'cluster is already covered');
     const conclusions = db
-      .prepare(`SELECT COUNT(*) AS n FROM memories WHERE project_key=? AND type='conclusion' AND status='active'`)
+      .prepare(
+        `SELECT COUNT(*) AS n FROM memories WHERE project_key=? AND type='conclusion' AND status='active'`,
+      )
       .get(key);
     assert.equal(conclusions.n, 1);
   } finally {
@@ -316,9 +305,18 @@ test('diversifyHitsByType: round-robins types so the top 3 are not all one type'
   // types (semantic, procedural, working).
   const types = new Set(picked.map((h) => h.type));
   assert.equal(types.size, 3, 'three distinct types: ' + [...types].join(','));
-  assert.ok(picked.some((h) => h.id === 'a'), 'top semantic included');
-  assert.ok(picked.some((h) => h.id === 'd'), 'top procedural included');
-  assert.ok(picked.some((h) => h.id === 'e'), 'top working included');
+  assert.ok(
+    picked.some((h) => h.id === 'a'),
+    'top semantic included',
+  );
+  assert.ok(
+    picked.some((h) => h.id === 'd'),
+    'top procedural included',
+  );
+  assert.ok(
+    picked.some((h) => h.id === 'e'),
+    'top working included',
+  );
 });
 
 test('diversifyHitsByType: returns fewer than topN when fewer types exist', async () => {

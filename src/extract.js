@@ -108,9 +108,7 @@ async function detectProjectMetadata(cwd) {
     if (pkg.workspaces && Array.isArray(pkg.workspaces) && pkg.workspaces.length) {
       out.stack.push('workspaces');
     }
-    const hasTypeScript = depNames.some(
-      (d) => d === 'typescript' || d.startsWith('@types/'),
-    );
+    const hasTypeScript = depNames.some((d) => d === 'typescript' || d.startsWith('@types/'));
     if (hasTypeScript) out.stack.push('typescript');
   } catch {
     // package.json missing or unparseable — ignore
@@ -120,7 +118,12 @@ async function detectProjectMetadata(cwd) {
     const tsPath = path.join(cwd, 'tsconfig.json');
     const tsText = await fs.readFile(tsPath, 'utf8');
     const ts = safeJsonParse(tsText).ok ? safeJsonParse(tsText).value : null;
-    if (ts && typeof ts === 'object' && ts.compilerOptions && typeof ts.compilerOptions === 'object') {
+    if (
+      ts &&
+      typeof ts === 'object' &&
+      ts.compilerOptions &&
+      typeof ts.compilerOptions === 'object'
+    ) {
       const opts = ts.compilerOptions;
       const bits = [];
       if (opts.target) bits.push(`target=${opts.target}`);
@@ -136,7 +139,8 @@ async function detectProjectMetadata(cwd) {
   }
 
   if (out.stack.length === 0 && !out.buildCommand && !out.testCommand) return null;
-  if (!out.updatePolicy) out.updatePolicy = 'Check for latest unless pinned or specified in manifest';
+  if (!out.updatePolicy)
+    out.updatePolicy = 'Check for latest unless pinned or specified in manifest';
   return out;
 }
 
@@ -480,27 +484,25 @@ export async function runAutoExtract({
 
   const projectMeta = await detectProjectMetadata(cwd);
   const prompt = buildExtractionPrompt(transcript, existingTitles || [], projectMeta);
-  
+
   let reply;
   try {
     // Retry with exponential backoff for transient LLM failures.
     reply = await withLlmRetry(
       () => callLlm({ ...target, system: prompt.system, user: prompt.user }),
-      { projectKey, maxAttempts: 3, baseDelayMs: 1000 }
+      { projectKey, maxAttempts: 3, baseDelayMs: 1000 },
     );
   } catch (error) {
     // LLM call failed after retries; log and continue with no extraction.
-    await logAutoExtractError(
-      projectKey,
-      'llm_failed_after_retries',
-      error,
-      { max_attempts: 3, error_code: error?.code }
-    ).catch(() => {});
+    await logAutoExtractError(projectKey, 'llm_failed_after_retries', error, {
+      max_attempts: 3,
+      error_code: error?.code,
+    }).catch(() => {});
     result.skipped = 'llm_failed_after_retries';
     result.error = error && error.message ? error.message : String(error);
     return result;
   }
-  
+
   if (!reply) {
     result.skipped = 'llm_no_reply';
     return result;
@@ -518,7 +520,8 @@ export async function runAutoExtract({
 
   const deterministic = [];
   if (projectMeta) {
-    const stack = projectMeta.stack && projectMeta.stack.length ? projectMeta.stack.join(', ') : 'unknown';
+    const stack =
+      projectMeta.stack && projectMeta.stack.length ? projectMeta.stack.join(', ') : 'unknown';
     deterministic.push({
       type: 'semantic',
       title: 'Project build/stack details',
