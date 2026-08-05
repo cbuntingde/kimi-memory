@@ -21,6 +21,14 @@ import { promises as fs } from 'node:fs';
 
 // Canonicalize a project root. Reject empty, non-absolute, and obviously
 // dangerous values. On Windows we also normalise the drive letter case.
+//
+// On non-Windows hosts, a Windows-style absolute path (e.g. C:/foo/bar)
+// must NOT be passed through path.resolve — POSIX treats the leading
+// "C:" as a filename, so path.resolve('C:/foo/bar') would join it onto
+// the current working directory and return a nonsense path. Instead we
+// normalise the drive-letter path by hand: convert forward slashes to
+// backslashes, then uppercase the drive letter on Windows so
+// "C:\foo" and "c:\foo" map identically.
 export function canonicalizeRoot(input) {
   if (typeof input !== 'string') return null;
   const trimmed = input.trim();
@@ -29,18 +37,19 @@ export function canonicalizeRoot(input) {
   const isWinAbs = /^[A-Za-z]:[\\/]/.test(trimmed);
   const isPosixAbs = trimmed.startsWith('/');
   if (!isWinAbs && !isPosixAbs) return null;
-  let resolved;
+  if (isWinAbs) {
+    let win = trimmed.replace(/\//g, '\\');
+    if (process.platform === 'win32') {
+      win = win.replace(/^([a-z])(:)/, (_, d, c) => d.toUpperCase() + c);
+    }
+    return win;
+  }
+  // POSIX absolute path.
   try {
-    resolved = path.resolve(trimmed);
+    return path.resolve(trimmed);
   } catch {
     return null;
   }
-  // On Windows path.resolve lowercases the drive letter on some Node
-  // versions; pin uppercase so "C:\foo" and "c:\foo" map identically.
-  if (process.platform === 'win32') {
-    resolved = resolved.replace(/^([a-z])(:)/, (_, d, c) => d.toUpperCase() + c);
-  }
-  return resolved;
 }
 
 export function deriveProjectKey(canonicalRoot) {

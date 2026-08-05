@@ -1880,7 +1880,17 @@ export function detectReclone(db, projectKey, canonicalRoot) {
   // birthtimeMs is 0 on some Unix filesystems; fall back to mtimeMs.
   // On Windows, birthtimeMs is the directory's actual creation time,
   // which is the strongest "this directory was just made" signal.
-  const dirTime = stat.birthtimeMs && stat.birthtimeMs > 0 ? stat.birthtimeMs : stat.mtimeMs;
+  //
+  // We also clamp to Math.min(birthtimeMs, mtimeMs). On Linux, some
+  // tests (and a few admin tools) backdate mtime via utimes, which
+  // leaves birthtime ahead of mtime; without the min, the directory
+  // would falsely look like it was just created. Using the min gives
+  // the older of the two timestamps, which is the right "when was
+  // this directory first made" signal across all platforms.
+  const dirTime = Math.min(
+    stat.birthtimeMs && stat.birthtimeMs > 0 ? stat.birthtimeMs : stat.mtimeMs,
+    stat.mtimeMs,
+  );
   out.dir_birthtime = new Date(dirTime).toISOString();
   const firstSeen = Date.parse(row.first_seen_at);
   if (!Number.isFinite(firstSeen)) {
