@@ -34,9 +34,12 @@ import {
   getMemory,
   memoryCounts,
   searchMemories,
-  listProjectPaths,
+  resetProject,
+  detectReclone,
+  resetProjectDryRunCounts,
 } from './persist.js';
-import { existsSync, readdirSync, rmSync, readFileSync, writeFileSync } from 'node:fs';
+import { enumeratePruneCandidates } from './prune.js';
+import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 
 function parseArgs(argv) {
@@ -300,56 +303,12 @@ function cmdPrune(args) {
     process.stderr.write(`note: ${memDir} does not exist\n`);
     process.exit(0);
   }
-  const entries = readdirSync(memDir, { withFileTypes: true });
-  const projectDirs = entries
-    .filter((d) => d.isDirectory() && d.name !== GLOBAL_PROJECT_KEY && d.name !== '_diagnostics')
-    .filter((d) => (all ? d.name !== activeKey : d.name === activeKey))
-    .map((d) => ({
-      key: d.name,
-      dir: path.join(memDir, d.name),
-      db: path.join(memDir, d.name, 'memory.sqlite'),
-    }));
-
-  const candidates = [];
-  for (const p of projectDirs) {
-    let recordedRoot = null;
-    if (existsSync(p.db)) {
-      const db = openDb(p.db);
-      const rows = listProjectPaths(db);
-      const row = rows.find((r) => r.project_key === p.key);
-      if (row) recordedRoot = row.canonical_root;
-      closeDb(p.db);
-    } else {
-      continue;
-    }
-    const isActive = p.key === activeKey;
-    const existsOnDisk = recordedRoot ? existsSync(recordedRoot) : null;
-    let action;
-    if (isActive) action = 'kept-active';
-    else if (existsOnDisk === false) {
-      if (apply) {
-        try {
-          closeDb(p.db);
-          rmSync(p.dir, { recursive: true, force: true });
-          action = 'removed';
-        } catch (e) {
-          action = 'error';
-          candidates.push({ project_key: p.key, action, error: e.message });
-          continue;
-        }
-      } else {
-        action = 'would-remove';
-      }
-    } else {
-      action = 'kept';
-    }
-    candidates.push({
-      project_key: p.key,
-      canonical_root: recordedRoot,
-      exists_on_disk: existsOnDisk,
-      action,
-    });
-  }
+  const { candidates } = enumeratePruneCandidates({
+    home,
+    activeKey,
+    scope: all ? 'all-projects' : 'project',
+    apply,
+  });
   const removed = candidates.filter((c) => c.action === 'removed').length;
   const out = {
     operation: 'prune',
@@ -575,6 +534,96 @@ function cmdImport(args) {
   process.stdout.write(`imported ${count} items from ${inFile}\n`);
 }
 
+// Wipe every per-project row (memories, working memory, conversations,
+// conversation events, edges, synthesizes) for the active project. Use
+// this after a repo is re-cloned to the same canonical path: the
+// project_key is a hash of the path, so kimi-memory cannot otherwise
+// tell the new project apart from the old one.
+//
+// Dry run by default; pass --apply to actually delete. The global DB
+// and every other project DB are never touched. Mirrors the
+// memory_reset_project MCP tool for ops users who want to script the
+// reset from a shell rather than via the agent.
+function cmdResetProject(args) {
+  const home = homeDir(args);
+  const cwd = resolveCwd(args);
+  if (!cwd) {
+    process.stderr.write('error: --cwd is required for reset-project\n');
+    process.exit(1);
+  }
+  const apply = !!args.flags.apply;
+  const asJson = !!args.flags.json;
+  const key = deriveProjectKey(cwd);
+  const dbPath = projectDbPath(home, key);
+  if (!existsSync(dbPath)) {
+    process.stderr.write(`note: project DB does not exist yet (${dbPath})\n`);
+    process.exit(0);
+  }
+  const db = openDb(dbPath);
+  // Re-clone diagnostic: lets the operator confirm this is the right
+  // project to wipe. isReclone may be false on long-lived projects;
+  // that does not block the reset, it just means the user does not
+  // have a re-clone signal to lean on.
+  let reclone;
+  try {
+    reclone = detectReclone(db, key, cwd);
+  } catch (e) {
+    reclone = { isReclone: false, reason: 'detect failed: ' + (e && e.message) };
+  }
+  // Dry run: echo the row counts and the diagnostic. The agent or the
+  // operator reads this and decides whether to invoke with --apply.
+  if (!apply) {
+    const counts = resetProjectDryRunCounts(db, key);
+    const totalRows = Object.values(counts).reduce((a, b) => a + b, 0);
+    const out = {
+      operation: 'reset_project_dry_run',
+      project_key: key,
+      cwd,
+      reclone,
+      row_counts: counts,
+      total_rows: totalRows,
+      note:
+        'dry run: nothing was deleted. Pass --apply to wipe the per-project rows. ' +
+        'The global database and every other project DB are never touched.',
+    };
+    if (asJson) emitJson(out);
+    else {
+      process.stdout.write(`project_key=${key} cwd=${cwd}\n`);
+      process.stdout.write(`reclone.isReclone=${reclone.isReclone}\n`);
+      if (reclone.reason) process.stdout.write(`reclone.reason=${reclone.reason}\n`);
+      for (const [k2, n] of Object.entries(counts)) {
+        process.stdout.write(`${k2}=${n}\n`);
+      }
+      process.stdout.write(`total_rows=${totalRows}\n`);
+      process.stdout.write('note: pass --apply to perform the reset.\n');
+    }
+    closeDb();
+    return;
+  }
+  // Apply: wipe the per-project rows. resetProject runs in a
+  // transaction so a mid-reset error leaves the DB untouched.
+  const summary = resetProject(db, key);
+  closeDb(dbPath);
+  const out = {
+    operation: 'reset_project',
+    project_key: key,
+    cwd,
+    reclone,
+    ...summary,
+  };
+  if (asJson) emitJson(out);
+  else {
+    process.stdout.write(`project_key=${key} cwd=${cwd}\n`);
+    process.stdout.write(`memories_deleted=${summary.memories_deleted}\n`);
+    process.stdout.write(`working_memory_deleted=${summary.working_memory_deleted}\n`);
+    process.stdout.write(`conversations_deleted=${summary.conversations_deleted}\n`);
+    process.stdout.write(`conversation_events_deleted=${summary.conversation_events_deleted}\n`);
+    process.stdout.write(`memory_edges_deleted=${summary.memory_edges_deleted}\n`);
+    process.stdout.write(`memory_synthesizes_deleted=${summary.memory_synthesizes_deleted}\n`);
+    process.stdout.write(`project_path_preserved=${summary.project_path_preserved}\n`);
+  }
+}
+
 function printUsage() {
   process.stdout.write(
     [
@@ -586,6 +635,7 @@ function printUsage() {
       '  node src/cli.js status [--cwd <path>] [--json]',
       '  node src/cli.js recall <query>       [--cwd <path>] [--limit N] [--per-type] [--json]',
       '  node src/cli.js prune  [--cwd <path>] [--all-projects] [--apply] [--json]',
+      '  node src/cli.js reset-project [--cwd <path>] [--apply] [--json]',
       '  node src/cli.js export <output-file> [--cwd <path>] [--scope project|global|all]',
       '  node src/cli.js import <input-file>  [--cwd <path>] [--scope project|global|all] [--merge|--replace [--yes]]',
       '',
@@ -621,6 +671,8 @@ function main() {
         return cmdRecall(args);
       case 'prune':
         return cmdPrune(args);
+      case 'reset-project':
+        return cmdResetProject(args);
       case 'export':
         return cmdExport(args);
       case 'import':

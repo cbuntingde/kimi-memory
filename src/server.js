@@ -20,8 +20,7 @@
 //     scoped; no scope argument is accepted.
 import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
-import { createRequire } from 'node:module';
-import { mkdirSync, readdirSync, rmSync, existsSync } from 'node:fs';
+import { mkdirSync, existsSync } from 'node:fs';
 import path from 'node:path';
 import { kimiHome, nowIso, asString } from './util.js';
 import {
@@ -64,9 +63,12 @@ import {
   unlinkMemory,
   listEdges,
   recordProjectPath,
-  listProjectPaths,
+  resetProject,
+  detectReclone,
+  resetProjectDryRunCounts,
 } from './persist.js';
 import { locateSessionArchive, walkWire, readSessionIndex } from './wire.js';
+import { enumeratePruneCandidates } from './prune.js';
 import {
   resolveProjectRoot,
   validateType,
@@ -521,6 +523,17 @@ const TOOL_DEFS = [
         .optional()
         .describe('Filter diagnostics to a specific error type.'),
       limit: z.number().int().min(1).max(500).optional().describe('Max records to return. Default 100.'),
+    },
+  },
+  {
+    name: 'memory_reset_project',
+    desc: 'Wipe every per-project row (memories, working memory, conversations, conversation events, edges, synthesizes) for the active project so the project starts from a clean slate. Use this after a repo is re-cloned to the same canonical path — the project_key is a hash of the path, so kimi-memory cannot otherwise tell the new project apart from the old one. Requires confirm=true to actually delete; without it the call is a dry run that returns the row counts that would be deleted. The global database and every other project DB are never touched. Run memory_status first if you want to see what is on file.',
+    input: {
+      cwd: z.string().describe('Project root (absolute path). Required.'),
+      confirm: z
+        .boolean()
+        .optional()
+        .describe('When true, perform the destructive reset. Default false (dry run).'),
     },
   },
 ];
@@ -1073,6 +1086,15 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
       const events = project.db
         .prepare('SELECT COUNT(*) AS n FROM conversation_events WHERE project_key=?')
         .get(project.projectKey).n;
+      // Re-clone detection: surface a flag in the status payload so
+      // dashboards and the hook layer can warn the user without making
+      // a second tool call. Best-effort; never throws.
+      let reclone = null;
+      try {
+        reclone = detectReclone(project.db, project.projectKey, pr.value);
+      } catch (e) {
+        reclone = { isReclone: false, reason: 'detect failed: ' + (e && e.message) };
+      }
       return ok({
         project_key: project.projectKey,
         cwd: pr.value,
@@ -1088,6 +1110,11 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
           memories: globalMem,
         },
         scopes: { project: project.projectKey, global: GLOBAL_PROJECT_KEY },
+        // Stale-memory warning: a freshly re-cloned repo can have a
+        // large, irrelevant memory cache. The hook layer surfaces this
+        // as a [stale-memory] line; memory_reset_project (with
+        // confirm=true) clears it.
+        reclone,
       });
     } catch (e) {
       return textError(toError(e).error);
@@ -1493,144 +1520,22 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
       if (!pr.ok) return textError(pr.error);
       const scope = args.scope === 'all-projects' ? 'all-projects' : 'project';
       const apply = !!args.apply;
-      const activeCanonical = pr.value; // canonicalized in resolveProjectRoot
-      // Collect the project directories to inspect.
-      //   scope='project'     → only the active project
-      //   scope='all-projects' → every project directory except the active one
-      const memDir = path.join(home, 'kimi-memory');
-      let entries = [];
-      try {
-        entries = readdirSync(memDir, { withFileTypes: true });
-      } catch (e) {
-        if (e && e.code === 'ENOENT') {
-          return ok({
-            operation: 'pruned',
-            scope,
-            apply,
-            candidates: [],
-            removed: 0,
-            note: 'no kimi-memory data directory yet',
-          });
-        }
-        throw e;
-      }
-      // Always include the active project (so the user sees the check, even
-      // when its path exists and it's not a prune candidate). For
-      // all-projects we skip the active project's directory entirely.
-      const activeKey = deriveProjectKey(activeCanonical);
-      const projectDirs = entries
-        .filter((d) => d.isDirectory() && d.name !== GLOBAL_PROJECT_KEY)
-        .filter((d) => {
-          // The active project is always included in the report so the
-          // user can see it was inspected (it is never removed). For
-          // scope='all-projects' we also include every other project.
-          if (d.name === activeKey) return true;
-          return scope === 'all-projects';
-        })
-        .map((d) => ({
-          key: d.name,
-          dir: path.join(memDir, d.name),
-          db: path.join(memDir, d.name, 'memory.sqlite'),
-        }));
-
-      const candidates = [];
-      for (const p of projectDirs) {
-        // Resolve a canonical root if the DB has one; otherwise report
-        // "unknown" so the user can decide manually.
-        let recordedRoot = null;
-        let firstSeenAt = null;
-        let lastSeenAt = null;
-        if (existsSync(p.db)) {
-          try {
-            const handle = openDb(p.db);
-            const rows = listProjectPaths(handle);
-            const row = rows.find((r) => r.project_key === p.key);
-            if (row) {
-              recordedRoot = row.canonical_root;
-              firstSeenAt = row.first_seen_at;
-              lastSeenAt = row.last_seen_at;
-            }
-            closeDb(p.db);
-          } catch (e) {
-            candidates.push({
-              project_key: p.key,
-              db_path: p.db,
-              canonical_root: null,
-              exists_on_disk: null,
-              first_seen_at: null,
-              last_seen_at: null,
-              action: apply ? 'error' : 'would-keep',
-              error: 'failed to read project_paths: ' + (e && e.message),
-            });
-            continue;
-          }
-        } else if (!existsSync(p.dir)) {
-          // Empty project dir; nothing to do.
-          continue;
-        }
-        const existsOnDisk = recordedRoot ? existsSync(recordedRoot) : null;
-        // Active project's DB is always reported as kept regardless of apply.
-        const isActive = p.key === activeKey;
-        if (isActive) {
-          candidates.push({
-            project_key: p.key,
-            db_path: p.db,
-            canonical_root: recordedRoot,
-            exists_on_disk: existsOnDisk,
-            first_seen_at: firstSeenAt,
-            last_seen_at: lastSeenAt,
-            action: 'kept-active',
-          });
-          continue;
-        }
-        if (existsOnDisk === false) {
-          // Orphan candidate.
-          let action = 'would-remove';
-          if (apply) {
-            try {
-              // Drop the cached handle before deleting the file.
-              closeDb(p.db);
-              rmSync(p.dir, { recursive: true, force: true });
-              action = 'removed';
-            } catch (e) {
-              action = 'error';
-              candidates.push({
-                project_key: p.key,
-                db_path: p.db,
-                canonical_root: recordedRoot,
-                exists_on_disk: existsOnDisk,
-                first_seen_at: firstSeenAt,
-                last_seen_at: lastSeenAt,
-                action,
-                error: e && e.message,
-              });
-              continue;
-            }
-          } else {
-            // Dry run: ensure the DB handle isn't holding a lock on a file
-            // we might want to keep.
-            closeDb(p.db);
-          }
-          candidates.push({
-            project_key: p.key,
-            db_path: p.db,
-            canonical_root: recordedRoot,
-            exists_on_disk: existsOnDisk,
-            first_seen_at: firstSeenAt,
-            last_seen_at: lastSeenAt,
-            action,
-          });
-        } else {
-          candidates.push({
-            project_key: p.key,
-            db_path: p.db,
-            canonical_root: recordedRoot,
-            exists_on_disk: existsOnDisk,
-            first_seen_at: firstSeenAt,
-            last_seen_at: lastSeenAt,
-            action: 'kept',
-          });
-        }
+      const activeKey = deriveProjectKey(pr.value);
+      const { candidates, note } = enumeratePruneCandidates({
+        home,
+        activeKey,
+        scope,
+        apply,
+      });
+      if (note) {
+        return ok({
+          operation: 'pruned',
+          scope,
+          apply,
+          candidates: [],
+          removed: 0,
+          note,
+        });
       }
       const removed = candidates.filter((c) => c.action === 'removed').length;
       return ok({
@@ -1667,6 +1572,71 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
         hours_back: hoursBack,
         log_location: path.join(home, 'kimi-memory', '_diagnostics', 'hooks.log'),
         note: 'Recent logs are ordered most-recent-first. Use type_filter to focus on specific error types.',
+      });
+    } catch (e) {
+      return textError(toError(e).error);
+    }
+  });
+
+  // ---- memory_reset_project (wipe a single project's data) ----
+  // Re-cloned repos share the project_key with the previous incarnation
+  // (project_key = SHA-256 prefix of canonical path), so the only way to
+  // discard the stale memories + working memory + session archive is to
+  // delete the rows. The global DB and every other project DB are never
+  // touched. The call is a dry run unless `confirm: true` is set; the
+  // dry-run path returns the same shape so the caller (or a slash
+  // command UI) can render a confirmation prompt before deleting.
+  server.tool(TOOL_DEFS[25].name, TOOL_DEFS[25].input, async (args) => {
+    try {
+      const pr = resolveProjectRoot(args.cwd);
+      if (!pr.ok) return textError(pr.error);
+      const key = deriveProjectKey(pr.value);
+      const dbPath = projectDbPath(home, key);
+      if (!existsSync(dbPath)) {
+        return textError(`no project DB at ${dbPath} (project has not been written to yet)`);
+      }
+      // Re-clone check: when stale memory is the reason for the reset,
+      // surface the diagnostic so the user can confirm. The check is
+      // read-only and never blocks the call.
+      const handle = openDb(dbPath);
+      let reclone = null;
+      try {
+        reclone = detectReclone(handle, key, pr.value);
+      } catch (e) {
+        reclone = { isReclone: false, reason: 'detect failed: ' + (e && e.message) };
+      }
+      // Always run the dry-run counter first so we can echo what would
+      // be deleted. The destructive path uses a transaction, so a
+      // confirm=true call that errors partway through still leaves the
+      // DB in a known state (rolled back).
+      const counts = resetProjectDryRunCounts(handle, key);
+      const totalRows = Object.values(counts).reduce((a, b) => a + b, 0);
+      const confirm = args.confirm === true;
+      if (!confirm) {
+        return ok({
+          operation: 'reset_project_dry_run',
+          project_key: key,
+          cwd: pr.value,
+          reclone,
+          row_counts: counts,
+          total_rows: totalRows,
+          note:
+            'dry run: nothing was deleted. Pass confirm=true to wipe the per-project rows. ' +
+            'The global database and every other project DB are never touched.',
+        });
+      }
+      const summary = resetProject(handle, key);
+      // Drop the cached handle so the next open re-reads the file.
+      closeDb(dbPath);
+      return ok({
+        operation: 'reset_project',
+        project_key: key,
+        cwd: pr.value,
+        reclone,
+        ...summary,
+        note:
+          'per-project rows deleted. The global database and every other project DB were not touched. ' +
+          'first_seen_at was reset to now, so the re-clone warning will not fire again until a new incarnation is recorded.',
       });
     } catch (e) {
       return textError(toError(e).error);
@@ -1744,7 +1714,3 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
 
   return { server, ingestOne, _deps: { kimiHome: home, pluginRoot: root, logger: log } };
 }
-
-// Suppress unused-import warning when createRequire is referenced only
-// in older test harnesses; no-op import is acceptable in ESM.
-void createRequire;

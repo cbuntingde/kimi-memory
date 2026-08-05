@@ -70,13 +70,14 @@ Every MCP call requires the active project's absolute root as `cwd` to prevent c
 
 All optional; defaults are tuned for production.
 
-| Variable                       | Default | Effect                                                                                                                                               |
-| ------------------------------ | ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `KIMI_MEMORY_EMBEDDINGS`       | `on`    | Set to `off` to skip the embedding encoder. `memory_recall` falls back to FTS5-only; `memory_similar` returns `[]`.                                  |
-| `KIMI_MEMORY_EMBED_TIMEOUT_MS` | `4000`  | Wall-clock cap on a single embedding call; on timeout the row's `embedding_status` flips to `failed` with `last_embed_error = "embed_timeout: ..."`. |
-| `KIMI_MEMORY_AUTO_EXTRACT`     | `on`    | Set to `off` to disable the Stop-hook auto-extraction LLM call. Also configurable as `[kimi-memory] disable_auto_extract = true` in `config.toml`.   |
-| `KIMI_MEMORY_SECRET_SCAN`      | `on`    | Set to `off` to bypass the server-side secret check on save (see Storage and privacy).                                                               |
-| `KIMI_MEMORY_PERF`             | `on`    | Set to `off` to skip the `tests/16-perf.test.js` benchmarks.                                                                                         |
+| Variable                            | Default | Effect                                                                                                                                               |
+| ----------------------------------- | ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `KIMI_MEMORY_EMBEDDINGS`            | `on`    | Set to `off` to skip the embedding encoder. `memory_recall` falls back to FTS5-only; `memory_similar` returns `[]`.                                  |
+| `KIMI_MEMORY_EMBED_TIMEOUT_MS`      | `4000`  | Wall-clock cap on a single embedding call; on timeout the row's `embedding_status` flips to `failed` with `last_embed_error = "embed_timeout: ..."`. |
+| `KIMI_MEMORY_AUTO_EXTRACT`          | `on`    | Set to `off` to disable the Stop-hook auto-extraction LLM call. Also configurable as `[kimi-memory] disable_auto_extract = true` in `config.toml`.   |
+| `KIMI_MEMORY_SECRET_SCAN`           | `on`    | Set to `off` to bypass the server-side secret check on save (see Storage and privacy).                                                               |
+| `KIMI_MEMORY_PERF`                  | `on`    | Set to `off` to skip the `tests/16-perf.test.js` benchmarks.                                                                                         |
+| `KIMI_MEMORY_DISABLE_SESSION_FOCUS` | `off`   | Set to `1` to skip the Stop-hook session-focus capture (the "where we left off" memory).                                                             |
 
 ## Memory tools
 
@@ -120,6 +121,7 @@ The plugin exposes 24 MCP tools over the `kimi-memory` stdio server.
 **Maintenance**:
 
 - `memory_prune(cwd, scope?, apply?)` — find (or, with `apply: true`, delete) project DBs whose canonical root no longer exists. `scope`: `"project"` (default, active only) or `"all-projects"` (every DB except active). Always dry-runs first. Active project and global DB are never removed.
+- `memory_reset_project(cwd, confirm?)` — wipe the per-project rows (memories, working memory, conversations, conversation events, edges, synthesizes) so the project starts from a clean slate. Use after a repo is re-cloned to the same canonical path: the project_key is a hash of the path, so a re-clone is otherwise indistinguishable from the original. `confirm: false` (default) is a dry run that returns the row counts and a re-clone diagnostic; pass `confirm: true` to actually delete. The global database and every other project DB are never touched. The hook layer surfaces a `[stale-memory]` line on SessionStart and UserPromptSubmit when a re-clone is detected (directory birthtime newer than `first_seen_at`).
 
 Successful memory operations return explicit metadata (`operation`, `scope`, counts, affected `id`).
 
@@ -138,10 +140,11 @@ kimi-memory list    [--cwd <path>] [--scope project|global|all] [--type <type>] 
 kimi-memory get     <memory-id> [--scope project|global] [--cwd <path>] [--json]
 kimi-memory status  [--cwd <path>] [--json]
 kimi-memory recall  <query> [--cwd <path>] [--limit N] [--per-type] [--json]
-kimi-memory prune   [--cwd <path>] [--all-projects] [--apply] [--json]
+kimi-memory prune          [--cwd <path>] [--all-projects] [--apply] [--json]
+kimi-memory reset-project  [--cwd <path>] [--apply] [--json]
 ```
 
-`--json` emits machine-readable JSON; `-q` suppresses per-row output; `--home <dir>` overrides `$KIMI_CODE_HOME`. The CLI never writes — `prune --apply` is the only mutating command.
+`--json` emits machine-readable JSON; `-q` suppresses per-row output; `--home <dir>` overrides `$KIMI_CODE_HOME`. `prune --apply` removes orphan project DBs whose canonical root no longer exists; `reset-project --apply` wipes the per-project rows of the active project (use after a re-clone). Both are dry runs by default.
 
 ## Higher-level features
 
@@ -174,6 +177,32 @@ Every memory has `confidence` (default 0.8, range 0.1–1.0) and `access_count` 
 
 Save with `memory_save({ type: "conclusion", synthesizes: [childId, ...] })`. Lineage is recorded in `memory_synthesizes` and queryable in both directions via `memory_conclusions_for` and `memory_parents`. Conclusions decay like any other row, but their child rows stay fresh while the conclusion is active — reinforce the conclusion itself.
 
+### Brain mode (v9+)
+
+`kimi-memory` v9 turns the plugin from a filing cabinet into something closer to a working brain, entirely through the hook layer:
+
+- **Continuous retrieval** — every `UserPromptSubmit` recall query unions prompt tokens, working-memory slots, the session-focus title, and recent file paths. The top 3 hits are round-robined across memory types so the user sees a balanced recall, not three rows of the same type.
+- **Mid-turn recall** — `PostToolUse` (a new hook event) surfaces `[tool-recall]` lines when a stored convention matches the tool's arguments (file paths, shell verbs). Cheap; no LLM call. Older Kimi versions that don't declare the event degrade silently.
+- **Ebbinghaus decay** — every memory carries a per-row `stability_days` and `last_rehearsed_at`. Confidence is rewritten on `SessionStart` from the curve `0.1 + 0.9 * exp(-days / stability)`. Every `memory_reinforce` grows stability by 1.5x (cap 365 days) and stamps a fresh rehearsal. The hook auto-reinforces the top project recall hit with a 60-second debounce so the feedback loop is closed without manual calls.
+- **Cross-session narrative** — `SessionStart` lists the last 3 sessions for the project, oldest → newest, with each session's focus title and body snippet. Pick-up phrasing: `Picking up the thread: <oldest session title>`.
+- **Background consolidation ("dream pass")** — every `SessionStart`, related memories (cosine ≥ 0.75, ≥ 2 shared tags) are clustered; each cluster of ≥ 3 siblings without a `conclusion` child gets one synthesised. Idempotent via `memory_synthesizes` coverage check. Opt out via `KIMI_MEMORY_CONSOLIDATE=off`.
+
+Schema `SCHEMA_VERSION = 9` adds `stability_days` and `last_rehearsed_at` to `memories`. Existing rows are backfilled on first open (stability defaults to 30, last_rehearsed_at defaults to updated_at).
+
+### Session focus — "where we left off"
+
+The `Stop` hook (and the lifecycle hooks that delegate to it) writes a `working`-typed memory titled `Last focus: <truncated latest user prompt>` whenever the session has at least one user prompt. The memory body lists the last few user prompts from the session so the next session has the thread to pick up. Tags: `focus`, `session-focus`, `in-flight`. `expires_at` is set 30 days out so the row auto-cleans when no longer relevant.
+
+This is the answer to "close kimi-code, reopen, ask what we were working on". The next `SessionStart` reads the most recent focus row and emits a one-line preview:
+
+```text
+[focus] "Last focus: narrow it down to the embed timeout edge case" (working) — Most recent user requests in this session (oldest → newest):
+```
+
+`UserPromptSubmit` emits the same line on every prompt, regardless of keyword match — it is the agent's signal that the user can simply say "continue" or "pick that up" and the prior focus is already in context. The status line gains a `focus=saved|updated|skip:<reason>` segment mirroring the `extract=` and `work_log=` shape.
+
+Auto-extract deliberately skips transient tasks (see Auto-extraction above), so the focus capture fills the gap that the LLM is not asked about. Cost: zero — the row is built from `conversation_events.summary`, no LLM call. Disable via `KIMI_MEMORY_DISABLE_SESSION_FOCUS=1`.
+
 ## Conversation archival
 
 Hooks run at `SessionStart`, `UserPromptSubmit`, `Stop`, `SessionEnd`, `PreCompact`, `Interrupt`, and `StopFailure`. They incrementally read the current session's `agents/main/wire.jsonl`, preserve every raw JSONL event, and extract searchable summaries. Imports use byte and line cursors and are idempotent. Kimi does not document full conversation text in hook payloads, so archival reads the transcript files directly without modifying them; the parser is tolerant of unknown/malformed records.
@@ -189,7 +218,7 @@ Summary lines are intentionally short:
 - SessionStart: `Loaded N recent memories. (N project, N global.)` or `No recent memories.`
 - UserPromptSubmit: `Recalled N memory/memories. (N project, N global.) [semantic: 2, procedural: 1]` (per-type breakdown appended when there are hits) or `No recall hits.`
 
-`UserPromptSubmit` is followed by up to three `[recall: i/N] "title" (type, scope, score=…) — <body snippet>` lines (snippet capped at 120 chars). Working-memory slots are emitted as `- WM <slot>: <value>` lines. The remaining hooks are silent on stdout and run only the idempotent project-session ingest; they are fail-open and never block Kimi's lifecycle. The hooks never echo full memory bodies, raw prompts, or session transcripts.
+`UserPromptSubmit` is followed by up to three `[recall: i/N] "title" (type, scope, score=…) — <body snippet>` lines (snippet capped at 120 chars). When a session-focus row exists, `[focus] "<title>" (working) — <body snippet>` is also emitted (always, not gated on keyword recall — see Session focus above). Working-memory slots are emitted as `- WM <slot>: <value>` lines. The remaining hooks are silent on stdout and run only the idempotent project-session ingest; they are fail-open and never block Kimi's lifecycle. The hooks never echo full memory bodies, raw prompts, or session transcripts.
 
 An advisor match line appears on `UserPromptSubmit` when the prompt contains a frozen keyword:
 

@@ -8,9 +8,6 @@ import { fileURLToPath } from 'node:url';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
-// Import test helpers
-import { withDb, tmpHome } from './_helpers.js';
-
 // Import modules under test
 import { calculateBackoffMs, withRetry } from '../src/retry.js';
 import { 
