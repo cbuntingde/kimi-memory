@@ -110,13 +110,23 @@ test('detectReclone: returns isReclone=false when first_seen_at is newer than di
 });
 
 test('detectReclone: returns isReclone=false when directory birthtime is far in the past (long-lived project)', () => {
-  // The "long-lived project" branch (dirAheadMs > 60s but dirAgeMs > 7d)
-  // is hard to exercise cross-platform: utimesSync only changes mtime
-  // on Windows, while the implementation prefers birthtime when it is
-  // reliable (which it is on Windows, since the kernel tracks it). On
-  // Windows this test would use birthtime (~now) instead of the
-  // simulated mtime, so the assertion is gated to non-Windows hosts.
+  // The "long-lived project" branch fires when the directory is older
+  // than RECLONE_MAX_DIR_AGE_MS (7d) from now. To exercise it on every
+  // platform we backdate the directory's mtime via utimesSync (which
+  // leaves birthtime untouched on Linux and Windows). The
+  // implementation clamps to Math.min(birthtime, mtime), so on filesystems
+  // with a reliable birthtime we still see the backdated mtime.
+  //
+  // Setup: directory mtime = 10 days ago (older than the 7d ceiling),
+  // first_seen_at = 30 days ago (so dirAheadMs is positive — the
+  // directory is "newer than the recorded first_seen_at", which is the
+  // combination that flips the function out of "predates" and into
+  // "long-lived project").
   if (process.platform === 'win32') {
+    // Windows honours utimes for both atime and mtime but not birthtime,
+    // and the implementation on Windows uses birthtime directly (no
+    // Math.min). Gating this assertion to non-Windows hosts avoids a
+    // birthtime-mismatch false positive.
     return;
   }
   const home = freshHome();
@@ -124,18 +134,14 @@ test('detectReclone: returns isReclone=false when directory birthtime is far in 
   const key = deriveProjectKey(cwd);
   try {
     const db = openDb(projectDbPath(home, key));
-    // Force the directory's mtime/birthtime to 60 days ago to simulate
-    // a project that has been around for two months.
-    const sixtyDaysAgo = new Date(Date.now() - 60 * 24 * 60 * 60 * 1000);
-    utimesSync(cwd, sixtyDaysAgo, sixtyDaysAgo);
-    // first_seen_at is 1 day ago, so the directory is older than 7d
-    // and the long-lived-project ceiling kicks in.
-    const yesterday = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
+    const tenDaysAgo = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000);
+    utimesSync(cwd, tenDaysAgo, tenDaysAgo);
+    const thirtyDaysAgo = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
     db.prepare(
       `INSERT INTO project_paths (project_key, canonical_root, first_seen_at, last_seen_at, last_canonical_root, record_count)
        VALUES (?, ?, ?, ?, NULL, 1)
        ON CONFLICT(project_key) DO UPDATE SET first_seen_at=excluded.first_seen_at`,
-    ).run(key, cwd, yesterday, yesterday);
+    ).run(key, cwd, thirtyDaysAgo, thirtyDaysAgo);
     const r = detectReclone(db, key, cwd);
     assert.equal(r.isReclone, false);
     assert.match(r.reason, /long-lived project/);

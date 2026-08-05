@@ -38,10 +38,12 @@ export function canonicalizeRoot(input) {
   const isPosixAbs = trimmed.startsWith('/');
   if (!isWinAbs && !isPosixAbs) return null;
   if (isWinAbs) {
-    let win = trimmed.replace(/\//g, '\\');
-    if (process.platform === 'win32') {
-      win = win.replace(/^([a-z])(:)/, (_, d, c) => d.toUpperCase() + c);
-    }
+    // Always normalise the drive letter to uppercase so 'C:\\foo' and
+    // 'c:\\foo' map to the same canonical root, regardless of which
+    // OS the function is running on. path.resolve lowercases the drive
+    // letter on Windows; we pin it here to keep the cross-platform
+    // canonical form stable.
+    const win = trimmed.replace(/\//g, '\\').replace(/^([a-z])(:)/, (_, d, c) => d.toUpperCase() + c);
     return win;
   }
   // POSIX absolute path.
