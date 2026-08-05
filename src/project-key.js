@@ -43,7 +43,9 @@ export function canonicalizeRoot(input) {
     // OS the function is running on. path.resolve lowercases the drive
     // letter on Windows; we pin it here to keep the cross-platform
     // canonical form stable.
-    const win = trimmed.replace(/\//g, '\\').replace(/^([a-z])(:)/, (_, d, c) => d.toUpperCase() + c);
+    const win = trimmed
+      .replace(/\//g, '\\')
+      .replace(/^([a-z])(:)/, (_, d, c) => d.toUpperCase() + c);
     return win;
   }
   // POSIX absolute path.
