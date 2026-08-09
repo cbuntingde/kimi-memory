@@ -45,6 +45,7 @@ Pick the right scope for every fact you save or recall:
 | `semantic`   | A durable fact, definition, or convention.                                                                                                                                                                                                       |
 | `procedural` | A procedure ("to release: ...").                                                                                                                                                                                                                 |
 | `conclusion` | A higher-order synthesis built from one or more underlying memories. Pass `synthesizes: [childId, ...]` to `memory_save`; the plugin records the lineage in `memory_synthesizes` and exposes it via `memory_conclusions_for` / `memory_parents`. |
+| `skill`      | A v10 trigger-matching memory whose `metadata.trigger` shape (`{ commands?, paths?, keywords? }`) is matched against tool invocations by `matchSkillTriggers` (and surfaced by `match_skill_triggers`).                                          |
 
 ## Tools
 
@@ -168,4 +169,4 @@ Disable via `KIMI_MEMORY_CONSOLIDATE=off` (matches the auto-extract opt-out patt
 | `SessionStart` decay pass   | Each row's `confidence` rewritten from `0.1 + 0.9 * exp(-t/s)`.                      |
 | `PostToolUse` recall        | Tool-call hits are surfaced but **not** reinforced (tool calls are too frequent).    |
 
-Schema is `SCHEMA_VERSION = 9`; migrations add `stability_days` and `last_rehearsed_at` to existing rows on first open.
+Schema is `SCHEMA_VERSION = 10`; migrations add `stability_days` and `last_rehearsed_at` to existing rows on first open, then the v10 phase layers on visibility/ACL, tier/persona, wiki, codegraph, and the `skill` type extension.

@@ -96,8 +96,12 @@ async function main() {
         );
       }
     } finally {
+      // closeDb() (vs raw db.close()) also evicts the cached handle
+      // from persist.js's path-keyed map, so a later openDb(dbPath)
+      // returns a fresh handle. Without it, the next caller inherits
+      // the closed DatabaseSync.
       try {
-        db.close();
+        closeDb(t.dbPath);
       } catch {
         /* ignore */
       }

@@ -16,7 +16,6 @@
 // cursors remain strictly project-scoped.
 import { createHash } from 'node:crypto';
 import path from 'node:path';
-import os from 'node:os';
 import { promises as fs } from 'node:fs';
 
 // Canonicalize a project root. Reject empty, non-absolute, and obviously
@@ -104,5 +103,3 @@ export async function ensureGlobalDir(kimiHomeDir) {
   await fs.mkdir(dir, { recursive: true });
   return dir;
 }
-
-export { os };

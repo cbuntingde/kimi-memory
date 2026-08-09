@@ -48,6 +48,16 @@ function tagOverlap(a, b) {
 // Load every active memory that has an embedding. Embedding-pending
 // rows are skipped — they cannot be cosine-clustered. Their day will
 // come on the next pass.
+//
+// Cap the input size at CONSOLIDATE_INPUT_CAP so the O(N²) cosine loop
+// in clusterMemories stays bounded even on huge projects. The cap is
+// (max clusters) × (max members) × 4 — plenty of headroom for the
+// clusterer's intended use and a hard wall against a 10k-memory DB
+// stalling the SessionStart hook. Rows are ordered by updated_at DESC
+// so the freshest memories (the ones the user is most likely to want
+// summarised) are preferred over ancient ones.
+const CONSOLIDATE_INPUT_CAP =
+  CONSOLIDATE_MAX_CLUSTERS * CONSOLIDATE_MAX_MEMBERS * 4; // 640 rows
 function loadActiveMemories(db, projectKey) {
   return db
     .prepare(
@@ -57,9 +67,11 @@ function loadActiveMemories(db, projectKey) {
          AND status = 'active'
          AND (expires_at IS NULL OR datetime(expires_at) > datetime('now'))
          AND embedding IS NOT NULL
-         AND embedding_dim IS NOT NULL`,
+         AND embedding_dim IS NOT NULL
+       ORDER BY updated_at DESC
+       LIMIT ?`,
     )
-    .all(projectKey)
+    .all(projectKey, CONSOLIDATE_INPUT_CAP)
     .map((r) => {
       let tags = [];
       try {

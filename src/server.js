@@ -66,9 +66,33 @@ import {
   resetProject,
   detectReclone,
   resetProjectDryRunCounts,
+  shareMemory,
+  openSharedDb,
+  sharedDbPath,
+  setMemoryTier,
+  promoteMemory,
+  demoteMemory,
+  listTierHistory,
 } from './persist.js';
 import { locateSessionArchive, walkWire, readSessionIndex } from './wire.js';
 import { enumeratePruneCandidates } from './prune.js';
+import {
+  grantMemoryAcl,
+  revokeMemoryAcl,
+  listMemoryAcls,
+  parsePrincipalDescriptor,
+  validatePrincipalKind,
+  validateSharedWith,
+} from './acl.js';
+import {
+  upsertWikiPage,
+  getWikiPage,
+  traverseWiki,
+  backlinksWiki,
+  resolveWiki as resolveWikiPage,
+  extractWikiLinks,
+} from './wiki.js';
+import { extractCodeGraph, buildCodeGraphEdges, queryMemoryGraph } from './codegraph.js';
 import {
   resolveProjectRoot,
   validateType,
@@ -95,7 +119,7 @@ import { getRecentLogs, getErrorSummary } from './diagnostics.js';
 const TOOL_DEFS = [
   {
     name: 'memory_save',
-    desc: 'Persist a memory entry. type \u2208 working|episodic|semantic|procedural|conclusion.',
+    desc: 'Persist a memory entry. type \u2208 working|episodic|semantic|procedural|conclusion|skill.',
     input: {
       cwd: z.string().describe('Project root (absolute path). Required.'),
       scope: z
@@ -105,9 +129,9 @@ const TOOL_DEFS = [
           'project: per-project durable memory (default). global: cross-project user memory under $KIMI_CODE_HOME/kimi-memory/_global/.',
         ),
       type: z
-        .enum(['working', 'episodic', 'semantic', 'procedural', 'conclusion'])
+        .enum(['working', 'episodic', 'semantic', 'procedural', 'conclusion', 'skill'])
         .describe(
-          'Memory type. conclusion is the higher-order type that synthesizes N underlying memories via the synthesizes[] input.',
+          'Memory type. conclusion is the higher-order type that synthesizes N underlying memories via the synthesizes[] input. skill is a v10 trigger-matching memory matched against tool invocations via matchSkillTriggers.',
         ),
       title: z.string().max(500).optional(),
       content: z.string().min(1).max(200000).describe('Memory body.'),
@@ -125,6 +149,27 @@ const TOOL_DEFS = [
         .describe(
           'For type=conclusion: ids of underlying memories this conclusion synthesizes. Recorded in memory_synthesizes for bidirectional lookup.',
         ),
+      // v10 ACL / visibility fields. visibility defaults to 'private'
+      // when omitted, so a save never accidentally produces a row that
+      // bypasses the principal gate. shared_with is a JSON-encoded
+      // list of "kind:id" principal descriptors (e.g. ["user:alice",
+      // "role:editor"]); the ACL grants table (memories_acl) is the
+      // authoritative source \u2014 shared_with is a denormalised cache
+      // kept in sync by acl_share_memory / memory_share.
+      visibility: z
+        .enum(['private', 'team', 'restricted', 'agent', 'task'])
+        .optional()
+        .describe('v10: row visibility. Default private.'),
+      shared_with: z
+        .array(z.string().min(1).max(128))
+        .max(32)
+        .optional()
+        .describe('v10: principal descriptors allowed to read this row.'),
+      team_id: z.string().max(128).optional().describe('v10: team identity (optional).'),
+      agent_id: z.string().max(128).optional().describe('v10: agent identity (optional).'),
+      user_id: z.string().max(128).optional().describe('v10: user identity (optional).'),
+      session_id: z.string().max(128).optional().describe('v10: session identity (optional).'),
+      task_id: z.string().max(128).optional().describe('v10: task identity (optional).'),
     },
   },
   {
@@ -155,6 +200,63 @@ const TOOL_DEFS = [
         .enum(['relevance', 'recent', 'confidence', 'priority'])
         .optional()
         .describe('Sort order. Default: relevance.'),
+      // v10: fusion strategy. 'rrf' (default) uses Reciprocal Rank
+      // Fusion across FTS5 and the vector channel with RRF_K=60.
+      // 'weighted' preserves the legacy 0.5/0.5 blend for callers that
+      // need it. rrf_k overrides the default RRF_K constant when set.
+      fusion: z
+        .enum(['rrf', 'weighted'])
+        .optional()
+        .describe('v10: ranking strategy. Default rrf.'),
+      rrf_k: z
+        .number()
+        .int()
+        .min(1)
+        .max(1000)
+        .optional()
+        .describe('v10: RRF_K constant when fusion=rrf. Default 60.'),
+      // v10: ACL filter. Accepts a single visibility level or an array.
+      // Null / omitted = no filter (recall every active row regardless
+      // of visibility). The filter is applied to both the FTS and the
+      // vector channels.
+      visibility: z
+        .union([
+          z.enum(['private', 'team', 'restricted', 'agent', 'task']),
+          z.array(z.enum(['private', 'team', 'restricted', 'agent', 'task'])).max(5),
+        ])
+        .optional()
+        .describe('v10: narrow recall to one or more visibility levels. Single string or array.'),
+      // v10: tier filter (Chat Memory L0→L1→L2→L3). Single string or
+      // array. The filter is independent of visibility; a row must pass
+      // both gates to be recalled. Tier also drives per-tier budget
+      // shaping when `tier_budgets` is supplied.
+      tier: z
+        .union([z.enum(['L0', 'L1', 'L2', 'L3']), z.array(z.enum(['L0', 'L1', 'L2', 'L3'])).max(4)])
+        .optional()
+        .describe('v10: narrow recall to one or more tier levels.'),
+      // v10: per-tier recall budget. Map of tier → max count.
+      tier_budgets: z
+        .record(z.string(), z.number().int().min(0).max(50))
+        .optional()
+        .describe('v10: cap each tier independently. e.g. {L0:2, L1:2, L2:1, L3:1}.'),
+      // v10: per-row content truncation. Cuts the content body to the
+      // budget and appends a "…(truncated)" suffix. Surrogate-pair safe.
+      max_chars_per_memory: z
+        .number()
+        .int()
+        .min(20)
+        .max(200000)
+        .optional()
+        .describe('v10: truncate individual row content to this many chars.'),
+      // v10: cumulative character cap. Drops tail rows once the running
+      // sum exceeds the budget.
+      max_total_recall_chars: z
+        .number()
+        .int()
+        .min(20)
+        .max(2000000)
+        .optional()
+        .describe('v10: drop tail rows once cumulative content length exceeds this.'),
     },
   },
   {
@@ -168,7 +270,9 @@ const TOOL_DEFS = [
         .describe(
           'project: this project only. global: _global DB only. all: project + global, project first (default all).',
         ),
-      type: z.enum(['working', 'episodic', 'semantic', 'procedural', 'conclusion']).optional(),
+      type: z
+        .enum(['working', 'episodic', 'semantic', 'procedural', 'conclusion', 'skill'])
+        .optional(),
       status: z.enum(['active', 'superseded', 'deleted']).optional(),
       limit: z.number().int().min(1).max(500).optional(),
       offset: z.number().int().min(0).optional(),
@@ -208,6 +312,21 @@ const TOOL_DEFS = [
       status: z.enum(['active', 'superseded', 'deleted']).optional(),
       priority: z.number().int().optional(),
       expires_at: z.string().optional(),
+      // v10 ACL fields. All optional; omitted fields are not changed.
+      visibility: z
+        .enum(['private', 'team', 'restricted', 'agent', 'task'])
+        .optional()
+        .describe('v10: row visibility.'),
+      shared_with: z
+        .array(z.string().min(1).max(128))
+        .max(32)
+        .optional()
+        .describe('v10: principal descriptors allowed to read this row.'),
+      team_id: z.string().max(128).optional(),
+      agent_id: z.string().max(128).optional(),
+      user_id: z.string().max(128).optional(),
+      session_id: z.string().max(128).optional(),
+      task_id: z.string().max(128).optional(),
     },
   },
   {
@@ -320,7 +439,7 @@ const TOOL_DEFS = [
         .array(
           z.object({
             type: z
-              .enum(['working', 'episodic', 'semantic', 'procedural', 'conclusion'])
+              .enum(['working', 'episodic', 'semantic', 'procedural', 'conclusion', 'skill'])
               .describe('Memory type.'),
             title: z.string().max(500).optional(),
             content: z.string().min(1).max(200000).describe('Memory body.'),
@@ -338,6 +457,14 @@ const TOOL_DEFS = [
               .describe(
                 'For type=conclusion: ids of underlying memories this conclusion synthesizes.',
               ),
+            // v10 ACL fields (same shape as memory_save).
+            visibility: z.enum(['private', 'team', 'restricted', 'agent', 'task']).optional(),
+            shared_with: z.array(z.string().min(1).max(128)).max(32).optional(),
+            team_id: z.string().max(128).optional(),
+            agent_id: z.string().max(128).optional(),
+            user_id: z.string().max(128).optional(),
+            session_id: z.string().max(128).optional(),
+            task_id: z.string().max(128).optional(),
           }),
         )
         .min(1)
@@ -554,6 +681,260 @@ const TOOL_DEFS = [
         .describe('When true, perform the destructive reset. Default false (dry run).'),
     },
   },
+  // ----- v10 ACL / visibility -----
+  {
+    name: 'acl_grant',
+    desc: 'Grant an ACL entry for a memory: who can read it. principal_kind ∈ {user, team, role, agent}; principal_id is the identifier for that principal (e.g. "alice", "eng", "editor"). Idempotent via UNIQUE(memory_id, principal_kind, principal_id).',
+    input: {
+      cwd: z.string().describe('Project root (absolute path). Required.'),
+      scope: z.enum(['project', 'global']).optional(),
+      memory_id: z.string().min(4).max(64).describe('Memory id.'),
+      principal_kind: z
+        .enum(['user', 'team', 'role', 'agent'])
+        .describe('Kind of principal being granted access.'),
+      principal_id: z.string().min(1).max(128).describe('Identifier of the principal.'),
+    },
+  },
+  {
+    name: 'acl_revoke',
+    desc: 'Revoke an ACL entry for a memory. Returns whether a row was deleted. Idempotent: revoking a non-existent grant returns removed=false.',
+    input: {
+      cwd: z.string().describe('Project root (absolute path). Required.'),
+      scope: z.enum(['project', 'global']).optional(),
+      memory_id: z.string().min(4).max(64).describe('Memory id.'),
+      principal_kind: z.enum(['user', 'team', 'role', 'agent']).describe('Kind of principal.'),
+      principal_id: z.string().min(1).max(128).describe('Identifier of the principal.'),
+    },
+  },
+  {
+    name: 'acl_list',
+    desc: 'List every ACL grant on a memory. Returns an array of {memory_id, principal_kind, principal_id, granted_at}.',
+    input: {
+      cwd: z.string().describe('Project root (absolute path). Required.'),
+      scope: z.enum(['project', 'global']).optional(),
+      memory_id: z.string().min(4).max(64).describe('Memory id.'),
+    },
+  },
+  {
+    name: 'acl_share_memory',
+    desc: 'Promote one or more memories to a new visibility level. Two modes: to_shared_pool=false (default) updates the row in place within the project DB; to_shared_pool=true moves the row into the cross-project shared DB at $KIMI_CODE_HOME/kimi-memory/_shared/memory.sqlite. Returns { moved, updated }. Idempotent: re-running is a no-op for already-shared rows.',
+    input: {
+      cwd: z.string().describe('Project root (absolute path). Required.'),
+      scope: z.enum(['project', 'global']).optional(),
+      memory_ids: z
+        .array(z.string().min(4).max(64))
+        .min(1)
+        .max(500)
+        .describe('Memory ids to share.'),
+      visibility: z
+        .enum(['private', 'team', 'restricted', 'agent', 'task'])
+        .describe('New visibility level.'),
+      shared_with: z
+        .array(z.string().min(1).max(128))
+        .max(32)
+        .optional()
+        .describe('Principal descriptors allowed to read (e.g. ["user:alice","role:editor"]).'),
+      to_shared_pool: z
+        .boolean()
+        .optional()
+        .describe('When true, move the row into the cross-project _shared DB. Default false.'),
+    },
+  },
+  {
+    name: 'acl_resolve_principal',
+    desc: 'Parse a principal descriptor like "user:alice" into its parts {kind, id}. Returns null when the descriptor is malformed or the kind is unknown.',
+    input: {
+      cwd: z.string().describe('Project root (absolute path). Required.'),
+      descriptor: z.string().min(1).max(256).describe('Principal descriptor (kind:id).'),
+    },
+  },
+  // ----- v10 tier / persona -----
+  {
+    name: 'memory_set_tier',
+    desc: 'Move a memory to a specific tier (L0|L1|L2|L3). Writes an audit row to persona_promotions; no-op when the row is already at the target tier. Throws on invalid tier input.',
+    input: {
+      cwd: z.string().describe('Project root (absolute path). Required.'),
+      scope: z.enum(['project', 'global']).optional(),
+      memory_id: z.string().min(4).max(64).describe('Memory id.'),
+      tier: z.enum(['L0', 'L1', 'L2', 'L3']).describe('Target tier.'),
+      reason: z.string().max(500).optional().describe('Optional reason recorded in the audit log.'),
+    },
+  },
+  {
+    name: 'memory_promote',
+    desc: 'Promote a memory one tier up (L0→L1, L1→L2, L2→L3). No-op when already at L3 or when the memory is missing / soft-deleted. Returns {memory, transition}; transition is the audit row or null when no transition happened.',
+    input: {
+      cwd: z.string().describe('Project root (absolute path). Required.'),
+      scope: z.enum(['project', 'global']).optional(),
+      memory_id: z.string().min(4).max(64).describe('Memory id.'),
+      reason: z.string().max(500).optional(),
+    },
+  },
+  {
+    name: 'memory_demote',
+    desc: 'Demote a memory one tier down (L3→L2, L2→L1, L1→L0). No-op when already at L0.',
+    input: {
+      cwd: z.string().describe('Project root (absolute path). Required.'),
+      scope: z.enum(['project', 'global']).optional(),
+      memory_id: z.string().min(4).max(64).describe('Memory id.'),
+      reason: z.string().max(500).optional(),
+    },
+  },
+  {
+    name: 'memory_tier_history',
+    desc: 'Return the audit log of tier transitions for a memory, oldest-first. Returns an empty list when no transitions have happened yet.',
+    input: {
+      cwd: z.string().describe('Project root (absolute path). Required.'),
+      scope: z.enum(['project', 'global']).optional(),
+      memory_id: z.string().min(4).max(64).describe('Memory id.'),
+      limit: z.number().int().min(1).max(500).optional(),
+    },
+  },
+  // ----- v10 Wiki / LLM-Wiki -----
+  {
+    name: 'wiki_upsert_page',
+    desc: 'Create or update a wiki page by name (idempotent). The wiki_id is derived deterministically from (project_key, name) so re-saving the same name rewrites the body in place. `links` is optional; when omitted, links are extracted from `[[wiki-name]]` and `[text](wiki:name)` markers in the body and recorded as kind=mentions. Resolves the page id after the write.',
+    input: {
+      cwd: z.string().describe('Project root (absolute path). Required.'),
+      service_id: z.string().max(128).optional(),
+      team_id: z.string().max(128).optional(),
+      name: z.string().min(1).max(128).describe('Unique page name within the project.'),
+      body: z.string().max(200000).optional().describe('Markdown body.'),
+      summary: z.string().max(2000).optional().describe('Short summary.'),
+      links: z
+        .array(
+          z.object({
+            name: z.string().min(1).max(128),
+            kind: z.enum(['mentions', 'derived_from', 'contradicts', 'supersedes']).optional(),
+          }),
+        )
+        .max(500)
+        .optional()
+        .describe('Explicit outgoing edges. When omitted, links are parsed from the body.'),
+    },
+  },
+  {
+    name: 'wiki_get_page',
+    desc: 'Fetch a single wiki page by id or name. Returns null when neither matches.',
+    input: {
+      cwd: z.string().describe('Project root (absolute path). Required.'),
+      wiki_id: z.string().min(1).max(64).optional().describe('Wiki page id (preferred).'),
+      name: z.string().min(1).max(128).optional().describe('Wiki page name (fallback).'),
+    },
+  },
+  {
+    name: 'wiki_traverse',
+    desc: 'BFS walk of the wiki link graph starting from a seed page. Returns visited nodes (in BFS order) and the edges traversed. max_hops caps the depth (default 2). kinds filters which edge kinds are walked (default all).',
+    input: {
+      cwd: z.string().describe('Project root (absolute path). Required.'),
+      wiki_id: z.string().min(1).max(64).describe('Seed wiki page id.'),
+      max_hops: z.number().int().min(0).max(20).optional(),
+      kinds: z.array(z.enum(['mentions', 'derived_from', 'contradicts', 'supersedes'])).optional(),
+    },
+  },
+  {
+    name: 'wiki_backlinks',
+    desc: 'List every page that links to the given wiki_id (incoming edges). Optional kinds filter.',
+    input: {
+      cwd: z.string().describe('Project root (absolute path). Required.'),
+      wiki_id: z.string().min(1).max(64).describe('Target wiki page id.'),
+      kinds: z.array(z.enum(['mentions', 'derived_from', 'contradicts', 'supersedes'])).optional(),
+    },
+  },
+  {
+    name: 'wiki_resolve',
+    desc: 'Resolve a wiki name to its page record (wiki_id, name, summary, updated_at). Returns null when no page with that name exists. Used by extract-from-body to validate [[wiki-name]] references.',
+    input: {
+      cwd: z.string().describe('Project root (absolute path). Required.'),
+      name: z.string().min(1).max(128).describe('Page name to resolve.'),
+    },
+  },
+  // ----- v10 CodeGraph (Phase 5) -----
+  {
+    name: 'codegraph_extract',
+    desc: 'Walk a project directory and extract function/class/const symbols + import lines from every .js / .ts / .py file. Skips node_modules and dotdirs. Returns the file list; call codegraph_build_edges with apply=true to write call-graph edges into memory_edges.',
+    input: {
+      cwd: z.string().describe('Project root (absolute path). Required.'),
+      root: z.string().min(1).max(1024).optional().describe('Root to walk; defaults to cwd.'),
+      limit: z
+        .number()
+        .int()
+        .min(1)
+        .max(5000)
+        .optional()
+        .describe('Max files to visit. Default 200.'),
+    },
+  },
+  {
+    name: 'codegraph_build_edges',
+    desc: "Build memory_edges rows (kind='calls' default) between memories that mention the same symbol. apply=false is a dry run returning {inserted, candidates}; apply=true persists edges with metadata {file, lang, range}. Self-loops are dropped; pairs with only one matching memory are dropped too.",
+    input: {
+      cwd: z.string().describe('Project root (absolute path). Required.'),
+      files: z
+        .array(
+          z.object({
+            file: z.string().min(1).max(1024),
+            ext: z.string().min(1).max(16),
+            symbols: z.array(z.object({ name: z.string(), kind: z.string() })).optional(),
+            imports: z
+              .array(z.object({ module: z.string(), symbols: z.array(z.string()) }))
+              .optional(),
+          }),
+        )
+        .min(1)
+        .max(5000)
+        .describe('Output of codegraph_extract.'),
+      kind: z
+        .enum(['imports', 'calls', 'defines'])
+        .optional()
+        .describe('Edge kind. Default calls.'),
+      apply: z
+        .boolean()
+        .optional()
+        .describe('When true, persist the edges. Default false (dry run).'),
+    },
+  },
+  {
+    name: 'codegraph_query_symbol',
+    desc: 'BFS walk over the memory graph starting from a seed memory id. Returns {nodes:[{id, ...memory fields}]}. Honors `kind` (one of imports|calls|defines) and `max_depth` (default 5, capped at 20). max_depth=0 returns only the seed.',
+    input: {
+      cwd: z.string().describe('Project root (absolute path). Required.'),
+      memory_id: z.string().min(4).max(64).describe('Seed memory id.'),
+      kind: z.enum(['imports', 'calls', 'defines']).optional(),
+      max_depth: z.number().int().min(0).max(20).optional().describe('BFS depth cap. Default 5.'),
+    },
+  },
+  {
+    name: 'codegraph_impact_path',
+    desc: 'Shortest path (BFS) from one memory id to another via codegraph edges. Returns {path:[id,id,...], hops} or {path:[], hops:-1} when no path exists.',
+    input: {
+      cwd: z.string().describe('Project root (absolute path). Required.'),
+      from_id: z.string().min(4).max(64).describe('Source memory id.'),
+      to_id: z.string().min(4).max(64).describe('Target memory id.'),
+      max_hops: z.number().int().min(1).max(20).optional().describe('BFS depth cap. Default 6.'),
+      kind: z.enum(['imports', 'calls', 'defines']).optional(),
+    },
+  },
+  {
+    name: 'codegraph_callers',
+    desc: 'Direct callers (predecessors) of a memory id along codegraph edges. kind filter optional; default all codegraph kinds.',
+    input: {
+      cwd: z.string().describe('Project root (absolute path). Required.'),
+      memory_id: z.string().min(4).max(64).describe('Target memory id.'),
+      kind: z.enum(['imports', 'calls', 'defines']).optional(),
+      depth: z.number().int().min(1).max(20).optional().describe('BFS depth. Default 1.'),
+    },
+  },
+  {
+    name: 'codegraph_callees',
+    desc: 'Direct callees (successors) of a memory id along codegraph edges. kind filter optional; default all codegraph kinds.',
+    input: {
+      cwd: z.string().describe('Project root (absolute path). Required.'),
+      memory_id: z.string().min(4).max(64).describe('Source memory id.'),
+      kind: z.enum(['imports', 'calls', 'defines']).optional(),
+      depth: z.number().int().min(1).max(20).optional().describe('BFS depth. Default 1.'),
+    },
+  },
 ];
 
 // Best-effort, bounded merge. Sorts each scope independently by the
@@ -591,7 +972,11 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
       }
     });
 
-  const server = new McpServer({ name: 'kimi-memory', version: '0.4.0' });
+  // Server version must mirror kimi.plugin.json / package.json / package-lock.json.
+  // Bump together with the manifest; tests/06-manifest.test.js asserts the manifest
+  // and package-lock equality, but the MCP `initialize` response is what Kimi logs
+  // at plugin load — drift there confuses users about the running version.
+  const server = new McpServer({ name: 'kimi-memory', version: '0.5.0' });
 
   // Resolve the database handle and key for a given scope. `cwd` is
   // required for `project` and `all`; for `global` it is audit context
@@ -671,6 +1056,17 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
         expires_at: exp.value,
         supersede: !!args.supersede,
         synthesizes: Array.isArray(args.synthesizes) ? args.synthesizes : undefined,
+        // v10 ACL fields. visibility is validated by saveMemory; the
+        // other fields are pass-through. shared_with may come from the
+        // agent or be left undefined (in which case saveMemory defaults
+        // it to []).
+        visibility: args.visibility || 'private',
+        shared_with: Array.isArray(args.shared_with) ? args.shared_with : undefined,
+        team_id: args.team_id || null,
+        agent_id: args.agent_id || null,
+        user_id: args.user_id || null,
+        session_id: args.session_id || null,
+        task_id: args.task_id || null,
       });
       return ok({
         operation: 'saved',
@@ -705,6 +1101,39 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
           ? openScopeDb({ cwd: pr.value, scope: 'global' })
           : null;
       const opts = { type: t.value, limit: lim.value };
+      // v10: pass visibility filter through to searchMemories so the
+      // FTS and vector channels both honour it. Accept either a single
+      // string ('team') or an array (['private','team']). null/undefined
+      // means no filter (preserves the pre-v10 recall surface).
+      if (typeof args.visibility === 'string') {
+        opts.visibility = args.visibility;
+      } else if (Array.isArray(args.visibility)) {
+        opts.visibility = args.visibility;
+      }
+      // v10 fusion strategy. Default rrf; 'weighted' preserves the
+      // pre-v10 0.5/0.5 blend. rrf_k is forwarded verbatim.
+      if (args.fusion === 'weighted' || args.fusion === 'rrf') {
+        opts.fusion = args.fusion;
+      }
+      if (Number.isFinite(args.rrf_k) && args.rrf_k > 0) {
+        opts.rrfK = args.rrf_k;
+      }
+      // v10 tier filter (single string or array). tier_budgets caps
+      // each tier independently after the standard selection.
+      if (typeof args.tier === 'string') {
+        opts.tier = args.tier;
+      } else if (Array.isArray(args.tier)) {
+        opts.tier = args.tier;
+      }
+      if (args.tier_budgets && typeof args.tier_budgets === 'object') {
+        opts.tierBudgets = args.tier_budgets;
+      }
+      if (Number.isFinite(args.max_chars_per_memory) && args.max_chars_per_memory > 0) {
+        opts.maxCharsPerMemory = args.max_chars_per_memory;
+      }
+      if (Number.isFinite(args.max_total_recall_chars) && args.max_total_recall_chars > 0) {
+        opts.maxTotalRecallChars = args.max_total_recall_chars;
+      }
       const projectItems = projectHandle
         ? await searchMemories(projectHandle.db, projectHandle.projectKey, args.query, opts)
         : [];
@@ -910,6 +1339,21 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
         if (!e2.ok) return textError(e2.error);
         merged.expires_at = e2.value;
       }
+      // v10 ACL fields. Omitted fields are not changed; passing
+      // undefined leaves the column at its existing value (saveMemory's
+      // COALESCE behavior preserves the row).
+      if (args.visibility !== undefined) merged.visibility = args.visibility;
+      if (args.shared_with !== undefined) {
+        if (!Array.isArray(args.shared_with)) {
+          return textError('shared_with must be an array of strings');
+        }
+        merged.shared_with = args.shared_with;
+      }
+      if (args.team_id !== undefined) merged.team_id = args.team_id;
+      if (args.agent_id !== undefined) merged.agent_id = args.agent_id;
+      if (args.user_id !== undefined) merged.user_id = args.user_id;
+      if (args.session_id !== undefined) merged.session_id = args.session_id;
+      if (args.task_id !== undefined) merged.task_id = args.task_id;
       const mem = saveMemory(target.db, target.projectKey, merged);
       return ok({
         operation: 'updated',
@@ -1216,6 +1660,15 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
           expires_at: exp.value,
           supersede: !!item.supersede,
           synthesizes: Array.isArray(item.synthesizes) ? item.synthesizes : undefined,
+          // v10 ACL fields. visibility defaults to 'private' inside
+          // saveMemory; shared_with is pass-through.
+          visibility: item.visibility || 'private',
+          shared_with: Array.isArray(item.shared_with) ? item.shared_with : undefined,
+          team_id: item.team_id || null,
+          agent_id: item.agent_id || null,
+          user_id: item.user_id || null,
+          session_id: item.session_id || null,
+          task_id: item.task_id || null,
         });
       }
       if (errors.length > 0) {
@@ -1655,6 +2108,582 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
         note:
           'per-project rows deleted. The global database and every other project DB were not touched. ' +
           'first_seen_at was reset to now, so the re-clone warning will not fire again until a new incarnation is recorded.',
+      });
+    } catch (e) {
+      return textError(toError(e).error);
+    }
+  });
+
+  // ---- v10 ACL / visibility ----
+
+  // acl_grant: insert a grant into memories_acl. Idempotent.
+  server.tool(TOOL_DEFS[26].name, TOOL_DEFS[26].input, async (args) => {
+    try {
+      const pr = resolveProjectRoot(args.cwd);
+      if (!pr.ok) return textError(pr.error);
+      const sc = validateScope(args.scope, { read: false });
+      if (!sc.ok) return textError(sc.error);
+      const memId = validateId(args.memory_id);
+      if (!memId.ok) return textError(memId.error);
+      let kind;
+      try {
+        kind = validatePrincipalKind(args.principal_kind);
+      } catch (e) {
+        return textError(e.message);
+      }
+      const target = openScopeDbForWrite({ cwd: pr.value, scope: sc.value });
+      const row = grantMemoryAcl(
+        target.db,
+        target.projectKey,
+        memId.value,
+        kind,
+        args.principal_id,
+      );
+      return ok({
+        operation: 'acl_granted',
+        scope: sc.value,
+        grant: row,
+        project_key: target.projectKey,
+      });
+    } catch (e) {
+      return textError(toError(e).error);
+    }
+  });
+
+  // acl_revoke: delete a grant from memories_acl.
+  server.tool(TOOL_DEFS[27].name, TOOL_DEFS[27].input, async (args) => {
+    try {
+      const pr = resolveProjectRoot(args.cwd);
+      if (!pr.ok) return textError(pr.error);
+      const sc = validateScope(args.scope, { read: false });
+      if (!sc.ok) return textError(sc.error);
+      const memId = validateId(args.memory_id);
+      if (!memId.ok) return textError(memId.error);
+      let kind;
+      try {
+        kind = validatePrincipalKind(args.principal_kind);
+      } catch (e) {
+        return textError(e.message);
+      }
+      const target = openScopeDbForWrite({ cwd: pr.value, scope: sc.value });
+      const removed = revokeMemoryAcl(
+        target.db,
+        target.projectKey,
+        memId.value,
+        kind,
+        args.principal_id,
+      );
+      return ok({
+        operation: 'acl_revoked',
+        scope: sc.value,
+        memory_id: memId.value,
+        principal_kind: kind,
+        principal_id: args.principal_id,
+        removed,
+        project_key: target.projectKey,
+      });
+    } catch (e) {
+      return textError(toError(e).error);
+    }
+  });
+
+  // acl_list: enumerate grants for a memory.
+  server.tool(TOOL_DEFS[28].name, TOOL_DEFS[28].input, async (args) => {
+    try {
+      const pr = resolveProjectRoot(args.cwd);
+      if (!pr.ok) return textError(pr.error);
+      const sc = validateScope(args.scope, { read: true });
+      if (!sc.ok) return textError(sc.error);
+      const memId = validateId(args.memory_id);
+      if (!memId.ok) return textError(memId.error);
+      const target = openScopeDb({ cwd: pr.value, scope: sc.value });
+      const items = listMemoryAcls(target.db, target.projectKey, memId.value);
+      return ok({
+        operation: 'acl_list',
+        scope: sc.value,
+        memory_id: memId.value,
+        items,
+        count: items.length,
+        project_key: target.projectKey,
+      });
+    } catch (e) {
+      return textError(toError(e).error);
+    }
+  });
+
+  // acl_share_memory: promote memories to a new visibility level. May
+  // also move rows into the cross-project _shared DB when to_shared_pool
+  // is set. The shared DB lives at <kimiHome>/kimi-memory/_shared/.
+  server.tool(TOOL_DEFS[29].name, TOOL_DEFS[29].input, async (args) => {
+    try {
+      const pr = resolveProjectRoot(args.cwd);
+      if (!pr.ok) return textError(pr.error);
+      const sc = validateScope(args.scope, { read: false });
+      if (!sc.ok) return textError(sc.error);
+      if (!Array.isArray(args.memory_ids) || args.memory_ids.length === 0) {
+        return textError('memory_ids must be a non-empty array');
+      }
+      if (args.memory_ids.length > 500) {
+        return textError('memory_ids must contain at most 500 entries');
+      }
+      let sharedWith = [];
+      try {
+        sharedWith = validateSharedWith(args.shared_with);
+      } catch (e) {
+        return textError(e.message);
+      }
+      const target = openScopeDbForWrite({ cwd: pr.value, scope: sc.value });
+      const result = shareMemory(target.db, target.projectKey, args.memory_ids, {
+        visibility: args.visibility,
+        sharedWith,
+        toSharedPool: !!args.to_shared_pool,
+        kimiHomeDir: home,
+      });
+      return ok({
+        operation: 'acl_shared',
+        scope: sc.value,
+        visibility: args.visibility,
+        shared_with: sharedWith,
+        to_shared_pool: !!args.to_shared_pool,
+        moved: result.moved,
+        updated: result.updated,
+        target_shared_db_path: args.to_shared_pool ? sharedDbPath(home) : null,
+        project_key: target.projectKey,
+      });
+    } catch (e) {
+      return textError(toError(e).error);
+    }
+  });
+
+  // acl_resolve_principal: parse a "kind:id" descriptor into parts.
+  // Pure / read-only — does not touch the DB. Useful for validating a
+  // shared_with entry before saving.
+  server.tool(TOOL_DEFS[30].name, TOOL_DEFS[30].input, async (args) => {
+    try {
+      const pr = resolveProjectRoot(args.cwd);
+      if (!pr.ok) return textError(pr.error);
+      if (!args.descriptor) return textError('descriptor is required');
+      const parsed = parsePrincipalDescriptor(args.descriptor);
+      return ok({
+        operation: 'acl_resolve_principal',
+        descriptor: args.descriptor,
+        kind: parsed ? parsed.kind : null,
+        id: parsed ? parsed.id : null,
+        valid: !!parsed,
+      });
+    } catch (e) {
+      return textError(toError(e).error);
+    }
+  });
+
+  // ---- v10 tier / persona ----
+
+  // memory_set_tier: explicit move to a target tier; writes audit row.
+  server.tool(TOOL_DEFS[31].name, TOOL_DEFS[31].input, async (args) => {
+    try {
+      const pr = resolveProjectRoot(args.cwd);
+      if (!pr.ok) return textError(pr.error);
+      const sc = validateScope(args.scope, { read: false });
+      if (!sc.ok) return textError(sc.error);
+      const memId = validateId(args.memory_id);
+      if (!memId.ok) return textError(memId.error);
+      const target = openScopeDbForWrite({ cwd: pr.value, scope: sc.value });
+      const result = setMemoryTier(target.db, target.projectKey, memId.value, args.tier, {
+        reason: args.reason || null,
+      });
+      if (!result.memory) return textError(`memory not found in ${sc.value}: ${memId.value}`);
+      return ok({
+        operation: 'set_tier',
+        scope: sc.value,
+        memory: result.memory,
+        transition: result.transition,
+        project_key: target.projectKey,
+      });
+    } catch (e) {
+      return textError(toError(e).error);
+    }
+  });
+
+  // memory_promote: tier up by one.
+  server.tool(TOOL_DEFS[32].name, TOOL_DEFS[32].input, async (args) => {
+    try {
+      const pr = resolveProjectRoot(args.cwd);
+      if (!pr.ok) return textError(pr.error);
+      const sc = validateScope(args.scope, { read: false });
+      if (!sc.ok) return textError(sc.error);
+      const memId = validateId(args.memory_id);
+      if (!memId.ok) return textError(memId.error);
+      const target = openScopeDbForWrite({ cwd: pr.value, scope: sc.value });
+      const result = promoteMemory(target.db, target.projectKey, memId.value, {
+        reason: args.reason || null,
+      });
+      if (!result.memory) return textError(`memory not found in ${sc.value}: ${memId.value}`);
+      return ok({
+        operation: 'promote',
+        scope: sc.value,
+        memory: result.memory,
+        transition: result.transition,
+        project_key: target.projectKey,
+      });
+    } catch (e) {
+      return textError(toError(e).error);
+    }
+  });
+
+  // memory_demote: tier down by one.
+  server.tool(TOOL_DEFS[33].name, TOOL_DEFS[33].input, async (args) => {
+    try {
+      const pr = resolveProjectRoot(args.cwd);
+      if (!pr.ok) return textError(pr.error);
+      const sc = validateScope(args.scope, { read: false });
+      if (!sc.ok) return textError(sc.error);
+      const memId = validateId(args.memory_id);
+      if (!memId.ok) return textError(memId.error);
+      const target = openScopeDbForWrite({ cwd: pr.value, scope: sc.value });
+      const result = demoteMemory(target.db, target.projectKey, memId.value, {
+        reason: args.reason || null,
+      });
+      if (!result.memory) return textError(`memory not found in ${sc.value}: ${memId.value}`);
+      return ok({
+        operation: 'demote',
+        scope: sc.value,
+        memory: result.memory,
+        transition: result.transition,
+        project_key: target.projectKey,
+      });
+    } catch (e) {
+      return textError(toError(e).error);
+    }
+  });
+
+  // memory_tier_history: audit log of tier transitions for a memory.
+  server.tool(TOOL_DEFS[34].name, TOOL_DEFS[34].input, async (args) => {
+    try {
+      const pr = resolveProjectRoot(args.cwd);
+      if (!pr.ok) return textError(pr.error);
+      const sc = validateScope(args.scope, { read: true });
+      if (!sc.ok) return textError(sc.error);
+      const memId = validateId(args.memory_id);
+      if (!memId.ok) return textError(memId.error);
+      const lim = validateLimit(args.limit, 1, 500, 200);
+      if (!lim.ok) return textError(lim.error);
+      const target = openScopeDb({ cwd: pr.value, scope: sc.value });
+      const items = listTierHistory(target.db, target.projectKey, memId.value, {
+        limit: lim.value,
+      });
+      return ok({
+        operation: 'tier_history',
+        scope: sc.value,
+        memory_id: memId.value,
+        items,
+        count: items.length,
+        project_key: target.projectKey,
+      });
+    } catch (e) {
+      return textError(toError(e).error);
+    }
+  });
+
+  // ---- v10 Wiki / LLM-Wiki ----
+
+  // wiki_upsert_page: create or update a page by name.
+  server.tool(TOOL_DEFS[35].name, TOOL_DEFS[35].input, async (args) => {
+    try {
+      const pr = resolveProjectRoot(args.cwd);
+      if (!pr.ok) return textError(pr.error);
+      const target = openScopeDbForWrite({ cwd: pr.value, scope: 'project' });
+      const result = upsertWikiPage(target.db, target.projectKey, {
+        service_id: args.service_id || '',
+        team_id: args.team_id || '',
+        name: args.name,
+        body: args.body || '',
+        summary: args.summary || '',
+        links: Array.isArray(args.links) ? args.links : null,
+      });
+      return ok({
+        operation: 'wiki_upsert_page',
+        wiki_id: result.wiki_id,
+        name: result.name,
+        summary: result.summary,
+        updated_at: result.updated_at,
+        links: result.links,
+        project_key: target.projectKey,
+      });
+    } catch (e) {
+      return textError(toError(e).error);
+    }
+  });
+
+  // wiki_get_page: by id (preferred) or name.
+  server.tool(TOOL_DEFS[36].name, TOOL_DEFS[36].input, async (args) => {
+    try {
+      const pr = resolveProjectRoot(args.cwd);
+      if (!pr.ok) return textError(pr.error);
+      const target = openScopeDb({ cwd: pr.value, scope: 'project' });
+      const page = getWikiPage(target.db, target.projectKey, {
+        wikiId: args.wiki_id || null,
+        name: args.name || null,
+      });
+      if (!page) return textError('wiki page not found');
+      return ok({
+        operation: 'wiki_get_page',
+        page,
+        project_key: target.projectKey,
+      });
+    } catch (e) {
+      return textError(toError(e).error);
+    }
+  });
+
+  // wiki_traverse: BFS walk from a seed.
+  server.tool(TOOL_DEFS[37].name, TOOL_DEFS[37].input, async (args) => {
+    try {
+      const pr = resolveProjectRoot(args.cwd);
+      if (!pr.ok) return textError(pr.error);
+      const lim = validateLimit(args.max_hops, 0, 20, 2);
+      if (!lim.ok) return textError(lim.error);
+      const target = openScopeDb({ cwd: pr.value, scope: 'project' });
+      const out = traverseWiki(target.db, target.projectKey, args.wiki_id, {
+        max_hops: lim.value,
+        kinds: Array.isArray(args.kinds) ? args.kinds : null,
+      });
+      return ok({
+        operation: 'wiki_traverse',
+        wiki_id: args.wiki_id,
+        max_hops: lim.value,
+        nodes: out.nodes,
+        edges: out.edges,
+        project_key: target.projectKey,
+      });
+    } catch (e) {
+      return textError(toError(e).error);
+    }
+  });
+
+  // wiki_backlinks: incoming edges to a page.
+  server.tool(TOOL_DEFS[38].name, TOOL_DEFS[38].input, async (args) => {
+    try {
+      const pr = resolveProjectRoot(args.cwd);
+      if (!pr.ok) return textError(pr.error);
+      const target = openScopeDb({ cwd: pr.value, scope: 'project' });
+      const items = backlinksWiki(target.db, target.projectKey, args.wiki_id, {
+        kinds: Array.isArray(args.kinds) ? args.kinds : null,
+      });
+      return ok({
+        operation: 'wiki_backlinks',
+        wiki_id: args.wiki_id,
+        items,
+        count: items.length,
+        project_key: target.projectKey,
+      });
+    } catch (e) {
+      return textError(toError(e).error);
+    }
+  });
+
+  // wiki_resolve: name → page record.
+  server.tool(TOOL_DEFS[39].name, TOOL_DEFS[39].input, async (args) => {
+    try {
+      const pr = resolveProjectRoot(args.cwd);
+      if (!pr.ok) return textError(pr.error);
+      const target = openScopeDb({ cwd: pr.value, scope: 'project' });
+      const page = resolveWikiPage(target.db, target.projectKey, args.name);
+      return ok({
+        operation: 'wiki_resolve',
+        name: args.name,
+        page,
+        found: !!page,
+        project_key: target.projectKey,
+      });
+    } catch (e) {
+      return textError(toError(e).error);
+    }
+  });
+
+  // ---- v10 CodeGraph ----
+
+  // codegraph_extract: walk a directory and emit per-file symbol lists.
+  server.tool(TOOL_DEFS[40].name, TOOL_DEFS[40].input, async (args) => {
+    try {
+      const pr = resolveProjectRoot(args.cwd);
+      if (!pr.ok) return textError(pr.error);
+      const rawRoot = args.root && args.root.length > 0 ? args.root : pr.value;
+      // Refuse roots that escape the project boundary — otherwise a
+      // prompt-injection attack via a recalled memory could walk
+      // arbitrary directories. (Audit finding H1 / B1-2.)
+      const root = path.resolve(rawRoot);
+      const projectRoot = path.resolve(pr.value);
+      if (root !== projectRoot && !root.startsWith(projectRoot + path.sep)) {
+        return textError(
+          `codegraph_extract root must be within the project directory (${projectRoot}); got ${root}`,
+        );
+      }
+      const lim = validateLimit(args.limit, 1, 5000, 200);
+      if (!lim.ok) return textError(lim.error);
+      const files = await extractCodeGraph(root, { limit: lim.value });
+      return ok({
+        operation: 'codegraph_extract',
+        root,
+        files,
+        count: files.length,
+      });
+    } catch (e) {
+      return textError(toError(e).error);
+    }
+  });
+
+  // codegraph_build_edges: form call-graph edges between memories.
+  server.tool(TOOL_DEFS[41].name, TOOL_DEFS[41].input, async (args) => {
+    try {
+      const pr = resolveProjectRoot(args.cwd);
+      if (!pr.ok) return textError(pr.error);
+      const target = openScopeDbForWrite({ cwd: pr.value, scope: 'project' });
+      const result = buildCodeGraphEdges(
+        target.db,
+        target.projectKey,
+        Array.isArray(args.files) ? args.files : [],
+        { apply: !!args.apply, kind: args.kind || 'calls' },
+      );
+      return ok({
+        operation: 'codegraph_build_edges',
+        kind: args.kind || 'calls',
+        apply: !!args.apply,
+        inserted: result.inserted,
+        candidates: result.candidates,
+        project_key: target.projectKey,
+      });
+    } catch (e) {
+      return textError(toError(e).error);
+    }
+  });
+
+  // codegraph_query_symbol: BFS from a seed.
+  server.tool(TOOL_DEFS[42].name, TOOL_DEFS[42].input, async (args) => {
+    try {
+      const pr = resolveProjectRoot(args.cwd);
+      if (!pr.ok) return textError(pr.error);
+      const lim = validateLimit(args.max_depth, 0, 20, 5);
+      if (!lim.ok) return textError(lim.error);
+      const memId = validateId(args.memory_id);
+      if (!memId.ok) return textError(memId.error);
+      const target = openScopeDb({ cwd: pr.value, scope: 'project' });
+      const out = queryMemoryGraph(target.db, target.projectKey, memId.value, {
+        kind: args.kind || null,
+        max_depth: lim.value,
+      });
+      return ok({
+        operation: 'codegraph_query_symbol',
+        memory_id: memId.value,
+        kind: args.kind || null,
+        max_depth: lim.value,
+        nodes: out.nodes,
+        project_key: target.projectKey,
+      });
+    } catch (e) {
+      return textError(toError(e).error);
+    }
+  });
+
+  // codegraph_impact_path: BFS shortest path.
+  function bfsPath(db, projectKey, fromId, toId, maxHops, kind) {
+    if (fromId === toId) return { path: [fromId], hops: 0 };
+    const kindList = kind ? [kind] : ['imports', 'calls', 'defines'];
+    const placeholders = kindList.map(() => '?').join(',');
+    const queue = [[fromId]];
+    const visited = new Set([fromId]);
+    while (queue.length > 0) {
+      const path = queue.shift();
+      if (path.length > maxHops + 1) continue;
+      const head = path[path.length - 1];
+      const edges = db
+        .prepare(
+          `SELECT from_id, to_id FROM memory_edges
+           WHERE project_key = ? AND (from_id = ? OR to_id = ?)
+             AND kind IN (${placeholders})`,
+        )
+        .all(projectKey, head, head, ...kindList);
+      for (const e of edges) {
+        const next = e.from_id === head ? e.to_id : e.from_id;
+        if (visited.has(next)) continue;
+        const newPath = [...path, next];
+        if (next === toId) return { path: newPath, hops: newPath.length - 1 };
+        visited.add(next);
+        queue.push(newPath);
+      }
+    }
+    return { path: [], hops: -1 };
+  }
+
+  server.tool(TOOL_DEFS[43].name, TOOL_DEFS[43].input, async (args) => {
+    try {
+      const pr = resolveProjectRoot(args.cwd);
+      if (!pr.ok) return textError(pr.error);
+      const fromId = validateId(args.from_id);
+      if (!fromId.ok) return textError(fromId.error);
+      const toId = validateId(args.to_id);
+      if (!toId.ok) return textError(toId.error);
+      const lim = validateLimit(args.max_hops, 1, 20, 6);
+      if (!lim.ok) return textError(lim.error);
+      const target = openScopeDb({ cwd: pr.value, scope: 'project' });
+      const out = bfsPath(
+        target.db,
+        target.projectKey,
+        fromId.value,
+        toId.value,
+        lim.value,
+        args.kind || null,
+      );
+      return ok({
+        operation: 'codegraph_impact_path',
+        from_id: fromId.value,
+        to_id: toId.value,
+        path: out.path,
+        hops: out.hops,
+        project_key: target.projectKey,
+      });
+    } catch (e) {
+      return textError(toError(e).error);
+    }
+  });
+
+  server.tool(TOOL_DEFS[44].name, TOOL_DEFS[44].input, async (args) => {
+    try {
+      const pr = resolveProjectRoot(args.cwd);
+      if (!pr.ok) return textError(pr.error);
+      const memId = validateId(args.memory_id);
+      if (!memId.ok) return textError(memId.error);
+      const target = openScopeDb({ cwd: pr.value, scope: 'project' });
+      const out = queryMemoryGraph(target.db, target.projectKey, memId.value, {
+        kind: args.kind || null,
+        max_depth: Math.max(1, Math.min(20, args.depth || 1)),
+      });
+      return ok({
+        operation: 'codegraph_callers',
+        memory_id: memId.value,
+        nodes: out.nodes,
+        project_key: target.projectKey,
+      });
+    } catch (e) {
+      return textError(toError(e).error);
+    }
+  });
+
+  server.tool(TOOL_DEFS[45].name, TOOL_DEFS[45].input, async (args) => {
+    try {
+      const pr = resolveProjectRoot(args.cwd);
+      if (!pr.ok) return textError(pr.error);
+      const memId = validateId(args.memory_id);
+      if (!memId.ok) return textError(memId.error);
+      const target = openScopeDb({ cwd: pr.value, scope: 'project' });
+      const out = queryMemoryGraph(target.db, target.projectKey, memId.value, {
+        kind: args.kind || null,
+        max_depth: Math.max(1, Math.min(20, args.depth || 1)),
+      });
+      return ok({
+        operation: 'codegraph_callees',
+        memory_id: memId.value,
+        nodes: out.nodes,
+        project_key: target.projectKey,
       });
     } catch (e) {
       return textError(toError(e).error);

@@ -18,6 +18,7 @@ plans/
 todo/
 TODO.md
 ROADMAP.md
+.audit/
 
 # Editor / OS scratch files
 *.bak

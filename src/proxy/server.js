@@ -1,0 +1,333 @@
+// Memory Proxy — HTTP transport adapter for external agent frameworks
+// (Claude Code, CodeBuddy, …). Ported from TencentDB-Agent-Memory's
+// `MemoryProxy/` module (the third container in their deploy stack).
+//
+// The proxy is a thin Node `http` server that translates inbound
+// POSTs into the same TOOL_DEFS handlers the stdio MCP server uses.
+// Every call ultimately routes through the existing server.js logic,
+// so the proxy inherits the same schema, validation, and error shape
+// as the in-process server.
+//
+// Auth: `KIMI_MEMORY_PROXY_TOKEN` env var. When set, every request
+// must carry `Authorization: Bearer <token>`. When unset, the proxy
+// refuses to start unless `KIMI_MEMORY_PROXY_AUTH=off` (intended for
+// dev only — see `proxyAuthBypass()`).
+//
+// Endpoint surface (kept minimal — the proxy is a transport, not a
+// re-implementation of the tool surface):
+//   POST /tools/<tool_name>     → call the named tool with JSON body
+//   GET  /tools                  → list the tool names the proxy can call
+//   GET  /healthz                 → liveness probe (always 200)
+//   POST /shutdown (auth required) → graceful shutdown
+//
+// The proxy is bound to the loopback interface by default. Pass
+// `--host 0.0.0.0` to expose it on the network — strongly discouraged
+// outside of a trusted LAN.
+
+import http from 'node:http';
+import { URL } from 'node:url';
+import crypto from 'node:crypto';
+import { makeServer } from '../server.js';
+import { kimiHome } from '../util.js';
+import { closeDb, flushEmbeddings } from '../persist.js';
+
+/**
+ * Build the tool-name → handler map by walking the MCP server's
+ * internal `_handlers` table. We can't directly enumerate
+ * `TOOL_DEFS` from outside `server.js` without exposing it, so we
+ * pre-register every public tool by calling makeServer() and then
+ * iterating the McpServer's internal handler list via a small probe.
+ *
+ * The pragmatic approach: every call hits the proxy with a known
+ * tool name; we forward by spinning up the real handler via the
+ * `makeServer()._deps` interface. The MCP server exposes a
+ * `server.tool(...)` registration API but no enumeration API; the
+ * simplest cross-version path is to forward via the JSON-RPC
+ * dispatcher that the McpServer wires up internally. To keep this
+ * file self-contained and not depend on internals, the proxy keeps
+ * its own name→spec table derived from TOOL_DEFS at startup.
+ */
+export async function startProxy({
+  host = '127.0.0.1',
+  port = 7331,
+  kimiHomeDir,
+  pluginRootDir,
+  authToken = null,
+  logger = null,
+} = {}) {
+  const log =
+    logger || ((...a) => process.stderr.write('[kimi-memory proxy] ' + a.join(' ') + '\n'));
+  const token = authToken != null ? authToken : process.env.KIMI_MEMORY_PROXY_TOKEN || null;
+  const bypass = process.env.KIMI_MEMORY_PROXY_AUTH === 'off';
+
+  // Refuse the dangerous combo: auth bypass on a non-loopback bind
+  // exposes the entire MCP surface (read + write) to the network with
+  // no authentication. The CLI flag --no-auth + --host 0.0.0.0 would
+  // otherwise be a one-keystroke data-leak path.
+  if (bypass && host !== '127.0.0.1' && host !== '::1' && host !== 'localhost') {
+    const msg = `kimi-memory proxy: refusing to start — KIMI_MEMORY_PROXY_AUTH=off with host=${host} would expose unauthenticated access. Use a loopback host or set KIMI_MEMORY_PROXY_TOKEN.`;
+    log(msg);
+    throw new Error(msg);
+  }
+
+  const mcp = makeServer({
+    kimiHomeDir: kimiHomeDir || kimiHome(),
+    pluginRootDir: pluginRootDir || process.cwd(),
+    logger: log,
+  });
+
+  // Lightweight request counter / lifecycle state.
+  const state = {
+    startedAt: new Date().toISOString(),
+    requests: 0,
+    lastRequestAt: null,
+    authEnabled: !!token && !bypass,
+    host,
+    port,
+  };
+
+  function authenticate(req) {
+    if (bypass) return { ok: true, bypass: true };
+    if (!token) {
+      return { ok: false, error: 'proxy auth token not configured (set KIMI_MEMORY_PROXY_TOKEN)' };
+    }
+    const auth = req.headers['authorization'] || '';
+    if (typeof auth !== 'string' || !auth.startsWith('Bearer ')) {
+      return { ok: false, error: 'missing Authorization: Bearer <token>' };
+    }
+    const presented = auth.slice('Bearer '.length).trim();
+    // Constant-time comparison so an attacker on the same loopback
+    // cannot recover the token byte-by-byte from response timing. The
+    // length check is intentionally first because timingSafeEqual
+    // throws when buffer lengths differ.
+    const a = Buffer.from(presented, 'utf8');
+    const b = Buffer.from(token, 'utf8');
+    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+      return { ok: false, error: 'invalid bearer token' };
+    }
+    return { ok: true };
+  }
+
+  async function readJson(req, limit = 1024 * 1024) {
+    return new Promise((resolve, reject) => {
+      const chunks = [];
+      let total = 0;
+      let aborted = false;
+      const finish = (err) => {
+        if (aborted) return;
+        aborted = true;
+        if (err) return reject(err);
+        try {
+          const body = Buffer.concat(chunks).toString('utf8');
+          resolve(body.length === 0 ? {} : JSON.parse(body));
+        } catch (e) {
+          reject(e);
+        }
+      };
+      req.on('data', (c) => {
+        if (aborted) return;
+        total += c.length;
+        if (total > limit) {
+          chunks.length = 0;
+          finish(new Error(`request body too large (>${limit} bytes)`));
+          return;
+        }
+        chunks.push(c);
+      });
+      req.on('end', () => finish(null));
+      req.on('error', finish);
+    });
+  }
+
+  async function dispatchTool(toolName, args) {
+    // The MCP McpServer exposes `server._registeredTools` (private)
+    // in some SDK versions; we fall back to invoking the named
+    // tool via the server's tool registry. For an external proxy the
+    // shape that matters is the wire response: we want the same
+    // `{ content: [{type:'text', text: JSON.stringify(payload)}] }`
+    // envelope the stdio MCP server emits.
+    //
+    // McpServer doesn't expose a public "call by name" API; the
+    // closest surface is the internal `_registeredTools` map. We use
+    // it as an implementation detail of this version of the SDK and
+    // fall back to a 501 if the shape ever drifts.
+    const srv = mcp.server;
+    const registry = srv && (srv._registeredTools || srv._tools);
+    if (!registry) {
+      throw new Error('MCP server registry not accessible in this SDK version');
+    }
+    const entry = registry.get(toolName) || registry[toolName];
+    if (!entry) {
+      const err = new Error(`unknown tool: ${toolName}`);
+      err.code = 'unknown_tool';
+      throw err;
+    }
+    const handler = entry.handler || entry.callback || entry.fn;
+    if (typeof handler !== 'function') {
+      throw new Error(`tool ${toolName} has no callable handler`);
+    }
+    return await handler(args || {}, {
+      // Minimal signal-bearing second arg — the stdio transport
+      // doesn't pass one but the tool handlers tolerate undefined.
+      signal: new AbortController().signal,
+      sendNotification: () => {},
+      sendRequest: () => Promise.resolve({}),
+      _meta: { proxy: true },
+    });
+  }
+
+  const server = http.createServer(async (req, res) => {
+    state.requests += 1;
+    state.lastRequestAt = new Date().toISOString();
+    let url;
+    try {
+      url = new URL(req.url, `http://${req.headers.host || host}`);
+    } catch (e) {
+      res.writeHead(400, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: 'invalid request URL' }));
+      return;
+    }
+    const path = url.pathname.replace(/\/+$/, '') || '/';
+
+    // CORS-lite: allow the agent browser to call from any origin;
+    // responses are JSON. The auth check still applies on the actual
+    // tool endpoints.
+    res.setHeader('access-control-allow-origin', '*');
+    res.setHeader('access-control-allow-methods', 'GET, POST, OPTIONS');
+    res.setHeader('access-control-allow-headers', 'authorization, content-type');
+    if (req.method === 'OPTIONS') {
+      res.writeHead(204);
+      res.end();
+      return;
+    }
+
+    // Liveness — open to anyone (no auth) so a k8s probe can hit it.
+    if (path === '/healthz') {
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ ok: true, startedAt: state.startedAt, requests: state.requests }));
+      return;
+    }
+
+    // Auth gate for everything else.
+    if (path !== '/tools') {
+      const auth = authenticate(req);
+      if (!auth.ok) {
+        res.writeHead(401, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: auth.error }));
+        return;
+      }
+    }
+
+    if (path === '/tools' && req.method === 'GET') {
+      // List the tool names the proxy can call. The McpServer does
+      // not expose this directly; we walk the registry.
+      try {
+        const registry = mcp.server && (mcp.server._registeredTools || mcp.server._tools);
+        const names = registry
+          ? [...(registry.keys ? registry.keys() : Object.keys(registry))]
+          : [];
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ tools: names, count: names.length }));
+      } catch (e) {
+        res.writeHead(500, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: e.message }));
+      }
+      return;
+    }
+
+    if (path === '/shutdown' && req.method === 'POST') {
+      log('shutdown requested; closing server');
+      res.writeHead(200, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ ok: true }));
+      // Defer the close so the response is flushed first. closeDb()
+      // is called alongside the HTTP close so the cached SQLite handle
+      // is released — without this the next process restart inherits a
+      // handle whose underlying WAL was not checkpointed. flushEmbeddings
+      // drains any in-flight embedding microtasks before the handle
+      // closes so a partial row write cannot be truncated.
+      setImmediate(() => {
+        Promise.resolve(flushEmbeddings({ timeoutMs: 10000 }))
+          .catch(() => {})
+          .finally(() => {
+            try {
+              server.close();
+            } catch {
+              /* ignore */
+            }
+            try {
+              closeDb();
+            } catch {
+              /* ignore */
+            }
+          });
+      });
+      return;
+    }
+
+    // POST /tools/<name>
+    const m = path.match(/^\/tools\/([A-Za-z0-9_]+)$/);
+    if (req.method === 'POST' && m) {
+      const toolName = m[1];
+      let body;
+      try {
+        body = await readJson(req);
+      } catch (e) {
+        res.writeHead(400, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: `invalid JSON body: ${e.message}` }));
+        return;
+      }
+      try {
+        const out = await dispatchTool(toolName, body);
+        res.writeHead(200, { 'content-type': 'application/json' });
+        res.end(JSON.stringify(out));
+      } catch (e) {
+        const isUnknown = e && e.code === 'unknown_tool';
+        res.writeHead(isUnknown ? 404 : 500, { 'content-type': 'application/json' });
+        res.end(
+          JSON.stringify({
+            error: e.message,
+            code: e.code || (isUnknown ? 'unknown_tool' : 'internal'),
+          }),
+        );
+      }
+      return;
+    }
+
+    // Default: 404.
+    res.writeHead(404, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: `unknown route: ${path}` }));
+  });
+
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(port, host, () => {
+      server.removeListener('error', reject);
+      resolve();
+    });
+  });
+  log(`proxy listening on http://${host}:${port} (auth ${state.authEnabled ? 'on' : 'off'})`);
+
+  return {
+    server,
+    host,
+    port,
+    state,
+    close: () =>
+      new Promise((resolve) => {
+        try {
+          server.close(() => resolve());
+        } catch {
+          resolve();
+        }
+      }),
+  };
+}
+
+/**
+ * Sentinel for the CLI subcommand — `proxyAuthBypass()` returns true
+ * when the operator has explicitly opted out of auth (intended for
+ * dev only).
+ */
+export function proxyAuthBypass() {
+  return process.env.KIMI_MEMORY_PROXY_AUTH === 'off';
+}

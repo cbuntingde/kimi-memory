@@ -21,7 +21,12 @@
 import { searchMemories } from '../persist.js';
 
 const TOOL_RECALL_MAX = 2;
-const TOOL_RECALL_MIN_SCORE = 0.25;
+// Score floor for a tool-recall hit. Default `minScore=0.01` matches
+// the persist layer's `MIN_RELEVANCE_SCORE` — rank-1 hits with RRF_K=60
+// score 1/61 ≈ 0.0164, so a higher floor would silently suppress every
+// surface. Mid-turn recall is best-effort; a too-aggressive floor
+// defeats the point. Pass `minScore` in opts to override.
+const TOOL_RECALL_MIN_SCORE = 0.01;
 const PATH_REGEX = /(?:[a-zA-Z]:)?[\\/][^\s"',;]+[\\/][^\s"',;]+/g;
 const SHELL_VERB_REGEX =
   /\b(pnpm|npm|yarn|bun|node|npx|tsx|ts-node|python|pip|cargo|go|make|cmake|gradle|mvn|docker|kubectl|git|curl|wget|brew|apt|systemctl)\b/g;

@@ -36,7 +36,6 @@ import { logEmbeddingError } from './diagnostics.js';
 
 export const EMBEDDING_DIM = 384;
 export const EMBEDDING_MODEL = 'Xenova/all-MiniLM-L6-v2@v1';
-export const EMBEDDING_MODEL_EXPECTED_DIM = 384; // Sanity check for loaded model
 
 // Default wall-clock cap for one embed call. Picked at 4s so the
 // persist layer (which is given 5s by the hook runner) can write the
@@ -79,10 +78,6 @@ async function getPipeline() {
     })();
   }
   return pipelinePromise;
-}
-
-export function isEmbeddingAvailable() {
-  return pipelineLoaded;
 }
 
 // Internal: returns the raw Float32Array (length EMBEDDING_DIM) or
@@ -250,30 +245,4 @@ export function cosineSimilarity(a, b) {
   let s = 0;
   for (let i = 0; i < a.length; i++) s += a[i] * b[i];
   return s;
-}
-
-// Model compatibility check. Returns {compatible: boolean, reason?: string}.
-// This is useful to validate that the loaded model matches expectations.
-export function validateModelCompatibility(loadedOutputDim) {
-  if (!Number.isFinite(loadedOutputDim) || loadedOutputDim < 0) {
-    return { compatible: false, reason: 'invalid dimension' };
-  }
-  if (loadedOutputDim !== EMBEDDING_MODEL_EXPECTED_DIM) {
-    return {
-      compatible: false,
-      reason: `dimension mismatch: got ${loadedOutputDim}, expected ${EMBEDDING_MODEL_EXPECTED_DIM}`,
-    };
-  }
-  return { compatible: true };
-}
-
-// Export model info for diagnostics and version checking.
-export function getModelInfo() {
-  return {
-    model: EMBEDDING_MODEL,
-    dimension: EMBEDDING_DIM,
-    expected_dimension: EMBEDDING_MODEL_EXPECTED_DIM,
-    loaded: pipelineLoaded,
-    last_error: lastError,
-  };
 }

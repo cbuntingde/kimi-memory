@@ -106,7 +106,12 @@ test('searchMemories: minScore filter drops marginal matches', async () => {
     });
     // 'tabs' matches the first row strongly; the second has no FTS hit
     // and no vector hit (embeddings off in tests), so the score is 0.
-    const strict = await searchMemories(db, key, 'tabs', { minScore: 0.1 });
+    // With RRF_K=60, a rank-1 FTS-only hit scores 1/(60+1) ≈ 0.0164.
+    // The default MIN_RELEVANCE_SCORE is 0.01 (designed to let every
+    // rank-1 hit through); we use a value just below that floor to
+    // assert monotonicity: a higher threshold excludes more, never
+    // fewer.
+    const strict = await searchMemories(db, key, 'tabs', { minScore: 0.005 });
     const lenient = await searchMemories(db, key, 'tabs', { minScore: 0 });
     assert.ok(strict.length >= 1, 'the strong match survives the threshold');
     assert.ok(lenient.length >= strict.length, 'lower threshold returns at least as many');

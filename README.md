@@ -29,7 +29,7 @@ A local Kimi Code plugin that provides three-layer memory — cross-project user
 In the Kimi Code chat input:
 
 ```text
-/plugins install https://github.com/cbuntingde/kimi-memory
+/plugins install https://github.com/cbuntingde/kimi-memory-testing
 ```
 
 Kimi pulls the source into `$KIMI_CODE_HOME/plugins/managed/kimi-memory/`. On
@@ -81,12 +81,12 @@ All optional; defaults are tuned for production.
 
 ## Memory tools
 
-The plugin exposes 24 MCP tools over the `kimi-memory` stdio server.
+The plugin exposes 46 MCP tools over the `kimi-memory` stdio server.
 
 **Durable memory** (scope-aware; defaults shown):
 
 - `memory_save(scope?, type, ...)` — `scope: "project"`. Accepts `synthesizes: [childId, ...]` for `conclusion` type to record lineage.
-- `memory_recall(scope?, query, ...)` — `scope: "all"` (project first, then global). Hybrid FTS5 keyword + cosine over stored embeddings; falls back to FTS5-only when embeddings are off.
+- `memory_recall(scope?, query, ...)` — `scope: "all"` (project first, then global). Hybrid FTS5 keyword + cosine over stored embeddings, fused via Reciprocal Rank Fusion (`fusion: 'rrf'` default with `rrf_k=60`; `fusion: 'weighted'` preserves the legacy 0.5/0.5 blend). Optional `visibility` filter narrows both channels to one or more ACL levels. Falls back to FTS5-only when embeddings are off.
 - `memory_list(scope?, ...)`, `memory_get(scope?, id)` — both default `scope: "all"`.
 - `memory_update(scope?, id, ...)` — `scope: "project"`.
 - `memory_delete(scope?, id, hard?)` — `scope: "project"`. Soft by default; `hard: true` removes the row permanently.
@@ -128,7 +128,7 @@ Successful memory operations return explicit metadata (`operation`, `scope`, cou
 ### Scope and types
 
 - **`scope: "all"` ordering**: results are sorted most-recent-first within each scope, then concatenated — every project row appears before every global row. A newer global row cannot outrank a stale project row.
-- **Types**: `working` (active scratch), `episodic` (timestamped events), `semantic` (durable facts/decisions/rules), `procedural` (repeatable workflows), `conclusion` (synthesis over child memories; lineage recorded in `memory_synthesizes`).
+- **Types**: `working` (active scratch), `episodic` (timestamped events), `semantic` (durable facts/decisions/rules), `procedural` (repeatable workflows), `conclusion` (synthesis over child memories; lineage recorded in `memory_synthesizes`), `skill` (v10 trigger-matching memory; metadata.trigger shape — `{ commands?, paths?, keywords? }` — is matched against tool invocations via `matchSkillTriggers`).
 - **Supersede**: `memory_save` / `memory_save_bulk` with `supersede: true` mark prior `(type, title)` rows as `superseded` and stamp `supersedes` on the new row. No-op when no prior row exists.
 
 ### Standalone CLI
@@ -142,6 +142,9 @@ kimi-memory status  [--cwd <path>] [--json]
 kimi-memory recall  <query> [--cwd <path>] [--limit N] [--per-type] [--json]
 kimi-memory prune          [--cwd <path>] [--all-projects] [--apply] [--json]
 kimi-memory reset-project  [--cwd <path>] [--apply] [--json]
+kimi-memory acl list      <memory-id> [--cwd <path>] [--scope project|global] [--json]
+kimi-memory acl grant     <memory-id> --principal-kind <k> --principal-id <id> [--cwd <path>] [--json]
+kimi-memory acl revoke    <memory-id> --principal-kind <k> --principal-id <id> [--cwd <path>] [--json]
 ```
 
 `--json` emits machine-readable JSON; `-q` suppresses per-row output; `--home <dir>` overrides `$KIMI_CODE_HOME`. `prune --apply` removes orphan project DBs whose canonical root no longer exists; `reset-project --apply` wipes the per-project rows of the active project (use after a re-clone). Both are dry runs by default.
@@ -203,6 +206,43 @@ This is the answer to "close kimi-code, reopen, ask what we were working on". Th
 
 Auto-extract deliberately skips transient tasks (see Auto-extraction above), so the focus capture fills the gap that the LLM is not asked about. Cost: zero — the row is built from `conversation_events.summary`, no LLM call. Disable via `KIMI_MEMORY_DISABLE_SESSION_FOCUS=1`.
 
+## ACL / visibility (v10)
+
+Ported from TencentDB-Agent-Memory. Every memory carries one of five visibility levels plus a list of principal descriptors and an explicit grant table. The default for every new save is `private`; rows are never accidentally cross-project visible.
+
+| Visibility   | Meaning                                                     | Default? |
+| ------------ | ----------------------------------------------------------- | -------- |
+| `private`    | Only the owning project sees the row.                       | yes      |
+| `team`       | Visible to any row tagged with the project's team identity. | no       |
+| `restricted` | Visible only to grants listed in `shared_with`.             | no       |
+| `agent`      | Visible to the named agent identity.                        | no       |
+| `task`       | Visible only while the row's task is open.                  | no       |
+
+**New MCP tools**:
+
+- `acl_grant({cwd, memory_id, principal_kind, principal_id})` — insert an ACL grant (`principal_kind ∈ {user, team, role, agent}`).
+- `acl_revoke(...)` — remove an ACL grant.
+- `acl_list({cwd, memory_id})` — list every grant for a memory.
+- `acl_share_memory({cwd, memory_ids, visibility, shared_with?, to_shared_pool?})` — promote rows to a new visibility level. With `to_shared_pool: true` the row is physically moved to the cross-project shared DB at `$KIMI_CODE_HOME/kimi-memory/_shared/memory.sqlite` (literal `project_key='_shared'`); without it, the row stays in its project DB and only `visibility` + `shared_with` change.
+- `acl_resolve_principal({cwd, descriptor})` — parse a `kind:id` descriptor into parts.
+
+`memory_recall` accepts an optional `visibility: 'team' | ['private', 'team']` filter that narrows both the FTS and the vector channels. `memory_save`, `memory_save_bulk`, and `memory_update` accept the same `visibility` + `shared_with` + `team_id` / `agent_id` / `user_id` / `session_id` / `task_id` fields; existing callers continue to work byte-identical because every new field has a safe default.
+
+**CLI additions**:
+
+```text
+node src/cli.js acl list   <memory-id> [--cwd <path>] [--scope project|global] [--json]
+node src/cli.js acl grant  <memory-id> --principal-kind <k> --principal-id <id> [--cwd <path>] [--json]
+node src/cli.js acl revoke <memory-id> --principal-kind <k> --principal-id <id> [--cwd <path>] [--json]
+```
+
+**Layout**: four logical DBs now exist under `$KIMI_CODE_HOME/kimi-memory/`:
+
+- `<project-key>/memory.sqlite` — per-project durable + working memory + conversations (unchanged).
+- `_global/memory.sqlite` — cross-project user durable memory (unchanged).
+- `_shared/memory.sqlite` — ACL-promoted cross-project pool (new in v10; lazily created on first `acl_share_memory` call with `to_shared_pool: true`).
+- `_diagnostics/hooks.log` — hook diagnostics (unchanged).
+
 ## Conversation archival
 
 Hooks run at `SessionStart`, `UserPromptSubmit`, `Stop`, `SessionEnd`, `PreCompact`, `Interrupt`, and `StopFailure`. They incrementally read the current session's `agents/main/wire.jsonl`, preserve every raw JSONL event, and extract searchable summaries. Imports use byte and line cursors and are idempotent. Kimi does not document full conversation text in hook payloads, so archival reads the transcript files directly without modifying them; the parser is tolerant of unknown/malformed records.
@@ -247,7 +287,7 @@ $KIMI_CODE_HOME/kimi-memory/_diagnostics/hooks.log          # hook runner (inges
 Local-first: SQLite databases live under `$KIMI_CODE_HOME/kimi-memory/`; the plugin never writes into Kimi's `sessions` tree. Two outbound behaviours:
 
 - The MiniLM model (~25 MB) downloads lazily from Hugging Face on first use and caches locally. Disable with `KIMI_MEMORY_EMBEDDINGS=off`.
-- Auto-extraction sends one short LLM call per Stop event to the model in `config.toml`. Disable with `KIMI_MEMORY_AUTO_EXTRACT=off` or `[kimi-memory] disable_auto_extract = true`.
+- Auto-extraction sends one short LLM call per Stop event to the model in `config.toml`. The conversation transcript included in that call is **scrubbed server-side** with `redactSecrets` (OpenAI, Anthropic, GitHub, AWS, JWT, PEM, `key=…`, `Authorization: Bearer` shapes) before it leaves the machine — credentials a user typed in chat never reach the configured LLM provider. Disable with `KIMI_MEMORY_AUTO_EXTRACT=off` or `[kimi-memory] disable_auto_extract = true`.
 
 Caveats:
 
@@ -292,7 +332,7 @@ Top-level fields describe the project layer; `global.memories` describes the cro
 
 ## Schema
 
-`SCHEMA_VERSION` is `8`. Databases are migrated in place on first open; migrations are idempotent and append a new column or table when missing. Current schema additions: `project_paths` (canonical project root per DB, drives `memory_prune`); `last_embed_error` on `memories` (failed embeddings are observable); `last_canonical_root` + `record_count` on `project_paths` (preserves prior root on re-record).
+`SCHEMA_VERSION` is `10`. Databases are migrated in place on first open; migrations are idempotent and append a new column or table when missing. Current schema additions: `project_paths` (canonical project root per DB, drives `memory_prune`); `last_embed_error` on `memories` (failed embeddings are observable); `last_canonical_root` + `record_count` on `project_paths` (preserves prior root on re-record); `stability_days` + `last_rehearsed_at` (Ebbinghaus decay, v9); `visibility` + `shared_with` + 5 nullable principal identity columns + `memories_acl` grant table (v10).
 
 ## Uninstall and data retention
 

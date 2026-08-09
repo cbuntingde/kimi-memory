@@ -37,8 +37,17 @@ import {
   resetProject,
   detectReclone,
   resetProjectDryRunCounts,
+  shareMemory,
 } from './persist.js';
 import { enumeratePruneCandidates } from './prune.js';
+import { looksLikeSecret } from './extract.js';
+import {
+  grantMemoryAcl,
+  revokeMemoryAcl,
+  listMemoryAcls,
+  parsePrincipalDescriptor,
+} from './acl.js';
+import { startProxy } from './proxy/server.js';
 import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 
@@ -255,6 +264,27 @@ function cmdRecall(args) {
   const limit = args.flags.limit ? Number(args.flags.limit) : 10;
   const perType = !!args.flags['per-type'];
   const asJson = !!args.flags.json;
+  // v10: fusion strategy + RRF_K. Default fusion='rrf' (k=60). The
+  // legacy 'weighted' blend is preserved for callers that need it.
+  const fusionFlag = args.flags.fusion ? String(args.flags.fusion) : 'rrf';
+  if (fusionFlag !== 'rrf' && fusionFlag !== 'weighted') {
+    process.stderr.write('error: --fusion must be rrf or weighted\n');
+    process.exit(1);
+  }
+  const rrfKFlag = args.flags['rrf-k'] ? Number(args.flags['rrf-k']) : undefined;
+  if (rrfKFlag !== undefined && (!Number.isFinite(rrfKFlag) || rrfKFlag < 1 || rrfKFlag > 1000)) {
+    process.stderr.write('error: --rrf-k must be 1..1000\n');
+    process.exit(1);
+  }
+  // v10: optional visibility filter (single string or comma-separated list).
+  let visibilityFlag = undefined;
+  if (typeof args.flags.visibility === 'string' && args.flags.visibility.length > 0) {
+    visibilityFlag = args.flags.visibility
+      .split(',')
+      .map((v) => v.trim())
+      .filter(Boolean);
+    if (visibilityFlag.length === 0) visibilityFlag = undefined;
+  }
   const key = deriveProjectKey(cwd);
   const dbPath = projectDbPath(home, key);
   if (!existsSync(dbPath)) {
@@ -266,6 +296,9 @@ function cmdRecall(args) {
     limit,
     perType,
     includeScore: true,
+    fusion: fusionFlag,
+    rrfK: rrfKFlag,
+    visibility: visibilityFlag,
   })
     .then((rows) => {
       if (asJson) emitJson({ operation: 'recall', query, count: rows.length, items: rows });
@@ -447,6 +480,27 @@ function cmdImport(args) {
   }
 
   let count = 0;
+  // Defence-in-depth: the save path runs `assertNoSecret` so an MCP
+  // call cannot persist a credential. The import path bypasses that
+  // helper (raw INSERT), so an attacker who can drop a crafted export
+  // JSON and persuade the operator to run `kimi-memory import` would
+  // otherwise land a secret in the DB. Refuse up-front with the same
+  // `secret_detected:` shape used elsewhere. opt-out via
+  // KIMI_MEMORY_SECRET_SCAN=off for fixture-import workflows.
+  if (process.env.KIMI_MEMORY_SECRET_SCAN !== 'off') {
+    const all = [];
+    if (doc.scopes.project?.memories) all.push(...doc.scopes.project.memories);
+    if (doc.scopes.global?.memories) all.push(...doc.scopes.global.memories);
+    for (const m of all) {
+      if (looksLikeSecret(m.title || '') || looksLikeSecret(m.content || '')) {
+        process.stderr.write(
+          `error: refusing to import — memory ${m.id} matches a known credential shape. ` +
+            `Set KIMI_MEMORY_SECRET_SCAN=off to bypass for fixture imports.\n`,
+        );
+        process.exit(1);
+      }
+    }
+  }
   if ((scope === 'project' || scope === 'all') && doc.scopes.project) {
     const key = deriveProjectKey(cwd);
     const dbPath = projectDbPath(home, key);
@@ -626,6 +680,170 @@ function cmdResetProject(args) {
   }
 }
 
+// v10 ACL / visibility CLI. Three subcommands:
+//
+//   acl list   <memory-id> [--cwd <path>] [--scope project|global] [--json]
+//     List every ACL grant for a memory.
+//
+//   acl grant  <memory-id> --principal-kind <user|team|role|agent> --principal-id <id>
+//            [--cwd <path>] [--scope project|global] [--json]
+//     Insert (or no-op via UNIQUE) a grant row into memories_acl.
+//
+//   acl revoke <memory-id> --principal-kind <k> --principal-id <id>
+//            [--cwd <path>] [--scope project|global] [--json]
+//     Delete a grant row. Returns removed=true|false.
+function cmdAcl(args) {
+  const home = homeDir(args);
+  const cwd = resolveCwd(args);
+  const sub = (args.positional[0] || '').toString();
+  const memId = (args.positional[1] || '').toString();
+  const scopeRaw = args.flags.scope ? String(args.flags.scope) : 'project';
+  const asJson = !!args.flags.json;
+
+  if (!sub) {
+    process.stderr.write('error: acl requires a subcommand (list|grant|revoke)\n');
+    process.exit(1);
+  }
+  if (!memId) {
+    process.stderr.write('error: acl requires a memory id (positional)\n');
+    process.exit(1);
+  }
+  if (scopeRaw !== 'project' && scopeRaw !== 'global') {
+    process.stderr.write('error: --scope must be project or global\n');
+    process.exit(1);
+  }
+  if (scopeRaw === 'project' && !cwd) {
+    process.stderr.write('error: --cwd is required for --scope project\n');
+    process.exit(1);
+  }
+  const key = scopeRaw === 'global' ? GLOBAL_PROJECT_KEY : deriveProjectKey(cwd);
+  const dbPath = scopeRaw === 'global' ? globalDbPath(home) : projectDbPath(home, key);
+  if (!existsSync(dbPath)) {
+    process.stderr.write(`note: ${scopeRaw} DB does not exist yet (${dbPath})\n`);
+    process.exit(0);
+  }
+  const db = openDb(dbPath);
+
+  try {
+    if (sub === 'list') {
+      const items = listMemoryAcls(db, key, memId);
+      const out = { operation: 'acl_list', memory_id: memId, items, count: items.length };
+      if (asJson) {
+        emitJson(out);
+      } else {
+        process.stdout.write(`memory_id=${memId}\n`);
+        process.stdout.write(`count=${items.length}\n`);
+        for (const it of items) {
+          process.stdout.write(
+            `grant=${it.principal_kind}:${it.principal_id} granted_at=${it.granted_at}\n`,
+          );
+        }
+      }
+      closeDb();
+      return;
+    }
+
+    if (sub === 'grant') {
+      const kindRaw = args.flags['principal-kind'] || args.flags.principal_kind;
+      const idRaw = args.flags['principal-id'] || args.flags.principal_id;
+      if (!kindRaw || !idRaw) {
+        process.stderr.write('error: acl grant requires --principal-kind and --principal-id\n');
+        process.exit(1);
+      }
+      try {
+        const row = grantMemoryAcl(db, key, memId, String(kindRaw), String(idRaw));
+        const out = { operation: 'acl_granted', grant: row };
+        if (asJson) {
+          emitJson(out);
+        } else {
+          process.stdout.write(`memory_id=${memId}\n`);
+          process.stdout.write(`granted=${row.principal_kind}:${row.principal_id}\n`);
+          process.stdout.write(`granted_at=${row.granted_at}\n`);
+        }
+      } catch (e) {
+        process.stderr.write(`error: ${e.message}\n`);
+        process.exit(1);
+      }
+      closeDb();
+      return;
+    }
+
+    if (sub === 'revoke') {
+      const kindRaw = args.flags['principal-kind'] || args.flags.principal_kind;
+      const idRaw = args.flags['principal-id'] || args.flags.principal_id;
+      if (!kindRaw || !idRaw) {
+        process.stderr.write('error: acl revoke requires --principal-kind and --principal-id\n');
+        process.exit(1);
+      }
+      const removed = revokeMemoryAcl(db, key, memId, String(kindRaw), String(idRaw));
+      const out = {
+        operation: 'acl_revoked',
+        memory_id: memId,
+        principal_kind: String(kindRaw),
+        principal_id: String(idRaw),
+        removed,
+      };
+      if (asJson) {
+        emitJson(out);
+      } else {
+        process.stdout.write(`memory_id=${memId}\n`);
+        process.stdout.write(
+          `principal=${out.principal_kind}:${out.principal_id}\nremoved=${removed}\n`,
+        );
+      }
+      closeDb();
+      return;
+    }
+
+    process.stderr.write(`error: unknown acl subcommand: ${sub}\n`);
+    process.exit(1);
+  } catch (e) {
+    try {
+      closeDb();
+    } catch {
+      /* ignore */
+    }
+    throw e;
+  }
+}
+
+// Phase 7 — Memory Proxy CLI. Starts an HTTP server that translates
+// POST /tools/<name> into the same TOOL_DEFS handlers the stdio MCP
+// server uses. Auth is via KIMI_MEMORY_PROXY_TOKEN by default; pass
+// --auth-token-env to override, or --no-auth (sets
+// KIMI_MEMORY_PROXY_AUTH=off) for dev only.
+async function cmdServeHttp(args) {
+  const home = homeDir(args);
+  const port = args.flags.port ? Number(args.flags.port) : 7331;
+  const host = args.flags.host ? String(args.flags.host) : '127.0.0.1';
+  if (!Number.isFinite(port) || port < 1 || port > 65535) {
+    process.stderr.write('error: --port must be 1..65535\n');
+    process.exit(1);
+  }
+  if (args.flags['no-auth']) {
+    process.env.KIMI_MEMORY_PROXY_AUTH = 'off';
+  }
+  const authTokenEnv = args.flags['auth-token-env'] ? String(args.flags['auth-token-env']) : null;
+  const authToken = authTokenEnv ? process.env[authTokenEnv] || null : null;
+  const proxy = await startProxy({
+    host,
+    port,
+    kimiHomeDir: home,
+    pluginRootDir: process.cwd(),
+    authToken,
+  });
+  const shutdown = (signal) => {
+    process.stderr.write(`\n[serve-http] received ${signal}, shutting down\n`);
+    proxy
+      .close()
+      .then(() => closeDb())
+      .then(() => process.exit(0))
+      .catch(() => process.exit(1));
+  };
+  process.on('SIGINT', () => shutdown('SIGINT'));
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
+}
+
 function printUsage() {
   process.stdout.write(
     [
@@ -635,11 +853,15 @@ function printUsage() {
       '  node src/cli.js list   [--cwd <path>] [--scope project|global|all] [--type <type>] [--status active|superseded|deleted] [--limit N] [--include-expired] [--json] [-q]',
       '  node src/cli.js get    <memory-id> [--scope project|global] [--cwd <path>] [--json]',
       '  node src/cli.js status [--cwd <path>] [--json]',
-      '  node src/cli.js recall <query>       [--cwd <path>] [--limit N] [--per-type] [--json]',
+      '  node src/cli.js recall <query>       [--cwd <path>] [--limit N] [--per-type] [--fusion rrf|weighted] [--rrf-k 60] [--visibility team,private] [--json]',
       '  node src/cli.js prune  [--cwd <path>] [--all-projects] [--apply] [--json]',
       '  node src/cli.js reset-project [--cwd <path>] [--apply] [--json]',
       '  node src/cli.js export <output-file> [--cwd <path>] [--scope project|global|all]',
       '  node src/cli.js import <input-file>  [--cwd <path>] [--scope project|global|all] [--merge|--replace [--yes]]',
+      '  node src/cli.js acl list   <memory-id> [--cwd <path>] [--scope project|global] [--json]',
+      '  node src/cli.js acl grant  <memory-id> --principal-kind <k> --principal-id <id> [--cwd <path>] [--json]',
+      '  node src/cli.js acl revoke <memory-id> --principal-kind <k> --principal-id <id> [--cwd <path>] [--json]',
+      '  node src/cli.js serve-http [--port 7331] [--host 127.0.0.1] [--auth-token-env KIMI_MEMORY_PROXY_TOKEN] [--no-auth]',
       '',
       'Options:',
       '  --home <dir>     override $KIMI_CODE_HOME',
@@ -650,7 +872,7 @@ function printUsage() {
   );
 }
 
-function main() {
+async function main() {
   const args = parseArgs(process.argv);
   if (
     !args.command ||
@@ -679,6 +901,10 @@ function main() {
         return cmdExport(args);
       case 'import':
         return cmdImport(args);
+      case 'acl':
+        return cmdAcl(args);
+      case 'serve-http':
+        return await cmdServeHttp(args);
       default:
         process.stderr.write(`error: unknown command: ${args.command}\n`);
         printUsage();
@@ -691,4 +917,7 @@ function main() {
   }
 }
 
-main();
+main().catch((e) => {
+  process.stderr.write(`fatal: ${e && e.stack ? e.stack : e}\n`);
+  process.exit(2);
+});

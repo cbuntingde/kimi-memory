@@ -62,6 +62,36 @@ export function looksLikeSecret(text) {
   }
   return false;
 }
+
+// Redact secret-shaped substrings from `text`, replacing each match
+// with a stable `[REDACTED:*]` token so the LLM still sees the structure
+// of the conversation but no credential bytes leave the machine.
+// Uses the same SECRET_PATTERNS as looksLikeSecret — keeps the input
+// filter and the output filter on a single source of truth.
+//
+// (Audit finding H3 / B3-1.)
+export function redactSecrets(text) {
+  if (typeof text !== 'string') return '';
+  if (!text) return '';
+  let out = text;
+  out = out.replace(
+    /\b(sk-[A-Za-z0-9]{20,}|sk-ant-[A-Za-z0-9-]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|ghp_[A-Za-z0-9]{36}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})\b/g,
+    '[REDACTED_PROVIDER_KEY]',
+  );
+  out = out.replace(
+    /-----BEGIN [A-Z ]*?(?:PRIVATE|OPENSSH PRIVATE) KEY-----[\s\S]*?-----END [A-Z ]*?PRIVATE KEY-----/g,
+    '[REDACTED_PEM_BLOCK]',
+  );
+  out = out.replace(
+    /(^|[\s,;])(?:api[_-]?key|api[_-]?token|access[_-]?token|auth[_-]?token|client[_-]?secret|secret[_-]?key|secret|password|passwd|pwd)\s*[:=]\s*["']?([A-Za-z0-9_/+=-]{8,})/gi,
+    '$1[REDACTED_ASSIGNED_SECRET]',
+  );
+  out = out.replace(
+    /Authorization\s*:\s*Bearer\s+[A-Za-z0-9_.-]{20,}/gi,
+    'Authorization: Bearer [REDACTED]',
+  );
+  return out;
+}
 const EXTRACT_SYSTEM_PROMPT = `You are a memory extraction module. Read the conversation and any project metadata summary provided, and decide whether it contains any durable facts worth remembering for the user's future self.
 
 A "durable fact" is a preference, decision, convention, or stable context that would still be useful hours or days later. Skip transient debugging, in-flight tasks, and one-off questions.
@@ -204,8 +234,13 @@ export async function resolveLlmTarget(homeDir) {
 // Build the extraction prompt. existingTitles is a list of titles
 // already in the project's active memories; listing them nudges the
 // model away from duplicates the dedup pass would also catch.
+//
+// The transcript is redacted with redactSecrets before being inserted
+// into the user message. The LLM call now sees a sanitised view —
+// credentials in the conversation never leave the machine, even when
+// the user typed them in chat. (Audit finding H3 / B3-1.)
 function buildExtractionPrompt(transcript, existingTitles, projectMeta) {
-  const trimmed = String(transcript || '').slice(0, MAX_INPUT_CHARS);
+  const trimmed = redactSecrets(String(transcript || '')).slice(0, MAX_INPUT_CHARS);
   const titlesLine =
     existingTitles && existingTitles.length
       ? `\nFor dedup, here are titles already in this project's memory (avoid repeating these):\n- ${existingTitles.slice(0, 50).join('\n- ')}\n`

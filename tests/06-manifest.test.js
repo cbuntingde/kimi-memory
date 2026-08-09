@@ -117,11 +117,16 @@ test('manifest version matches package.json and package-lock.json', () => {
 
 test('manifest tool count claim matches the registered tool count', () => {
   const serverSrc = readFileSync(path.join(root, 'src', 'server.js'), 'utf8');
-  // Count `name: 'memory_…' / 'working_memory_…' / 'conversation_…'` entries
-  // inside the TOOL_DEFS array. Each registered tool declares exactly one.
+  // Count `name: 'memory_…' / 'working_memory_…' / 'conversation_…' / 'acl_…' / 'wiki_…' / 'codegraph_…'`
+  // entries inside the TOOL_DEFS array. Each registered tool declares
+  // exactly one. (acl_* added in v10 Phase 1; tier tools in Phase 3;
+  // wiki tools in Phase 4; codegraph tools in Phase 5.)
   const def = serverSrc.match(/const TOOL_DEFS = \[([\s\S]*?)\];/);
   assert.ok(def, 'TOOL_DEFS not found in src/server.js');
-  const toolNames = def[1].match(/name: '(?:memory_|working_memory_|conversation_)[a-z_]+'/g) || [];
+  const toolNames =
+    def[1].match(
+      /name: '(?:memory_|working_memory_|conversation_|acl_|wiki_|codegraph_)[a-z_]+'/g,
+    ) || [];
   const toolCount = toolNames.length;
   assert.ok(toolCount > 0, 'no tools registered in TOOL_DEFS');
   // Every tool must be wired into `server.tool(TOOL_DEFS[N]…)`. The wire
@@ -214,7 +219,7 @@ test('memory_prune tool is registered, wired, and documented', () => {
   // The exact count is governed by the regex match above; this hardcode
   // exists to flag a description that claims a different number than the
   // TOOL_DEFS array. Bump this when a new tool is added.
-  assert.match(long, /Tools \(26\):/, 'longDescription must claim Tools (26)');
+  assert.match(long, /Tools \(46\):/, 'longDescription must claim Tools (46)');
   // The slash command exists and links to the tool.
   const pruneCmd = readFileSync(path.join(root, 'commands', 'prune.md'), 'utf8');
   assert.match(pruneCmd, /memory_prune\(/);

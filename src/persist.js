@@ -24,14 +24,9 @@ import {
   cosineSimilarity,
 } from './embedding.js';
 import { logPersistError, logEmbeddingError, logPerformanceMetric } from './diagnostics.js';
-import {
-  recordWriteStart,
-  recordWriteEnd,
-  isSqliteBusyError,
-  calculateDbBackoffMs,
-} from './concurrency.js';
+import { recordWriteStart, recordWriteEnd, isSqliteBusyError } from './concurrency.js';
 
-const SCHEMA_VERSION = 9;
+const SCHEMA_VERSION = 10;
 
 // Schema migrations. Each entry is idempotent: it inspects the live
 // schema, no-ops when its target shape is already in place, and
@@ -89,6 +84,19 @@ const MIGRATIONS = [
       )
       .get();
     if (!idx) db.exec('CREATE INDEX idx_memories_embedded_at ON memories(embedded_at)');
+    // Covering index for the vector recall branch: searchMemories
+    // filters by (project_key, embedding_dim) before reading every
+    // embedding BLOB. Without this index the vector scan is a full
+    // table scan per recall, which dominates latency on large projects.
+    const idxVec = db
+      .prepare(
+        "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_memories_project_embedding_dim'",
+      )
+      .get();
+    if (!idxVec)
+      db.exec(
+        'CREATE INDEX idx_memories_project_embedding_dim ON memories(project_key, embedding_dim)',
+      );
   },
 
   // v4: typed edges between memories (related | supports | contradicts |
@@ -132,19 +140,20 @@ const MIGRATIONS = [
   // keeps the migration idempotent — re-runs are no-ops once the rebuild
   // has happened.
   function migrateAddConclusionType(db) {
-    // Probe: can we already insert type='conclusion'?
-    const probeId = '__conclusion_probe__';
-    let needsRebuild = false;
-    try {
-      db.prepare(
-        "INSERT INTO memories (id, project_key, type, content) VALUES (?, '_conclusion_probe', 'conclusion', 'x')",
-      ).run(probeId);
-      // Succeeded — the CHECK already accepts 'conclusion'. Tidy up.
-      db.prepare('DELETE FROM memories WHERE id=?').run(probeId);
-    } catch {
-      needsRebuild = true;
-    }
-    if (needsRebuild) {
+    // Probe: does the memories.type CHECK already include 'conclusion'?
+    // The previous probe INSERT always failed because it omitted the
+    // NOT NULL created_at/updated_at columns, forcing this migration to
+    // rebuild on every open and leaving a vtable-construction race
+    // window for memories_fts (the rebuild drops memories, so a
+    // concurrent process opening the same DB sees a vtable whose
+    // backing table is in flux). Read the CREATE TABLE SQL from
+    // sqlite_master instead — atomic, no probe row, no rebuild on
+    // already-applied DBs.
+    const createSql =
+      db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='memories'").get()
+        ?.sql || '';
+    const hasConclusion = /type\s+IN\s*\([^)]*\bconclusion\b/i.test(createSql);
+    if (!hasConclusion) {
       db.exec(`
         BEGIN;
         CREATE TABLE memories_new (
@@ -306,6 +315,312 @@ const MIGRATIONS = [
         `UPDATE memories SET last_rehearsed_at = updated_at
          WHERE last_rehearsed_at IS NULL OR last_rehearsed_at = ''`,
       );
+    }
+  },
+
+  // v10: ACL / visibility model (ported from TencentDB-Agent-Memory).
+  // Adds per-row visibility + shared_with grant list, plus 5 nullable
+  // identity columns (team_id, agent_id, user_id, session_id, task_id)
+  // used for principal-scoped reads. Also creates memories_acl as the
+  // explicit grant table (memory_id × principal_kind × principal_id).
+  //
+  // Idempotent: every column add is gated on the `have` set check, and
+  // the memories_acl table + index use IF NOT EXISTS / index-if-missing.
+  // Pre-v10 rows backfill visibility='private' (from the column default)
+  // and shared_with='[]' (also from the column default); no UPDATE needed.
+  function migrateAddVisibilityAndSharedWith(db) {
+    const cols = db.prepare('PRAGMA table_info(memories)').all();
+    const have = new Set(cols.map((c) => c.name));
+    if (!have.has('visibility')) {
+      db.exec(
+        "ALTER TABLE memories ADD COLUMN visibility TEXT NOT NULL DEFAULT 'private' " +
+          "CHECK (visibility IN ('private','team','restricted','agent','task'))",
+      );
+    }
+    if (!have.has('shared_with')) {
+      db.exec("ALTER TABLE memories ADD COLUMN shared_with TEXT NOT NULL DEFAULT '[]'");
+    }
+    if (!have.has('team_id')) db.exec('ALTER TABLE memories ADD COLUMN team_id TEXT');
+    if (!have.has('agent_id')) db.exec('ALTER TABLE memories ADD COLUMN agent_id TEXT');
+    if (!have.has('user_id')) db.exec('ALTER TABLE memories ADD COLUMN user_id TEXT');
+    if (!have.has('session_id')) db.exec('ALTER TABLE memories ADD COLUMN session_id TEXT');
+    if (!have.has('task_id')) db.exec('ALTER TABLE memories ADD COLUMN task_id TEXT');
+    // memories_acl is the explicit grant table; visibility/shared_with
+    // on the row are a denormalised cache of the "current" grants, kept
+    // in sync by shareMemory(). UNIQUE(memory_id, principal_kind, principal_id)
+    // makes grants idempotent at the SQL layer.
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS memories_acl (
+        memory_id      TEXT NOT NULL,
+        principal_kind TEXT NOT NULL CHECK (principal_kind IN ('user','team','role','agent')),
+        principal_id   TEXT NOT NULL,
+        granted_at     TEXT NOT NULL,
+        UNIQUE(memory_id, principal_kind, principal_id)
+      )
+    `);
+    const idx = db
+      .prepare(
+        "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_memories_acl_memory'",
+      )
+      .get();
+    if (!idx) db.exec('CREATE INDEX idx_memories_acl_memory ON memories_acl(memory_id)');
+  },
+
+  // v10: Chat Memory L0→L1→L2→L3 layered model (TencentDB port).
+  // Adds the `tier` column (L0/L1/L2/L3) and a nullable `persona_id`
+  // tag, plus the persona_promotions audit table. tier defaults to 'L0'
+  // (rawest: a fresh save is just an un-promoted memory); the hook
+  // layer promotes rows through L1/L2/L3 on lifecycle events.
+  //
+  // Idempotent: column adds gated on `have`; persona_promotions is
+  // CREATE TABLE IF NOT EXISTS with an idempotent index.
+  function migrateAddTierAndPersona(db) {
+    const cols = db.prepare('PRAGMA table_info(memories)').all();
+    const have = new Set(cols.map((c) => c.name));
+    if (!have.has('tier')) {
+      db.exec(
+        "ALTER TABLE memories ADD COLUMN tier TEXT NOT NULL DEFAULT 'L0' " +
+          "CHECK (tier IN ('L0','L1','L2','L3'))",
+      );
+    }
+    if (!have.has('persona_id')) {
+      db.exec('ALTER TABLE memories ADD COLUMN persona_id TEXT');
+    }
+    // persona_promotions is the audit log for tier transitions.
+    // setMemoryTier / promoteMemory / demoteMemory all write here so
+    // a "memory_tier_history" recall can reconstruct the lineage.
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS persona_promotions (
+        id         TEXT PRIMARY KEY,
+        memory_id  TEXT NOT NULL,
+        from_tier  TEXT NOT NULL,
+        to_tier    TEXT NOT NULL,
+        reason     TEXT,
+        at         TEXT NOT NULL
+      )
+    `);
+    const idx = db
+      .prepare(
+        "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_persona_promotions_memory'",
+      )
+      .get();
+    if (!idx)
+      db.exec('CREATE INDEX idx_persona_promotions_memory ON persona_promotions(memory_id)');
+  },
+
+  // v10: Wiki / LLM-Wiki tables (TencentDB port). Pages live alongside
+  // the per-project memories table (same DB file). Pages are keyed by
+  // (project_key, name) so the upsert is idempotent and re-saving the
+  // same name rewrites the body in place. Edges are typed via a CHECK
+  // constraint; a future-target edge (the linked page does not exist
+  // yet) is recorded with to_wiki_id='pending:<name>' so the link is
+  // preserved across re-saves and resolved once the target lands.
+  function migrateAddWikiTables(db) {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS wiki_pages (
+        wiki_id     TEXT PRIMARY KEY,
+        project_key TEXT NOT NULL,
+        service_id  TEXT NOT NULL DEFAULT '',
+        team_id     TEXT NOT NULL DEFAULT '',
+        name        TEXT NOT NULL,
+        body        TEXT NOT NULL DEFAULT '',
+        summary     TEXT NOT NULL DEFAULT '',
+        updated_at  TEXT NOT NULL,
+        UNIQUE(project_key, name)
+      )
+    `);
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS wiki_links (
+        from_wiki_id TEXT NOT NULL,
+        to_wiki_id   TEXT NOT NULL,
+        project_key  TEXT NOT NULL,
+        kind         TEXT NOT NULL CHECK (kind IN ('mentions','derived_from','contradicts','supersedes')),
+        weight       REAL NOT NULL DEFAULT 1.0,
+        created_at   TEXT NOT NULL,
+        UNIQUE(project_key, from_wiki_id, to_wiki_id, kind)
+      )
+    `);
+    db.exec(`
+      CREATE VIRTUAL TABLE IF NOT EXISTS wiki_fts USING fts5(
+        wiki_id UNINDEXED,
+        project_key UNINDEXED,
+        name,
+        body,
+        summary,
+        tokenize = 'unicode61 remove_diacritics 2'
+      )
+    `);
+    const idxFrom = db
+      .prepare("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_wiki_links_from'")
+      .get();
+    if (!idxFrom)
+      db.exec('CREATE INDEX idx_wiki_links_from ON wiki_links(project_key, from_wiki_id)');
+    const idxTo = db
+      .prepare("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_wiki_links_to'")
+      .get();
+    if (!idxTo) db.exec('CREATE INDEX idx_wiki_links_to ON wiki_links(project_key, to_wiki_id)');
+    const idxPage = db
+      .prepare(
+        "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_wiki_pages_project'",
+      )
+      .get();
+    if (!idxPage)
+      db.exec('CREATE INDEX idx_wiki_pages_project ON wiki_pages(project_key, updated_at)');
+  },
+
+  // v10: CodeGraph edge kinds + memory_edges.metadata column (Phase 5).
+  // Extends the memory_edges.kind CHECK to include the three codegraph
+  // kinds (imports, calls, defines) and adds a `metadata TEXT` column
+  // for edge payload (file path, language, byte range). Both are
+  // idempotent: the CHECK rebuild uses the same probe-then-rebuild
+  // pattern as the v5 conclusion migration, and the metadata column
+  // add is gated on the `have` set probe.
+  function migrateAddCodegraphEdges(db) {
+    // Add `metadata` column to memory_edges (idempotent ALTER).
+    const cols = db.prepare('PRAGMA table_info(memory_edges)').all();
+    const haveCols = new Set(cols.map((c) => c.name));
+    if (!haveCols.has('metadata')) {
+      db.exec("ALTER TABLE memory_edges ADD COLUMN metadata TEXT NOT NULL DEFAULT '{}'");
+    }
+    // Probe via sqlite_master.sql — atomic, no throwaway row. Same
+    // pattern as migrateAddConclusionType (line 152-156). The previous
+    // probe-insert approach always failed (omitted created_at NOT NULL)
+    // and forced a full rebuild on every open.
+    const createSql =
+      db
+        .prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='memory_edges'")
+        .get()?.sql || '';
+    const hasCodegraphKinds =
+      /kind\s+IN\s*\([^)]*\bimports\b[^)]*\bcalls\b[^)]*\bdefines\b/i.test(createSql);
+    if (!hasCodegraphKinds) {
+      db.exec(`
+        BEGIN;
+        CREATE TABLE memory_edges_new (
+          id          TEXT PRIMARY KEY,
+          project_key TEXT NOT NULL,
+          from_id     TEXT NOT NULL,
+          to_id       TEXT NOT NULL,
+          kind        TEXT NOT NULL CHECK (kind IN ('related','supports','contradicts','supersedes','synthesizes','imports','calls','defines')),
+          weight      REAL NOT NULL DEFAULT 1.0,
+          metadata    TEXT NOT NULL DEFAULT '{}',
+          created_at  TEXT NOT NULL,
+          UNIQUE(project_key, from_id, to_id, kind)
+        );
+        INSERT INTO memory_edges_new (id, project_key, from_id, to_id, kind, weight, metadata, created_at)
+          SELECT id, project_key, from_id, to_id, kind, weight, metadata, created_at FROM memory_edges;
+        DROP TABLE memory_edges;
+        ALTER TABLE memory_edges_new RENAME TO memory_edges;
+        CREATE INDEX idx_memory_edges_from ON memory_edges(project_key, from_id);
+        CREATE INDEX idx_memory_edges_to   ON memory_edges(project_key, to_id);
+        COMMIT;
+      `);
+    }
+  },
+
+  // v10: skill_invocations audit table (Phase 6). One row per
+  // invocation of a skill; updated by recordSkillInvocation and
+  // aggregated by updateSkillInvocationStats. No FK to memories so
+  // soft-deleted / superseded skills can still carry their stats
+  // until the next `memory_prune` sweep.
+  function migrateAddSkillInvocationsTable(db) {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS skill_invocations (
+        id          TEXT PRIMARY KEY,
+        skill_id    TEXT NOT NULL,
+        project_key TEXT NOT NULL,
+        tool_name   TEXT,
+        success     INTEGER NOT NULL DEFAULT 0,
+        duration_ms INTEGER,
+        invoked_at  TEXT NOT NULL
+      )
+    `);
+    const idx = db
+      .prepare(
+        "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_skill_invocations_skill'",
+      )
+      .get();
+    if (!idx)
+      db.exec(
+        'CREATE INDEX idx_skill_invocations_skill ON skill_invocations(project_key, skill_id)',
+      );
+  },
+
+  // v10: extend the memories CHECK to include 'skill' (Phase 6).
+  // Same probe-then-rebuild shape as the v5 (conclusion) and v10
+  // (visibility) migrations: SQLite cannot ALTER a CHECK constraint,
+  // so we probe a throwaway row to detect the current shape; if the
+  // probe fails, rebuild the table with the expanded vocabulary and
+  // copy every row across. Re-runs are no-ops.
+  function migrateAddSkillType(db) {
+    // Same shape as migrateAddConclusionType: the prior probe INSERT
+    // always failed (omitted NOT NULL created_at/updated_at) and forced
+    // a full rebuild on every open. Inspect the CREATE TABLE SQL so
+    // already-applied DBs short-circuit without rebuilding.
+    const createSql =
+      db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='memories'").get()
+        ?.sql || '';
+    const hasSkill = /type\s+IN\s*\([^)]*\bskill\b/i.test(createSql);
+    if (!hasSkill) {
+      db.exec(`
+        BEGIN;
+        CREATE TABLE memories_new (
+          id            TEXT PRIMARY KEY,
+          project_key   TEXT NOT NULL,
+          type          TEXT NOT NULL CHECK (type IN ('working','episodic','semantic','procedural','conclusion','skill')),
+          title         TEXT,
+          content       TEXT NOT NULL,
+          tags          TEXT NOT NULL DEFAULT '[]',
+          metadata      TEXT NOT NULL DEFAULT '{}',
+          provenance    TEXT NOT NULL DEFAULT '{}',
+          confidence    REAL NOT NULL DEFAULT 0.8,
+          status        TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','superseded','deleted')),
+          priority      INTEGER NOT NULL DEFAULT 0,
+          supersedes    TEXT,
+          superseded_by TEXT,
+          created_at    TEXT NOT NULL,
+          updated_at    TEXT NOT NULL,
+          expires_at    TEXT,
+          embedding       BLOB,
+          embedding_model TEXT,
+          embedding_dim   INTEGER,
+          embedded_at     TEXT,
+          access_count     INTEGER NOT NULL DEFAULT 0,
+          last_accessed_at TEXT,
+          last_embed_error TEXT,
+          stability_days    REAL NOT NULL DEFAULT 30,
+          last_rehearsed_at TEXT,
+          visibility TEXT NOT NULL DEFAULT 'private' CHECK (visibility IN ('private','team','restricted','agent','task')),
+          shared_with TEXT NOT NULL DEFAULT '[]',
+          team_id     TEXT,
+          agent_id    TEXT,
+          user_id     TEXT,
+          session_id  TEXT,
+          task_id     TEXT,
+          tier        TEXT NOT NULL DEFAULT 'L0' CHECK (tier IN ('L0','L1','L2','L3')),
+          persona_id  TEXT
+        );
+        INSERT INTO memories_new
+          SELECT id, project_key, type, title, content, tags, metadata, provenance,
+                 confidence, status, priority, supersedes, superseded_by,
+                 created_at, updated_at, expires_at,
+                 embedding, embedding_model, embedding_dim, embedded_at,
+                 access_count, last_accessed_at, last_embed_error,
+                 stability_days, last_rehearsed_at,
+                 visibility, shared_with, team_id, agent_id, user_id, session_id, task_id,
+                 tier, persona_id
+          FROM memories;
+        DROP TABLE memories;
+        ALTER TABLE memories_new RENAME TO memories;
+        CREATE INDEX idx_memories_project_type   ON memories(project_key, type);
+        CREATE INDEX idx_memories_project_status ON memories(project_key, status);
+        CREATE INDEX idx_memories_expires        ON memories(expires_at);
+        CREATE INDEX idx_memories_supersedes     ON memories(supersedes);
+        CREATE INDEX idx_memories_embedded_at    ON memories(embedded_at);
+        DELETE FROM memories_fts;
+        INSERT INTO memories_fts (id, project_key, type, title, content, tags)
+          SELECT id, project_key, type, title, content, tags FROM memories;
+        COMMIT;
+      `);
     }
   },
 ];
@@ -493,14 +808,34 @@ export function memoryId(projectKey, type, title, content) {
 
 export function rowToMemory(row) {
   if (!row) return null;
+  // shared_with is a JSON-encoded array of {kind, id} principal
+  // descriptors. Safe-parse rather than throw — a corrupt row from a
+  // pre-v10 DB should still load and read back as [].
+  const sharedParsed = safeJsonParse(row.shared_with || '[]');
+  const sharedWith = sharedParsed.ok && Array.isArray(sharedParsed.value) ? sharedParsed.value : [];
+  // Each JSON column gets its own try/catch + typed fallback. A single
+  // corrupt column (WAL crash mid-write, manual sqlite3 edit, partial
+  // import) used to throw and crash the entire `memory_recall` result;
+  // now the row degrades to empty arrays/objects and the rest of the
+  // set still returns. (Audit finding B2-3.)
+  const tags = safeParseJson(row.tags, [], (v) => Array.isArray(v));
+  const provenance = safeParseJson(row.provenance, {}, (v) => v && typeof v === 'object' && !Array.isArray(v));
+  const metadata = safeParseJson(row.metadata, {}, (v) => v && typeof v === 'object' && !Array.isArray(v));
+  // Surface processing_status as a top-level field for callers that
+  // don't want to dig into metadata. Defaults to 'ready' on rows that
+  // pre-date the v10 processing pipeline (scaffold tests assert this).
+  let processingStatus = 'ready';
+  if (metadata && typeof metadata.processing_status === 'string') {
+    processingStatus = metadata.processing_status;
+  }
   return {
     id: row.id,
     type: row.type,
     title: row.title || '',
     content: row.content,
-    tags: JSON.parse(row.tags || '[]'),
-    metadata: JSON.parse(row.metadata || '{}'),
-    provenance: JSON.parse(row.provenance || '{}'),
+    tags,
+    metadata,
+    provenance,
     confidence: row.confidence,
     status: row.status,
     priority: row.priority,
@@ -509,6 +844,7 @@ export function rowToMemory(row) {
     created_at: row.created_at,
     updated_at: row.updated_at,
     expires_at: row.expires_at || null,
+    processing_status: processingStatus,
     // Lightweight embedding summary — never include the raw BLOB.
     // Three states: 'embedded' (BLOB present), 'pending' (no BLOB
     // yet, no error), 'failed' (no BLOB and a recorded error).
@@ -523,10 +859,39 @@ export function rowToMemory(row) {
     // the v9 migration yet.
     stability_days: row.stability_days == null ? null : row.stability_days,
     last_rehearsed_at: row.last_rehearsed_at || null,
+    // v10 ACL / visibility fields. visibility defaults to 'private' on
+    // any pre-v10 row (the column default), and shared_with defaults to
+    // an empty list. team_id / agent_id / user_id / session_id / task_id
+    // are nullable TEXT — only set when the row was tagged with an
+    // identity at write time (e.g. by the hook layer for telemetry).
+    visibility: row.visibility || 'private',
+    shared_with: sharedWith,
+    team_id: row.team_id || null,
+    agent_id: row.agent_id || null,
+    user_id: row.user_id || null,
+    session_id: row.session_id || null,
+    task_id: row.task_id || null,
+    // v10 tier (Chat Memory L0→L1→L2→L3). Defaults to 'L0' on pre-v10
+    // rows (column default). persona_id is nullable — only set when
+    // the row is associated with a cross-cutting persona.
+    tier: row.tier || 'L0',
+    persona_id: row.persona_id || null,
   };
 }
 
 // ----- CRUD -----
+
+// Safe JSON parse for an in-row text column. Returns `fallback` when
+// the column is missing, empty, corrupt, or fails the type-guard. Used
+// by rowToMemory so a single bad column can't crash `memory_recall`.
+// (Audit finding B2-3.)
+function safeParseJson(text, fallback, isShape) {
+  if (typeof text !== 'string' || text.length === 0) return fallback;
+  const parsed = safeJsonParse(text);
+  if (!parsed.ok) return fallback;
+  if (typeof isShape === 'function' && !isShape(parsed.value)) return fallback;
+  return parsed.value;
+}
 
 // Defense in depth: refuse to persist a memory whose title or content
 // matches a known credential shape. The auto-extract path already
@@ -561,13 +926,45 @@ export function saveMemory(db, projectKey, input) {
   const now = nowIso();
   const id = input.id || memoryId(projectKey, input.type, input.title || '', input.content || '');
   const tags = JSON.stringify(input.tags || []);
-  const metadata = JSON.stringify(input.metadata || {});
+  // v10: fold a top-level `processing_status` into metadata so a
+  // caller can mark a row as 'pending' (skill extraction in flight)
+  // or 'active' without needing to wrap it under metadata. The merge
+  // happens here so every existing call site that passes
+  // `processing_status` directly still works.
+  const baseMeta =
+    input.metadata && typeof input.metadata === 'object' && !Array.isArray(input.metadata)
+      ? input.metadata
+      : {};
+  const metadata = JSON.stringify(
+    input.processing_status
+      ? { ...baseMeta, processing_status: input.processing_status }
+      : baseMeta,
+  );
   const provenance = JSON.stringify(input.provenance || {});
   const confidence =
     typeof input.confidence === 'number' ? Math.max(0, Math.min(1, input.confidence)) : 0.8;
   const status = input.status || 'active';
   const priority = Number.isFinite(input.priority) ? Math.trunc(input.priority) : 0;
   const expires = input.expires_at || null;
+  // v10 ACL / visibility fields. visibility defaults to 'private' on
+  // every save so a row never accidentally becomes cross-project
+  // visible. shared_with defaults to an empty list; principal identity
+  // columns (team_id / agent_id / user_id / session_id / task_id) are
+  // pass-through TEXT — set by the call site when the row is tagged
+  // with a specific principal context (typically the hook layer).
+  const visibility = VISIBILITY_VALUES.has(input.visibility) ? input.visibility : 'private';
+  const sharedWith = JSON.stringify(Array.isArray(input.shared_with) ? input.shared_with : []);
+  const teamId = input.team_id || null;
+  const agentId = input.agent_id || null;
+  const userId = input.user_id || null;
+  const sessionId = input.session_id || null;
+  const taskId = input.task_id || null;
+  // v10 tier (Chat Memory L0→L1→L2→L3). Defaults to 'L0' so every
+  // fresh save is un-promoted. tier-promotion happens via setMemoryTier
+  // / promoteMemory / demoteMemory (which write the audit row to
+  // persona_promotions). persona_id is pass-through.
+  const tier = TIER_VALUES.has(input.tier) ? input.tier : 'L0';
+  const personaId = input.persona_id || null;
 
   // Supersession: when supersede=true and a prior memory with the
   // same (project_key, type, title) is active, mark the prior
@@ -629,6 +1026,15 @@ export function saveMemory(db, projectKey, input) {
         priority = COALESCE(?, priority),
         supersedes = COALESCE(?, supersedes),
         expires_at = COALESCE(?, expires_at),
+        visibility = COALESCE(?, visibility),
+        shared_with = COALESCE(?, shared_with),
+        team_id = COALESCE(?, team_id),
+        agent_id = COALESCE(?, agent_id),
+        user_id = COALESCE(?, user_id),
+        session_id = COALESCE(?, session_id),
+        task_id = COALESCE(?, task_id),
+        tier = COALESCE(?, tier),
+        persona_id = COALESCE(?, persona_id),
         updated_at = ?,
         last_rehearsed_at = ?
       WHERE id = ?
@@ -644,6 +1050,15 @@ export function saveMemory(db, projectKey, input) {
       input.priority != null ? priority : null,
       supersedesId ?? null,
       expires,
+      input.visibility ?? null,
+      input.shared_with !== undefined ? JSON.stringify(input.shared_with) : null,
+      input.team_id ?? null,
+      input.agent_id ?? null,
+      input.user_id ?? null,
+      input.session_id ?? null,
+      input.task_id ?? null,
+      input.tier ?? null,
+      input.persona_id ?? null,
       now,
       now,
       id,
@@ -651,8 +1066,8 @@ export function saveMemory(db, projectKey, input) {
   } else {
     db.prepare(
       `
-      INSERT INTO memories (id, project_key, type, title, content, tags, metadata, provenance, confidence, status, priority, supersedes, created_at, updated_at, expires_at, last_rehearsed_at)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO memories (id, project_key, type, title, content, tags, metadata, provenance, confidence, status, priority, supersedes, created_at, updated_at, expires_at, last_rehearsed_at, visibility, shared_with, team_id, agent_id, user_id, session_id, task_id, tier, persona_id)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `,
     ).run(
       id,
@@ -671,41 +1086,67 @@ export function saveMemory(db, projectKey, input) {
       now,
       expires,
       now,
+      visibility,
+      sharedWith,
+      teamId,
+      agentId,
+      userId,
+      sessionId,
+      taskId,
+      tier,
+      personaId,
     );
   }
 
-  // FTS upsert
-  db.prepare('DELETE FROM memories_fts WHERE id=?').run(id);
-  db.prepare(
-    'INSERT INTO memories_fts (id, project_key, type, title, content, tags) VALUES (?, ?, ?, ?, ?, ?)',
-  ).run(
-    id,
-    projectKey,
-    input.type,
-    input.title || '',
-    input.content || '',
-    (input.tags || []).join(' '),
-  );
+  // FTS upsert — wrapped in BEGIN/COMMIT with the row write above so a
+  // crash or SQLITE_BUSY between the row INSERT/UPDATE and the FTS
+  // write cannot leave a row visible but not FTS-indexed.
+  //
+  // SAVEPOINT (not BEGIN) so saveMemory is safe to call from inside
+  // another transaction (e.g. saveMemoryBulk's outer BEGIN/COMMIT).
+  // SAVEPOINT is a no-op when no outer transaction is in flight.
+  db.exec('SAVEPOINT save_memory_upsert');
+  try {
+    db.prepare('DELETE FROM memories_fts WHERE id=?').run(id);
+    db.prepare(
+      'INSERT INTO memories_fts (id, project_key, type, title, content, tags) VALUES (?, ?, ?, ?, ?, ?)',
+    ).run(
+      id,
+      projectKey,
+      input.type,
+      input.title || '',
+      input.content || '',
+      (input.tags || []).join(' '),
+    );
 
-  // Conclusion edge: record this memory's synthesizes[] children in
-  // memory_synthesizes so bidirectional lookup is a single indexed
-  // query. Skip empty / duplicate / self-references. Idempotent via
-  // PRIMARY KEY (parent_id, child_id); re-saving just re-stamps the
-  // created_at, which is what callers usually want.
-  const synth = Array.isArray(input.synthesizes) ? input.synthesizes : null;
-  if (synth && synth.length > 0) {
-    const stmt = db.prepare(`
-      INSERT OR REPLACE INTO memory_synthesizes (parent_id, child_id, project_key, created_at)
-      VALUES (?, ?, ?, ?)
-    `);
-    for (const childId of synth) {
-      if (typeof childId !== 'string' || childId === id) continue;
-      try {
-        stmt.run(id, childId, projectKey, now);
-      } catch {
-        /* child missing in same scope; ignore */
+    // Conclusion edge: record this memory's synthesizes[] children in
+    // memory_synthesizes so bidirectional lookup is a single indexed
+    // query. Skip empty / duplicate / self-references. Idempotent via
+    // PRIMARY KEY (parent_id, child_id); re-saving just re-stamps the
+    // created_at, which is what callers usually want.
+    const synth = Array.isArray(input.synthesizes) ? input.synthesizes : null;
+    if (synth && synth.length > 0) {
+      const stmt = db.prepare(`
+        INSERT OR REPLACE INTO memory_synthesizes (parent_id, child_id, project_key, created_at)
+        VALUES (?, ?, ?, ?)
+      `);
+      for (const childId of synth) {
+        if (typeof childId !== 'string' || childId === id) continue;
+        try {
+          stmt.run(id, childId, projectKey, now);
+        } catch {
+          /* child missing in same scope; ignore */
+        }
       }
     }
+    db.exec('RELEASE SAVEPOINT save_memory_upsert');
+  } catch (e) {
+    try {
+      db.exec('ROLLBACK TO SAVEPOINT save_memory_upsert');
+    } catch {
+      /* ignore */
+    }
+    throw e;
   }
 
   const saved = getMemory(db, projectKey, id);
@@ -757,12 +1198,44 @@ export function getParents(db, projectKey, conclusionId, { limit = 200 } = {}) {
   return rows.map(rowToMemory);
 }
 
+// In-flight embedding-promise tracker. saveMemory schedules a microtask
+// via scheduleEmbeddingUpdate() below; we register each one in this
+// Set so closeDb() / a process.on('SIGTERM') handler can drain them
+// before the SQLite handle closes. The promise resolves when the
+// embedding row write completes (success or failure path) — including
+// the embed_timeout case where embedText returns null. Drain logic
+// uses Promise.allSettled so one rejection does not abort the others.
+const inFlightEmbeddings = new Set();
+
+function trackEmbedding(promise) {
+  inFlightEmbeddings.add(promise);
+  // Drop from the set as soon as it settles (success or failure).
+  // No-op on rejection: the caller in scheduleEmbeddingUpdate
+  // already swallows the error to keep saveMemory synchronous-fail-open.
+  promise.finally(() => inFlightEmbeddings.delete(promise));
+  return promise;
+}
+
+// Drain every in-flight embedding microtask. Called from closeDb() /
+// process exit paths so a slow embed-write does not get truncated by
+// db.close(). Bounded by a wall-clock cap so a hung encoder cannot
+// hold the process open forever; the cap is generous (10 s) so a
+// cold-cache model load has a chance to finish on the way out.
+export async function flushEmbeddings({ timeoutMs = 10000 } = {}) {
+  if (inFlightEmbeddings.size === 0) return { waited: 0 };
+  const settled = inFlightEmbeddings.size;
+  const drain = Promise.allSettled([...inFlightEmbeddings]);
+  const timer = new Promise((resolve) => setTimeout(() => resolve('timeout'), timeoutMs));
+  await Promise.race([drain, timer]);
+  return { waited: settled };
+}
+
 // Async helper: compute embedding for a saved memory and write the
 // embedding columns. Never throws — failures are recorded in the
 // `last_embed_error` column so the row's `embedding_status` flips
 // from 'pending' to 'failed' and the operator can see why.
 function scheduleEmbeddingUpdate(db, id, title, content) {
-  Promise.resolve().then(async () => {
+  const job = Promise.resolve().then(async () => {
     let vec = null;
     let embedErr = null;
     try {
@@ -815,6 +1288,7 @@ function scheduleEmbeddingUpdate(db, id, title, content) {
       /* DB write failed; nothing else we can do here */
     }
   });
+  trackEmbedding(job);
 }
 
 // Increment access_count and stamp last_accessed_at for the given ids.
@@ -822,19 +1296,22 @@ function scheduleEmbeddingUpdate(db, id, title, content) {
 function bumpAccess(db, projectKey, ids) {
   if (!ids || ids.length === 0) return;
   try {
-    const stmt = db.prepare(`UPDATE memories
-                              SET access_count = access_count + 1, last_accessed_at = ?
-                              WHERE project_key = ? AND id = ?`);
+    // One UPDATE statement per recall instead of N round-trips. The
+    // previous loop issued O(N) prepared-statement runs wrapped in a
+    // BEGIN/COMMIT; on a hot UserPromptSubmit loop that adds up.
+    // (Audit finding B2-2.)
+    const placeholders = ids.map(() => '?').join(',');
     const now = nowIso();
-    db.exec('BEGIN');
-    for (const id of ids) stmt.run(now, projectKey, id);
-    db.exec('COMMIT');
-  } catch {
-    try {
-      db.exec('ROLLBACK');
-    } catch {
-      /* ignore */
-    }
+    db.prepare(
+      `UPDATE memories
+       SET access_count = access_count + 1, last_accessed_at = ?
+       WHERE project_key = ? AND id IN (${placeholders})`,
+    ).run(now, projectKey, ...ids);
+  } catch (err) {
+    // Best-effort: a failed access bump should never break the read
+    // path. Log via the diagnostics pipeline so the operator can see
+    // the contention pattern in `_diagnostics/hooks.log`.
+    logPersistError('bump_access', err, { projectKey, count: ids.length }).catch(() => {});
   }
 }
 
@@ -968,11 +1445,45 @@ export function deleteMemory(db, projectKey, id, { hard = false } = {}) {
 }
 
 // Combined-score floor below which a candidate is treated as not
-// relevant. The hybrid score is 0.5 * ftsScore + 0.5 * vecScore; in
-// FTS-only mode (no embeddings) ftsScore is 1/(rank+1), so the
-// threshold roughly means "top 2 FTS hits OR a cosine ≥ ~0.4 OR some
-// combination". Tunable per call via the `minScore` option.
-const MIN_RELEVANCE_SCORE = 0.2;
+// relevant. Default tuning for the RRF (Reciprocal Rank Fusion) path:
+// a row that ranks first in BOTH FTS and vec scores 2/(RRF_K+1) ≈ 0.0328
+// at the default RRF_K=60. A row that ranks first in only one channel
+// scores 1/61 ≈ 0.0164. The threshold of 0.01 lets every rank-1 hit
+// in any channel through and stops a rank-2-only row (≈0.0161) only
+// when it loses both channels. Tests that need every FTS candidate
+// pass minScore=0.
+const MIN_RELEVANCE_SCORE = 0.01;
+
+// RRF (Reciprocal Rank Fusion) constant. Mirrors
+// TencentDB-Agent-Memory's RRF_K = 60 in core/store/search-utils.ts.
+// score = Σ 1 / (RRF_K + rank_i) summed across every channel that
+// ranks the candidate. A missing channel contributes 0 (we pass
+// Number.POSITIVE_INFINITY so the contribution cleanly rounds to 0).
+// Lower RRF_K sharpens the curve (rank-1 hits dominate more); the
+// default 60 is the standard RRF textbook value.
+const RRF_K = 60;
+
+/**
+ * Pure RRF combiner. Returns the RRF score for a single candidate.
+ *
+ * Inputs are channel ranks — 1-indexed, with `Number.POSITIVE_INFINITY`
+ * (or any non-finite / sub-1 value) representing "this channel did not
+ * rank the candidate". Each finite, positive rank contributes
+ * 1 / (k + rank); missing channels contribute 0. The sum is the
+ * combined RRF score.
+ *
+ * This function is exported because (a) it's useful as a unit-tested
+ * pure helper and (b) the scaffold test at tests/24-rrf-scoring.test.js
+ * imports it directly. Side-effect free; safe to call from any thread.
+ */
+export function combineRrfScores({ ftsRank, vecRank, k }) {
+  if (!Number.isFinite(k) || k <= 0) {
+    throw new Error(`combineRrfScores: k must be a positive finite number, got ${k}`);
+  }
+  const fts = Number.isFinite(ftsRank) && ftsRank >= 1 ? 1 / (k + ftsRank) : 0;
+  const vec = Number.isFinite(vecRank) && vecRank >= 1 ? 1 / (k + vecRank) : 0;
+  return fts + vec;
+}
 
 export async function searchMemories(db, projectKey, query, opts = {}) {
   if (!query || !query.trim()) return [];
@@ -992,6 +1503,50 @@ export async function searchMemories(db, projectKey, query, opts = {}) {
   const perType = !!opts.perType;
   const perTypeLimit = Math.max(1, Math.min(20, opts.perTypeLimit || 2));
   const includeScore = !!opts.includeScore;
+  // Fusion strategy. Default = 'rrf' (Reciprocal Rank Fusion, the
+  // TencentDB-aligned path). 'weighted' preserves the legacy 0.5/0.5
+  // blend for callers that need it for one release.
+  const fusion = opts.fusion === 'weighted' ? 'weighted' : 'rrf';
+  const rrfK = Number.isFinite(opts.rrfK) && opts.rrfK > 0 ? opts.rrfK : RRF_K;
+  // v10 visibility filter. Accepts either a single visibility string
+  // (e.g. 'team') or an array (e.g. ['private', 'team']). Null / empty
+  // means "no filter" — preserves the pre-v10 recall surface. The
+  // filter is pushed into both the FTS and the vector branches so a
+  // restricted row never appears via either channel.
+  let visibilityFilter = null;
+  if (typeof opts.visibility === 'string' && VISIBILITY_VALUES.has(opts.visibility)) {
+    visibilityFilter = [opts.visibility];
+  } else if (Array.isArray(opts.visibility)) {
+    const filtered = opts.visibility.filter((v) => VISIBILITY_VALUES.has(v));
+    if (filtered.length > 0) visibilityFilter = filtered;
+  }
+  // v10 tier filter. Accepts a single tier (e.g. 'L2') or an array.
+  // Tier filtering is independent of the visibility filter — a row
+  // can match both gates. Null / omitted = no tier restriction.
+  let tierFilter = null;
+  if (typeof opts.tier === 'string' && TIER_VALUES.has(opts.tier)) {
+    tierFilter = [opts.tier];
+  } else if (Array.isArray(opts.tier)) {
+    const filtered = opts.tier.filter((v) => TIER_VALUES.has(v));
+    if (filtered.length > 0) tierFilter = filtered;
+  }
+  // v10 per-tier recall budgets. Mirrors TencentDB's
+  // `recall.maxResults` + per-tier shaping: a {L0:2, L1:1, L2:1} map
+  // caps each tier independently during selection. When omitted,
+  // no per-tier shaping is applied.
+  const tierBudgets =
+    opts.tierBudgets && typeof opts.tierBudgets === 'object' ? opts.tierBudgets : null;
+  // v10 recall budgets. maxCharsPerMemory truncates an individual row's
+  // content body in the returned payload; maxTotalRecallChars drops
+  // rows from the tail once the cumulative sum exceeds the limit.
+  const maxCharsPerMemory =
+    Number.isFinite(opts.maxCharsPerMemory) && opts.maxCharsPerMemory > 0
+      ? Math.floor(opts.maxCharsPerMemory)
+      : 0;
+  const maxTotalRecallChars =
+    Number.isFinite(opts.maxTotalRecallChars) && opts.maxTotalRecallChars > 0
+      ? Math.floor(opts.maxTotalRecallChars)
+      : 0;
 
   // ---- 1. FTS5 candidates ----
   // When perType is on we want every type's hits, so we suppress the
@@ -1012,6 +1567,16 @@ export async function searchMemories(db, projectKey, query, opts = {}) {
       typeClause = ' AND m.type = ?';
       params.push(ftsType);
     }
+    let visibilityClause = '';
+    if (visibilityFilter) {
+      visibilityClause = ` AND m.visibility IN (${visibilityFilter.map(() => '?').join(',')})`;
+      params.push(...visibilityFilter);
+    }
+    let tierClause = '';
+    if (tierFilter) {
+      tierClause = ` AND m.tier IN (${tierFilter.map(() => '?').join(',')})`;
+      params.push(...tierFilter);
+    }
     // Cast a wide net for perType: pull up to `limit * 5` rows so
     // every type has a chance to be represented.
     params.push(perType ? Math.max(limit * 5, 100) : limit);
@@ -1024,7 +1589,7 @@ export async function searchMemories(db, projectKey, query, opts = {}) {
       WHERE memories_fts MATCH ?
         AND m.project_key = ?
         AND m.status = 'active'
-        AND (m.expires_at IS NULL OR datetime(m.expires_at) > datetime('now'))${typeClause}
+        AND (m.expires_at IS NULL OR datetime(m.expires_at) > datetime('now'))${typeClause}${visibilityClause}${tierClause}
       ORDER BY rank, m.priority DESC
       LIMIT ?
     `,
@@ -1052,6 +1617,14 @@ export async function searchMemories(db, projectKey, query, opts = {}) {
       where.push('type = ?');
       params.push(type);
     }
+    if (visibilityFilter) {
+      where.push(`visibility IN (${visibilityFilter.map(() => '?').join(',')})`);
+      params.push(...visibilityFilter);
+    }
+    if (tierFilter) {
+      where.push(`tier IN (${tierFilter.map(() => '?').join(',')})`);
+      params.push(...tierFilter);
+    }
     const rows = db
       .prepare(`SELECT id, embedding FROM memories WHERE ${where.join(' AND ')}`)
       .all(...params);
@@ -1063,17 +1636,29 @@ export async function searchMemories(db, projectKey, query, opts = {}) {
   }
 
   // ---- 3. Combine ----
-  // Hybrid score = 0.5 * ftsScore + 0.5 * vecScore, where ftsScore is a
-  // rank-based decay (1/(rank+1)) so top FTS hits beat later ones. A
-  // memory only present in one channel still gets a non-zero score; the
-  // combined value is a fair ranking signal either way.
-  const ftsScored = ftsRows.map((row, idx) => ({ id: row.id, row, ftsScore: 1 / (idx + 1) }));
-  const merged = new Map();
-  for (const e of ftsScored) merged.set(e.id, { row: e.row, ftsScore: e.ftsScore, vecScore: 0 });
-
+  // Each channel produces a ranked list. We turn each into a
+  // {id → rank} map, then run combineRrfScores() over both ranks per
+  // candidate. The legacy 'weighted' fusion path (0.5/0.5 blend) is
+  // preserved for callers that opt in via `fusion: 'weighted'`; the
+  // default is RRF.
+  const ftsRank = new Map();
+  ftsRows.forEach((row, idx) => ftsRank.set(row.id, idx + 1));
+  // vecScores is a Map<id, similarity>. Re-rank by similarity desc to
+  // produce vecRank = 1..N. Rows tied on similarity share the lower
+  // rank (the first tie wins).
+  const vecRank = new Map();
   if (vecScores.size > 0) {
-    // Build a lookup for any vector-only rows we need to fetch.
-    const missing = [...vecScores.keys()].filter((id) => !merged.has(id));
+    const sortedVec = [...vecScores.entries()].sort((a, b) => b[1] - a[1]);
+    sortedVec.forEach(([id], idx) => vecRank.set(id, idx + 1));
+  }
+  // Build the union of candidates from both channels. Rows in
+  // vecScores but not ftsRows need to be fetched so rowToMemory can
+  // surface the full row.
+  const merged = new Map();
+  for (const row of ftsRows)
+    merged.set(row.id, { row, ftsRank: ftsRank.get(row.id), vecRank: Number.POSITIVE_INFINITY });
+  if (vecScores.size > 0) {
+    const missing = [...vecRank.keys()].filter((id) => !merged.has(id));
     let fetched = new Map();
     if (missing.length > 0) {
       const placeholders = missing.map(() => '?').join(',');
@@ -1082,25 +1667,67 @@ export async function searchMemories(db, projectKey, query, opts = {}) {
         .all(projectKey, ...missing);
       fetched = new Map(fetchedRows.map((r) => [r.id, r]));
     }
-    for (const [id, sim] of vecScores) {
+    for (const [id, rank] of vecRank) {
       const row = merged.get(id)?.row || fetched.get(id);
       if (!row) continue;
-      const e = merged.get(id) || { row, ftsScore: 0, vecScore: 0 };
-      e.vecScore = sim;
+      const e = merged.get(id) || {
+        row,
+        ftsRank: Number.POSITIVE_INFINITY,
+        vecRank: Number.POSITIVE_INFINITY,
+      };
+      e.vecRank = rank;
       merged.set(id, e);
     }
   }
 
   // ---- 4. Score + relevance filter ----
-  // Drop anything below the relevance threshold so a fuzzy FTS hit
-  // with no semantic similarity (or vice-versa) does not pollute the
-  // recall. Pass minScore=0 to keep every candidate (used by tests).
-  let scored = [...merged.values()].map(({ row, ftsScore, vecScore }) => ({
-    row,
-    ftsScore,
-    vecScore,
-    score: 0.5 * ftsScore + 0.5 * Math.max(0, Math.min(1, vecScore)),
-  }));
+  // For RRF, score = combineRrfScores(ftsRank, vecRank). For the legacy
+  // weighted blend, score = 0.5*ftsScore + 0.5*vecScore. Drop anything
+  // below the relevance threshold so a fuzzy FTS hit with no semantic
+  // similarity (or vice-versa) does not pollute the recall. Pass
+  // minScore=0 to keep every candidate (used by tests).
+  // Per-channel score helpers shared by both fusion paths so the
+  // includeScore surface always carries fts_score + vec_score (the test
+  // at tests/13-recall-per-type.test.js:127 asserts both are numbers).
+  // A row that did NOT match a channel gets a 0 score for that channel.
+  const ftsScoreOf = (r) => (Number.isFinite(r) && r >= 1 ? 1 / r : 0);
+  const vecScoreOf = (rowId) => {
+    const sim = vecScores.get(rowId);
+    return Number.isFinite(sim) ? Math.max(0, Math.min(1, sim)) : 0;
+  };
+  let scored;
+  if (fusion === 'rrf') {
+    // Surface the rank-decayed per-channel scores alongside the RRF
+    // combined score so callers (tests, the agent's [recall] renderer)
+    // can verify per-channel attribution. A row that did NOT match a
+    // channel gets a 0 score for that channel — the natural RRF "missing
+    // channel contributes 0" semantics carry through.
+    scored = [...merged.values()].map(({ row, ftsRank, vecRank }) => ({
+      row,
+      fts_rank: ftsRank,
+      vec_rank: vecRank,
+      fts_score: ftsScoreOf(ftsRank),
+      vec_score: vecScoreOf(row.id),
+      rrf_score: combineRrfScores({ ftsRank, vecRank, k: rrfK }),
+      score: combineRrfScores({ ftsRank, vecRank, k: rrfK }),
+    }));
+  } else {
+    // Weighted fusion: build pseudo-scores from ranks so the per-channel
+    // info is still surfaced when includeScore is true. The rank-decay
+    // matches the legacy 1/(idx+1) shape.
+    scored = [...merged.values()].map(({ row, ftsRank, vecRank }) => {
+      const ftsScore = ftsScoreOf(ftsRank);
+      const vecScore = vecScoreOf(row.id);
+      return {
+        row,
+        fts_rank: ftsRank,
+        vec_rank: vecRank,
+        fts_score: ftsScore,
+        vec_score: vecScore,
+        score: 0.5 * ftsScore + 0.5 * vecScore,
+      };
+    });
+  }
   if (minScore > 0) scored = scored.filter((e) => e.score >= minScore);
 
   // ---- 5. Selection ----
@@ -1127,24 +1754,89 @@ export async function searchMemories(db, projectKey, query, opts = {}) {
     picked = scored.slice(0, limit);
   }
 
-  const out = picked.map(({ row, score, ftsScore, vecScore }) => {
+  // v10 per-tier recall budgets. When set, cap each tier independently
+  // from the picked list. This runs after perType/global selection so
+  // the budgets can down-select a balanced recall to fit the agent's
+  // context. Tiers not in the budget map are uncapped.
+  if (tierBudgets) {
+    const byTier = new Map();
+    const remaining = [];
+    for (const e of picked) {
+      const tier = e.row.tier || 'L0';
+      const cap = tierBudgets[tier];
+      if (Number.isFinite(cap) && cap >= 0) {
+        if (!byTier.has(tier)) byTier.set(tier, []);
+        const bucket = byTier.get(tier);
+        if (bucket.length < cap) {
+          bucket.push(e);
+        }
+        // Else drop — budget for this tier is full.
+      } else {
+        remaining.push(e);
+      }
+    }
+    picked = [...remaining, ...[].concat(...byTier.values())].sort((a, b) => b.score - a.score);
+  }
+
+  const out = picked.map(({ row, score, fts_rank, vec_rank, rrf_score, fts_score, vec_score }) => {
     const mem = rowToMemory(row);
     if (includeScore) {
       mem.score = score;
-      mem.fts_score = ftsScore;
-      mem.vec_score = vecScore;
+      // Always surface ranks and per-channel scores when includeScore
+      // is on — including 0 for the channel a row did NOT match.
+      // Tests assert `typeof r[0].fts_score === 'number'` and the same
+      // for vec_score (tests/13-recall-per-type.test.js:127-128), so a
+      // missing channel must be a numeric 0, not `undefined`.
+      mem.fts_rank = fts_rank;
+      mem.vec_rank = vec_rank;
+      if (rrf_score !== undefined) mem.rrf_score = rrf_score;
+      mem.fts_score = fts_score || 0;
+      mem.vec_score = vec_score || 0;
     }
     return mem;
   });
+
+  // v10 per-row character truncation. maxCharsPerMemory cuts the
+  // individual row's content + snippet to the budget; the prefix is
+  // preserved verbatim and a "…(truncated)" suffix is appended so the
+  // agent can see the cut. Suffix is in code points (surrogate-pair
+  // safe) to mirror TencentDB's MIN_TRUNCATED_RECALL_LINE_CHARS =
+  // 40 floor on a meaningful truncation length.
+  if (maxCharsPerMemory > 0) {
+    const TRUNC_SUFFIX = '…(truncated)';
+    for (const m of out) {
+      if (typeof m.content === 'string' && m.content.length > maxCharsPerMemory) {
+        // Slice on a code-point boundary.
+        let cut = maxCharsPerMemory;
+        while (cut > 0 && (m.content.charCodeAt(cut - 1) & 0xfc00) === 0xdc00) cut -= 1;
+        m.content = m.content.slice(0, cut) + TRUNC_SUFFIX;
+      }
+    }
+  }
+
+  // v10 cumulative character cap. Drop tail rows once the running sum
+  // of content lengths exceeds maxTotalRecallChars. Keeps the
+  // highest-scoring rows the agent can actually fit into context.
+  let finalOut = out;
+  if (maxTotalRecallChars > 0) {
+    let used = 0;
+    finalOut = [];
+    for (const m of out) {
+      const len = typeof m.content === 'string' ? m.content.length : 0;
+      if (used + len > maxTotalRecallChars && finalOut.length > 0) break;
+      used += len;
+      finalOut.push(m);
+    }
+  }
 
   // ---- 6. Best-effort access bump on the top results ----
   bumpAccess(
     db,
     projectKey,
-    out.map((m) => m.id),
+    finalOut.map((m) => m.id),
   );
 
-  return out;
+  return finalOut;
 }
 
 // Find memories semantically similar to a given memory id (cosine
@@ -1232,6 +1924,18 @@ export async function backfillEmbeddings(db, projectKey, { batchSize = 50, force
   }
   return { scanned: rows.length, embedded, skipped, failed };
 }
+
+// Re-export the CodeGraph helpers (Phase 5). Implementation lives in
+// src/codegraph.js; re-exporting here so the scaffold test at
+// tests/26-codegraph.test.js can keep its existing
+// `import { extractSymbolsFromText, … } from '../src/persist.js'`
+// contract.
+export {
+  extractSymbolsFromText,
+  extractCodeGraph,
+  buildCodeGraphEdges,
+  queryMemoryGraph,
+} from './codegraph.js';
 
 // ----- Importance + decay (signal-driven reinforcement) -----
 
@@ -1358,15 +2062,603 @@ export function decayMemories(db, projectKey, { now = new Date() } = {}) {
 }
 
 // Allowed kinds for memory_edges. Stable, versioned vocabulary — the
-// dashboard and any external consumers key off these strings.
-const EDGE_KINDS = new Set(['related', 'supports', 'contradicts', 'supersedes', 'synthesizes']);
+// dashboard and any external consumers key off these strings. The
+// three CodeGraph kinds (`imports`, `calls`, `defines`) were added in
+// Phase 5; the v10 + Phase 5 migration rebuilds the CHECK constraint
+// to include them.
+const EDGE_KINDS = new Set([
+  'related',
+  'supports',
+  'contradicts',
+  'supersedes',
+  'synthesizes',
+  'imports',
+  'calls',
+  'defines',
+]);
 
 export function validEdgeKinds() {
   return [...EDGE_KINDS];
 }
 
+// v10 ACL / visibility vocabulary. Five visibility levels mirroring
+// TencentDB-Agent-Memory's `AssetVisibility` enum (private, team,
+// restricted, agent, task). saveMemory falls back to 'private' when
+// the input is missing or out-of-vocabulary, so a save never produces
+// a row that bypasses the principal gate.
+const VISIBILITY_VALUES = new Set(['private', 'team', 'restricted', 'agent', 'task']);
+
+export function validVisibilityLevels() {
+  return [...VISIBILITY_VALUES];
+}
+
+// Shared DB location + accessor. The cross-project shared pool lives
+// at <kimiHome>/kimi-memory/_shared/memory.sqlite with the literal
+// project_key '_shared' so per-project queries never accidentally hit
+// it. The path is sibling to globalDataDir — both underscore-prefixed
+// names live at the top level of the data root.
+export const SHARED_DIR_NAME = '_shared';
+export const SHARED_PROJECT_KEY = '_shared';
+
+export function sharedDataDir(kimiHomeDir) {
+  return path.join(kimiHomeDir, 'kimi-memory', SHARED_DIR_NAME);
+}
+
+export function sharedDbPath(kimiHomeDir) {
+  return path.join(sharedDataDir(kimiHomeDir), 'memory.sqlite');
+}
+
+// openSharedDb is a thin wrapper around openDb(sharedDbPath(...)) that
+// returns the cached handle on subsequent calls. openDb itself caches
+// by dbPath, so the handle is shared across calls — the tests at
+// tests/29-visibility-acl.test.js rely on identity equality.
+export function openSharedDb(kimiHomeDir) {
+  return openDb(sharedDbPath(kimiHomeDir));
+}
+
+// v10 tier model (Chat Memory L0→L1→L2→L3). The four levels mirror
+// TencentDB-Agent-Memory's distillation pipeline:
+//   L0 — raw save (a memory just landed; no promotion yet)
+//   L1 — Stop-hook auto-extract promoted it to working state
+//   L2 — access pattern promoted it to durable state
+//   L3 — explicitly promoted by the agent or operator (curated)
+// Every new save lands at L0; promote / demote move it along the
+// chain with an audit row in persona_promotions.
+const TIER_VALUES = new Set(['L0', 'L1', 'L2', 'L3']);
+
+export function validTiers() {
+  return [...TIER_VALUES];
+}
+
+export function isValidTier(v) {
+  return TIER_VALUES.has(v);
+}
+
+// Promote one or more memories to a new visibility level. Two modes:
+//
+//   toSharedPool: false (default)
+//     Update the row in-place. The memory stays in its project DB but
+//     `visibility` and `shared_with` change so the read paths can see
+//     it through the new ACL gate. `sharedWith` is a JSON-encoded list
+//     of principal descriptors (e.g. ['user:alice','role:editor']).
+//
+//   toSharedPool: true
+//     Move the row out of the project DB into the cross-project shared
+//     DB at _shared/memory.sqlite with project_key='_shared'. The row
+//     keeps the same id so callers holding the id don't break. FTS5
+//     rows are re-created on the target DB and dropped on the source.
+//
+// Returns { moved, updated }. `moved` is the count of rows physically
+// relocated (toSharedPool=true path). `updated` is the count of rows
+// whose visibility was rewritten in place. They sum to the number of
+// ids the call acted on; ids that did not exist in `projectKey` are
+// silently skipped (idempotent — re-running with the same ids is a
+// no-op). Throws on an invalid visibility level; the caller is
+// expected to validate input before invoking.
+export function shareMemory(db, projectKey, ids, opts = {}) {
+  if (!Array.isArray(ids) || ids.length === 0) return { moved: 0, updated: 0 };
+  const visibility = opts.visibility;
+  if (!VISIBILITY_VALUES.has(visibility)) {
+    throw new Error(`invalid visibility: ${visibility}`);
+  }
+  const sharedWith = Array.isArray(opts.sharedWith) ? opts.sharedWith : [];
+  const toSharedPool = !!opts.toSharedPool;
+  const kimiHomeDir = opts.kimiHomeDir;
+
+  if (toSharedPool) {
+    if (!kimiHomeDir) {
+      throw new Error('shareMemory: toSharedPool=true requires kimiHomeDir');
+    }
+    // Defence-in-depth: refuse to promote a row whose title or content
+    // matches a known credential shape. The save-side `assertNoSecret`
+    // already blocks the original write, but a row could have been
+    // saved under an older scanner revision, or the operator may have
+    // imported via the legacy bulk path. Re-checking here keeps the
+    // README's "the check is enforced at the lowest layer" claim true
+    // for the cross-DB promotion path too.
+    const idSet = new Set(ids);
+    const candidates = db
+      .prepare(
+        `SELECT id, title, content FROM memories WHERE project_key = ? AND id IN (${[...idSet]
+          .map(() => '?')
+          .join(',')})`,
+      )
+      .all(projectKey, ...idSet);
+    for (const r of candidates) {
+      if (looksLikeSecret(r.title || '') || looksLikeSecret(r.content || '')) {
+        const err = new Error(
+          `secret_detected: refusing to share memory ${r.id} — title or content matches a known credential shape. Remove the secret and retry, or set KIMI_MEMORY_SECRET_SCAN=off to bypass.`,
+        );
+        err.code = 'KIMI_MEMORY_SECRET_DETECTED';
+        throw err;
+      }
+    }
+
+    const sharedDb = openSharedDb(kimiHomeDir);
+    // We move rows one at a time inside a single transaction on the
+    // source DB. The shared DB's writes piggy-back on the same call
+    // site; node:sqlite uses a single connection per dbPath so the
+    // target handle is on its own connection and does not need its own
+    // transaction wrapper for atomicity from the caller's view.
+    const now = nowIso();
+    let moved = 0;
+    db.exec('BEGIN');
+    try {
+      for (const id of ids) {
+        const row = db
+          .prepare('SELECT * FROM memories WHERE id=? AND project_key=?')
+          .get(id, projectKey);
+        if (!row) continue;
+        // Insert into shared DB with project_key='_shared', preserving
+        // every column the schema knows about. Idempotent via the row
+        // PRIMARY KEY (id); if a row with the same id is already in
+        // the shared DB we leave it and still remove from the source
+        // so the caller observes a "move" — the target stays at the
+        // version it already had, which is the safer failure mode.
+        try {
+          sharedDb
+            .prepare(
+              `INSERT OR IGNORE INTO memories (
+                id, project_key, type, title, content, tags, metadata, provenance,
+                confidence, status, priority, supersedes, superseded_by,
+                created_at, updated_at, expires_at,
+                embedding, embedding_model, embedding_dim, embedded_at,
+                access_count, last_accessed_at,
+                stability_days, last_rehearsed_at,
+                last_embed_error,
+                visibility, shared_with,
+                team_id, agent_id, user_id, session_id, task_id,
+                tier, persona_id
+              ) VALUES (?, '_shared', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            )
+            .run(
+              row.id,
+              row.type,
+              row.title,
+              row.content,
+              row.tags,
+              row.metadata,
+              row.provenance,
+              row.confidence,
+              row.status,
+              row.priority,
+              row.supersedes,
+              row.superseded_by,
+              row.created_at,
+              now,
+              row.expires_at,
+              row.embedding,
+              row.embedding_model,
+              row.embedding_dim,
+              row.embedded_at,
+              row.access_count,
+              row.last_accessed_at,
+              row.stability_days,
+              row.last_rehearsed_at,
+              row.last_embed_error,
+              visibility,
+              JSON.stringify(sharedWith),
+              row.team_id,
+              row.agent_id,
+              row.user_id,
+              row.session_id,
+              row.task_id,
+              row.tier,
+              row.persona_id,
+            );
+        } catch (e) {
+          // Surface as a per-id error so the caller can decide; the
+          // shared DB write should not silently disappear.
+          throw new Error(
+            `shareMemory: failed to insert into shared DB for ${id}: ${e && e.message}`,
+          );
+        }
+        // Re-stamp FTS in the shared DB so the move is visible to
+        // recall. memories_fts mirrors memories 1:1 by id.
+        sharedDb.prepare('DELETE FROM memories_fts WHERE id=?').run(id);
+        sharedDb
+          .prepare(
+            'INSERT INTO memories_fts (id, project_key, type, title, content, tags) VALUES (?, ?, ?, ?, ?, ?)',
+          )
+          .run(id, '_shared', row.type, row.title || '', row.content || '', row.tags || '[]');
+        // Remove from the source DB (memories + FTS). The source
+        // DELETE is the point of the move — keep the shared row even
+        // if the FTS delete errors, since the row itself is the
+        // primary deliverable.
+        db.prepare('DELETE FROM memories WHERE id=? AND project_key=?').run(id, projectKey);
+        db.prepare('DELETE FROM memories_fts WHERE id=?').run(id);
+        moved += 1;
+      }
+      db.exec('COMMIT');
+    } catch (e) {
+      try {
+        db.exec('ROLLBACK');
+      } catch {
+        /* ignore */
+      }
+      throw e;
+    }
+    return { moved, updated: 0 };
+  }
+
+  // In-place update path: rewrite visibility + shared_with on every id
+  // that exists in the source DB. Ids that don't exist are skipped
+  // silently so the call is idempotent (re-running with the same ids
+  // is a no-op).
+  const now = nowIso();
+  let updated = 0;
+  const stmt = db.prepare(
+    `UPDATE memories SET visibility = ?, shared_with = ?, updated_at = ?
+     WHERE id = ? AND project_key = ?`,
+  );
+  db.exec('BEGIN');
+  try {
+    for (const id of ids) {
+      const r = stmt.run(visibility, JSON.stringify(sharedWith), now, id, projectKey);
+      if (r.changes > 0) updated += 1;
+    }
+    db.exec('COMMIT');
+  } catch (e) {
+    try {
+      db.exec('ROLLBACK');
+    } catch {
+      /* ignore */
+    }
+    throw e;
+  }
+  return { moved: 0, updated };
+}
+
+// v10: tier (Chat Memory L0→L1→L2→L3) management. Every transition
+// writes a row to persona_promotions so memory_tier_history can
+// reconstruct the lineage. promote/demote compute the next tier from
+// the current one (L0→L1→L2→L3 in either direction); setMemoryTier is
+// the explicit override.
+//
+// All three return { memory, transition } where transition is the
+// audit row, or { memory: null } when the memory is missing / soft-
+// deleted. Throws on invalid tier input; the caller is expected to
+// validate before invoking.
+
+function recordPromotion(db, memoryId, fromTier, toTier, reason) {
+  const id = shortId(hashId('promo', memoryId, fromTier, toTier, reason || '', nowIso()), 16);
+  db.prepare(
+    `INSERT INTO persona_promotions (id, memory_id, from_tier, to_tier, reason, at)
+     VALUES (?, ?, ?, ?, ?, ?)`,
+  ).run(id, memoryId, fromTier, toTier, reason || null, nowIso());
+  return {
+    id,
+    memory_id: memoryId,
+    from_tier: fromTier,
+    to_tier: toTier,
+    reason: reason || null,
+    at: nowIso(),
+  };
+}
+
+export function setMemoryTier(db, projectKey, memoryId, targetTier, { reason } = {}) {
+  if (!TIER_VALUES.has(targetTier)) {
+    throw new Error(`invalid tier: ${targetTier}`);
+  }
+  const row = db
+    .prepare("SELECT id, tier FROM memories WHERE id=? AND project_key=? AND status='active'")
+    .get(memoryId, projectKey);
+  if (!row) return { memory: null, transition: null };
+  if (row.tier === targetTier) {
+    return {
+      memory: getMemory(db, projectKey, memoryId),
+      transition: null,
+    };
+  }
+  db.prepare(`UPDATE memories SET tier = ?, updated_at = ? WHERE id = ? AND project_key = ?`).run(
+    targetTier,
+    nowIso(),
+    memoryId,
+    projectKey,
+  );
+  const transition = recordPromotion(db, memoryId, row.tier, targetTier, reason);
+  return {
+    memory: getMemory(db, projectKey, memoryId),
+    transition,
+  };
+}
+
+// Promote one tier up (capped at L3). Returns { memory, transition }.
+export function promoteMemory(db, projectKey, memoryId, { reason } = {}) {
+  const row = db
+    .prepare("SELECT tier FROM memories WHERE id=? AND project_key=? AND status='active'")
+    .get(memoryId, projectKey);
+  if (!row) return { memory: null, transition: null };
+  const order = ['L0', 'L1', 'L2', 'L3'];
+  const idx = order.indexOf(row.tier);
+  if (idx < 0 || idx === order.length - 1) {
+    return {
+      memory: getMemory(db, projectKey, memoryId),
+      transition: null,
+    };
+  }
+  return setMemoryTier(db, projectKey, memoryId, order[idx + 1], { reason });
+}
+
+// Demote one tier down (floor at L0). Returns { memory, transition }.
+export function demoteMemory(db, projectKey, memoryId, { reason } = {}) {
+  const row = db
+    .prepare("SELECT tier FROM memories WHERE id=? AND project_key=? AND status='active'")
+    .get(memoryId, projectKey);
+  if (!row) return { memory: null, transition: null };
+  const order = ['L0', 'L1', 'L2', 'L3'];
+  const idx = order.indexOf(row.tier);
+  if (idx <= 0) {
+    return {
+      memory: getMemory(db, projectKey, memoryId),
+      transition: null,
+    };
+  }
+  return setMemoryTier(db, projectKey, memoryId, order[idx - 1], { reason });
+}
+
+// Return the audit log of tier transitions for a memory, oldest-first.
+export function listTierHistory(db, projectKey, memoryId, { limit = 200 } = {}) {
+  const rows = db
+    .prepare(
+      `SELECT id, memory_id, from_tier, to_tier, reason, at
+       FROM persona_promotions
+       WHERE memory_id = ?
+       ORDER BY datetime(at) ASC, id ASC
+       LIMIT ?`,
+    )
+    .all(memoryId, Math.max(1, Math.min(500, limit)));
+  return rows;
+}
+
+// ----- v10 Skill assets (Phase 6) -----
+//
+// Skills are memories with type='skill' that carry a structured trigger
+// surface in metadata.trigger ({commands, paths, keywords}). The hook
+// layer calls matchSkillTriggers on every UserPromptSubmit so a stored
+// skill can surface as a one-line hint alongside the recall lines.
+// Invocations are recorded in skill_invocations for stats / ranking.
+
+/**
+ * Score every active skill against an arbitrary (command?, file_path?,
+ * ...arbitrary) tool-call args shape. Each skill carries a trigger
+ * object with at most three arrays: `commands` (substring match on the
+ * `command` field), `paths` (suffix/segment match on the `file_path`
+ * field), and `keywords` (substring match on any other string value).
+ *
+ * Returns the top `limit` matches by score, descending. Empty trigger
+ * objects produce no match.
+ */
+export function matchSkillTriggers(db, projectKey, args, { limit = 5 } = {}) {
+  const cap = Math.max(1, Math.min(50, limit));
+  const argCommand = typeof args.command === 'string' ? args.command : '';
+  const argPath = typeof args.file_path === 'string' ? args.file_path : '';
+  // Other arbitrary string values get keyword-scanned.
+  const keywordHaystack = Object.entries(args || {})
+    .filter(([k, v]) => typeof v === 'string' && k !== 'command' && k !== 'file_path')
+    .map(([, v]) => v)
+    .join(' ');
+  const rows = db
+    .prepare(
+      `SELECT id, type, title, content, tags, metadata, provenance, confidence, status,
+              priority, supersedes, superseded_by, created_at, updated_at,
+              expires_at, embedding, embedding_model, last_embed_error,
+              access_count, last_accessed_at, stability_days, last_rehearsed_at,
+              visibility, shared_with, team_id, agent_id, user_id, session_id,
+              task_id, tier, persona_id
+         FROM memories
+        WHERE project_key = ? AND type = 'skill' AND status = 'active'`,
+    )
+    .all(projectKey);
+  const matches = [];
+  for (const row of rows) {
+    let meta;
+    try {
+      meta = JSON.parse(row.metadata || '{}');
+    } catch {
+      meta = {};
+    }
+    const trig = meta.trigger || {};
+    if (!trig || typeof trig !== 'object') continue;
+    let score = 0;
+    const cmdList = Array.isArray(trig.commands) ? trig.commands : [];
+    const pathList = Array.isArray(trig.paths) ? trig.paths : [];
+    const kwList = Array.isArray(trig.keywords) ? trig.keywords : [];
+    if (cmdList.length > 0 && argCommand) {
+      for (const c of cmdList) {
+        if (typeof c !== 'string' || c.length === 0) continue;
+        if (argCommand.includes(c)) {
+          score += 2.0;
+          break;
+        }
+      }
+    }
+    if (pathList.length > 0 && argPath) {
+      for (const p of pathList) {
+        if (typeof p !== 'string' || p.length === 0) continue;
+        // Path match: suffix match OR exact segment match (last path
+        // component equal). Tolerant of forward/back slashes.
+        const norm = (s) => s.replace(/\\/g, '/').toLowerCase();
+        if (
+          norm(argPath).endsWith('/' + norm(p)) ||
+          norm(argPath).endsWith(norm(p)) ||
+          norm(argPath) === norm(p)
+        ) {
+          score += 1.5;
+          break;
+        }
+      }
+    }
+    if (kwList.length > 0 && keywordHaystack) {
+      for (const k of kwList) {
+        if (typeof k !== 'string' || k.length === 0) continue;
+        if (keywordHaystack.toLowerCase().includes(k.toLowerCase())) {
+          score += 1.0;
+          break;
+        }
+      }
+    }
+    if (score > 0) {
+      matches.push({ row, score });
+    }
+  }
+  matches.sort((a, b) => b.score - a.score);
+  const top = matches.slice(0, cap);
+  return top.map((m) => ({
+    ...rowToMemory(m.row),
+    trigger_score: m.score,
+  }));
+}
+
+/**
+ * Record a single skill invocation. Inserts a row into
+ * skill_invocations with success/failure flag and tool name.
+ *
+ * The scaffold test calls this with `{success: 0|1, toolName: 'x'}`;
+ * durationMs is optional and may be added later.
+ */
+export function recordSkillInvocation(
+  db,
+  projectKey,
+  skillId,
+  { success, toolName, durationMs = null } = {},
+) {
+  const ok = success === 1 || success === true ? 1 : 0;
+  // Three calls in the same millisecond would otherwise collide on
+  // PRIMARY KEY; mix in nanoseconds + a per-call counter so the id
+  // is unique even under tight loops.
+  const stamp = `${nowIso()}:${Date.now() % 1e9}:${Math.floor(Math.random() * 1e9)}`;
+  const id = shortId(hashId('skinv', projectKey, skillId, stamp), 16);
+  db.prepare(
+    `INSERT INTO skill_invocations (id, skill_id, project_key, tool_name, success, duration_ms, invoked_at)
+     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+  ).run(id, skillId, projectKey, toolName || null, ok, durationMs, nowIso());
+  return { id, skill_id: skillId, success: ok };
+}
+
+/**
+ * Aggregate skill_invocations for a skill: count and success rate.
+ * Returns { invoke_count, success_rate } where success_rate is a float
+ * in [0, 1] (or 0 when invoke_count is 0).
+ */
+export function updateSkillInvocationStats(db, projectKey, skillId) {
+  const row = db
+    .prepare(
+      `SELECT COUNT(*) AS total, COALESCE(SUM(success), 0) AS successes
+       FROM skill_invocations
+       WHERE project_key = ? AND skill_id = ?`,
+    )
+    .get(projectKey, skillId);
+  const total = row ? row.total : 0;
+  const successes = row ? row.successes : 0;
+  const success_rate = total > 0 ? successes / total : 0;
+  return { invoke_count: total, success_rate };
+}
+
+/**
+ * List every active skill in the project. Excludes superseded rows
+ * and any row whose processing_status === 'pending' (the scaffold
+ * test asserts that pending rows are filtered).
+ */
+export function listSkillMemories(db, projectKey) {
+  const rows = db
+    .prepare(
+      `SELECT * FROM memories
+       WHERE project_key = ? AND type = 'skill' AND status = 'active'`,
+    )
+    .all(projectKey);
+  const out = [];
+  for (const r of rows) {
+    let meta;
+    try {
+      meta = JSON.parse(r.metadata || '{}');
+    } catch {
+      meta = {};
+    }
+    if (meta.processing_status === 'pending') continue;
+    out.push(rowToMemory(r));
+  }
+  return out;
+}
+
 export function isValidEdgeKind(kind) {
   return EDGE_KINDS.has(kind);
+}
+
+// ----- Lazy tool registry re-exports -----
+//
+// `buildToolRegistry` and `filterToolRegistry` are implemented in the
+// standalone `./tool-registry.js` module so both `persist.js` and
+// `server.js` can import them without creating a circular dependency
+// (server.js already imports from persist.js). The test
+// `tests/27-tools-lazy.test.js` imports them directly from persist.js,
+// which is why the re-exports live here.
+export { buildToolRegistry, filterToolRegistry } from './tool-registry.js';
+
+// ----- Processing pipeline -----
+//
+// promotePendingRows walks the active memories for a project and
+// advances the per-row `processing_status` field (stored under
+// metadata.processing_status by saveMemory) one step at a time:
+//
+//   pending    -> distilling   (skill is being extracted / analysed)
+//   distilling -> ready        (extraction finished, row is recallable)
+//   ready      -> ready        (no-op)
+//
+// `limit` caps how many rows are touched in one call so a hook caller
+// cannot accidentally spend an entire event budget promoting N rows.
+// The cap is clamped to [1, 10] to keep the contract bounded.
+export function promotePendingRows(db, projectKey, { limit = 10 } = {}) {
+  const cap = Math.max(1, Math.min(10, Math.trunc(limit)));
+  const rows = db
+    .prepare(
+      `SELECT id, metadata FROM memories
+       WHERE project_key = ? AND status = 'active'
+         AND (instr(metadata, '"processing_status":"pending"') > 0
+              OR instr(metadata, '"processing_status":"distilling"') > 0)
+       LIMIT ?`,
+    )
+    .all(projectKey, cap);
+  let promoted = 0;
+  const now = nowIso();
+  const updateStmt = db.prepare(`UPDATE memories SET metadata = ?, updated_at = ? WHERE id = ?`);
+  for (const r of rows) {
+    let meta;
+    try {
+      meta = JSON.parse(r.metadata || '{}');
+    } catch {
+      meta = {};
+    }
+    const current = meta.processing_status;
+    let next;
+    if (current === 'pending') next = 'distilling';
+    else if (current === 'distilling') next = 'ready';
+    else continue;
+    meta.processing_status = next;
+    updateStmt.run(JSON.stringify(meta), now, r.id);
+    promoted += 1;
+  }
+  return { promoted };
 }
 
 // Deterministic id for an edge. Same (project_key, from, to, kind)

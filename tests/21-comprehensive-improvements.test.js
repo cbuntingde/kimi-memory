@@ -18,7 +18,8 @@ import {
 } from '../src/concurrency.js';
 import { normalizeFts5Query, buildTitleBoostedQuery, buildOrderByClause } from '../src/search.js';
 import { getConversationsToArchive, getMemoriesToPrune, estimateDbSize } from '../src/lifecycle.js';
-import { validateConfig, parseTomlLike, mergeConfigWithEnv } from '../src/config.js';
+import { validateConfig, mergeConfigWithEnv } from '../src/config.js';
+import { parseToml } from '../src/toml.js';
 
 test('retry: exponential backoff with jitter', () => {
   // Test increasing delays
@@ -147,7 +148,7 @@ nested = "value"
 # This is a comment
 `;
 
-  const parsed = parseTomlLike(content);
+  const parsed = parseToml(content);
   assert.equal(parsed.section1.key1, 'quoted string', 'should parse quoted strings');
   assert.equal(parsed.section1.key2, 'unquoted', 'should parse unquoted strings');
   assert.equal(parsed.section1.key3, true, 'should parse booleans');

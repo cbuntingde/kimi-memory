@@ -34,12 +34,6 @@ export function recordWriteEnd(dbPath, operation, durationMs) {
   }
 }
 
-// Detect if a write is being blocked by another writer.
-export function isWriteContending(dbPath) {
-  const entry = activeWrites.get(dbPath);
-  return entry && entry.count > 1;
-}
-
 // Get current concurrency status for a database.
 export function getConcurrencyStatus(dbPath) {
   const entry = activeWrites.get(dbPath);
@@ -120,13 +114,4 @@ export function isSqliteBusyError(error) {
   if (!error) return false;
   const message = String(error.message || error).toLowerCase();
   return message.includes('sqlite_busy') || message.includes('database is locked');
-}
-
-// Calculate backoff for database lock contention.
-export function calculateDbBackoffMs(attempt, baseMs = 50) {
-  // Exponential backoff, but shorter delays than network calls.
-  const exponential = baseMs * Math.pow(2, attempt);
-  const capped = Math.min(exponential, 5000);
-  const jitter = capped * 0.1 * (Math.random() * 2 - 1);
-  return Math.max(0, Math.round(capped + jitter));
 }

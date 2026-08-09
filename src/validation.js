@@ -1,7 +1,12 @@
 // Input validation shared between MCP tools and tests.
 import { canonicalizeRoot } from './project-key.js';
 
-const TYPES = new Set(['working', 'episodic', 'semantic', 'procedural', 'conclusion']);
+// Memory type vocabulary. Must mirror the CHECK constraint on
+// memories.type in src/persist.js SCHEMA_SQL (line 634) and every
+// migration's rebuild clause. The v10 skill phase added 'skill' here
+// so memory_save / memory_list / memory_save_bulk accept it; the DB
+// layer already accepted it from migrateAddSkillType.
+const TYPES = new Set(['working', 'episodic', 'semantic', 'procedural', 'conclusion', 'skill']);
 const STATUSES = new Set(['active', 'superseded', 'deleted']);
 const SLOTS = new Set([
   'current_focus',

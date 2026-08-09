@@ -4,16 +4,7 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { logConfigValidationError } from './diagnostics.js';
-import { parseToml as parseTomlReal } from './toml.js';
-
-// Config-only TOML surface. The shared parser in toml.js handles a
-// superset (dotted section paths, escape sequences) — config schema
-// only consumes a single flat section, so this thin wrapper is the
-// only public signature the rest of the project needs to know.
-export function parseTomlLike(content) {
-  if (!content || typeof content !== 'string') return {};
-  return parseTomlReal(content);
-}
+import { parseToml } from './toml.js';
 
 // Configuration schema and validation.
 const DEFAULT_CONFIG = {
@@ -72,7 +63,7 @@ export function validateConfig(raw) {
 export async function loadConfig(filePath) {
   try {
     const content = await fs.readFile(filePath, 'utf8');
-    const parsed = parseTomlLike(content);
+    const parsed = content ? parseToml(content) : {};
     const validated = validateConfig(parsed);
 
     if (!validated.ok) {
