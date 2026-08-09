@@ -19,6 +19,7 @@
 // degrades gracefully.
 
 import { searchMemories } from '../persist.js';
+import { PATH_REGEX, SHELL_VERB_REGEX } from '../util.js';
 
 const TOOL_RECALL_MAX = 2;
 // Score floor for a tool-recall hit. Default `minScore=0.01` matches
@@ -27,9 +28,6 @@ const TOOL_RECALL_MAX = 2;
 // surface. Mid-turn recall is best-effort; a too-aggressive floor
 // defeats the point. Pass `minScore` in opts to override.
 const TOOL_RECALL_MIN_SCORE = 0.01;
-const PATH_REGEX = /(?:[a-zA-Z]:)?[\\/][^\s"',;]+[\\/][^\s"',;]+/g;
-const SHELL_VERB_REGEX =
-  /\b(pnpm|npm|yarn|bun|node|npx|tsx|ts-node|python|pip|cargo|go|make|cmake|gradle|mvn|docker|kubectl|git|curl|wget|brew|apt|systemctl)\b/g;
 
 // Extract a query string from a tool-call payload. The Kimi wire
 // payload may be a JSON object (file_path, command, content…) or a

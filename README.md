@@ -190,7 +190,7 @@ Save with `memory_save({ type: "conclusion", synthesizes: [childId, ...] })`. Li
 - **Cross-session narrative** — `SessionStart` lists the last 3 sessions for the project, oldest → newest, with each session's focus title and body snippet. Pick-up phrasing: `Picking up the thread: <oldest session title>`.
 - **Background consolidation ("dream pass")** — every `SessionStart`, related memories (cosine ≥ 0.75, ≥ 2 shared tags) are clustered; each cluster of ≥ 3 siblings without a `conclusion` child gets one synthesised. Idempotent via `memory_synthesizes` coverage check. Opt out via `KIMI_MEMORY_CONSOLIDATE=off`.
 
-Schema `SCHEMA_VERSION = 9` adds `stability_days` and `last_rehearsed_at` to `memories`. Existing rows are backfilled on first open (stability defaults to 30, last_rehearsed_at defaults to updated_at).
+Schema `SCHEMA_VERSION = 10` is the current migration target. The v9 bump added `stability_days` and `last_rehearsed_at`; the v10 bump added ACL/visibility columns (`visibility`, `shared_with`, `team_id`, `agent_id`, `user_id`, `session_id`, `task_id`) + `tier` + `persona_id` + the `metadata` column on `memory_edges`. Existing rows are backfilled on first open via column defaults; pre-v10 rows get `visibility='private'`, `shared_with='[]'`, `tier='L0'`, `stability_days=30`.
 
 ### Session focus — "where we left off"
 

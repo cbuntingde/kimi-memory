@@ -130,6 +130,20 @@ export async function logAutoExtractRetry(projectKey, attempt, delayMs, reason) 
   await appendLog(record);
 }
 
+// Free-form hook diagnostic. Used by the hook runner for info / warn
+// entries that don't fit a specific failure shape. (Audit SG-4.)
+export async function logHookDiag(event, level, message, context = {}) {
+  const record = {
+    timestamp: nowIso(),
+    type: 'hook_diag',
+    event,
+    level,
+    message,
+    context,
+  };
+  await appendLog(record);
+}
+
 export async function logConfigValidationError(error, context = {}) {
   const record = {
     timestamp: nowIso(),

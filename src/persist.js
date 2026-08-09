@@ -24,7 +24,6 @@ import {
   cosineSimilarity,
 } from './embedding.js';
 import { logPersistError, logEmbeddingError, logPerformanceMetric } from './diagnostics.js';
-import { recordWriteStart, recordWriteEnd, isSqliteBusyError } from './concurrency.js';
 
 const SCHEMA_VERSION = 10;
 
@@ -906,19 +905,58 @@ function safeParseJson(text, fallback, isShape) {
 // generic "api_key" is far cheaper than persisting a real one.
 function assertNoSecret(input) {
   if (process.env.KIMI_MEMORY_SECRET_SCAN === 'off') return;
-  const titleMatch = input.title && looksLikeSecret(input.title);
-  const contentMatch = input.content && looksLikeSecret(input.content);
-  if (titleMatch || contentMatch) {
-    const where =
-      titleMatch && contentMatch ? 'title and content' : titleMatch ? 'title' : 'content';
-    const err = new Error(
-      `secret_detected: refusing to persist a memory whose ${where} matches a known credential shape. ` +
-        `Remove the secret and retry, or set KIMI_MEMORY_SECRET_SCAN=off to bypass.`,
-    );
-    err.code = 'KIMI_MEMORY_SECRET_DETECTED';
-    err.where = where;
-    throw err;
+  // Tags and metadata are checked too — the previous version only
+  // scanned title and content, leaving a small gap for credentials
+  // stashed in tag names or structured metadata.
+  // (Audit finding B2-11.)
+  const matched = [];
+  // Title + content as flat strings.
+  for (const name of ['title', 'content']) {
+    if (typeof input[name] === 'string' && looksLikeSecret(input[name])) {
+      matched.push(name);
+    }
   }
+  // Each tag value individually — the JSON-encoded array would
+  // start with `["` and the existing regex's leading-char boundary
+  // would miss a secret that begins at position 0 of a tag.
+  if (Array.isArray(input.tags)) {
+    for (const t of input.tags) {
+      if (typeof t === 'string' && looksLikeSecret(t)) {
+        matched.push('tags');
+        break;
+      }
+    }
+  }
+  // The metadata object's string values, recursively. Stash the
+  // serialised JSON as a fallback for shapes the recursion can't
+  // reach (e.g. deeply nested arrays of objects).
+  function scan(value, path) {
+    if (typeof value === 'string') {
+      if (looksLikeSecret(value)) matched.push(path);
+      return;
+    }
+    if (Array.isArray(value)) {
+      for (let i = 0; i < value.length; i++) scan(value[i], `${path}[${i}]`);
+      return;
+    }
+    if (value && typeof value === 'object') {
+      for (const k of Object.keys(value)) scan(value[k], `${path}.${k}`);
+    }
+  }
+  if (input.metadata && typeof input.metadata === 'object') {
+    scan(input.metadata, 'metadata');
+  }
+  if (matched.length === 0) return;
+  // De-dupe matched paths so the error message is concise.
+  const unique = [...new Set(matched.map((p) => p.split(/[.\[]/)[0] === 'metadata' ? 'metadata' : p.split(/[.\[]/)[0]))];
+  const where = unique.length > 1 ? unique.join(' + ') : unique[0];
+  const err = new Error(
+    `secret_detected: refusing to persist a memory whose ${where} matches a known credential shape. ` +
+      `Remove the secret and retry, or set KIMI_MEMORY_SECRET_SCAN=off to bypass.`,
+  );
+  err.code = 'KIMI_MEMORY_SECRET_DETECTED';
+  err.where = where;
+  throw err;
 }
 
 export function saveMemory(db, projectKey, input) {
@@ -2341,9 +2379,15 @@ export function shareMemory(db, projectKey, ids, opts = {}) {
 // validate before invoking.
 
 function recordPromotion(db, memoryId, fromTier, toTier, reason) {
-  const id = shortId(hashId('promo', memoryId, fromTier, toTier, reason || '', nowIso()), 16);
+  // Mix ms + ns + a random int into the id stamp so two transitions
+  // in the same second produce different ids. Same pattern as
+  // recordSkillInvocation. INSERT OR IGNORE keeps the PRIMARY KEY
+  // safety net for the rare ms-collision case.
+  // (Audit finding B2-6.)
+  const stamp = `${nowIso()}:${Date.now() % 1e9}:${Math.floor(Math.random() * 1e9)}`;
+  const id = shortId(hashId('promo', memoryId, fromTier, toTier, reason || '', stamp), 16);
   db.prepare(
-    `INSERT INTO persona_promotions (id, memory_id, from_tier, to_tier, reason, at)
+    `INSERT OR IGNORE INTO persona_promotions (id, memory_id, from_tier, to_tier, reason, at)
      VALUES (?, ?, ?, ?, ?, ?)`,
   ).run(id, memoryId, fromTier, toTier, reason || null, nowIso());
   return {

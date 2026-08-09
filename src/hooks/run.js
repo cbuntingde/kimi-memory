@@ -12,7 +12,7 @@
 // grows without blocking Kimi's lifecycle.
 import path from 'node:path';
 import { existsSync, promises as fs } from 'node:fs';
-import { kimiHome, readStdin, safeJsonParse, nowIso, asString } from '../util.js';
+import { kimiHome, readStdin, safeJsonParse, nowIso, asString, PATH_REGEX } from '../util.js';
 import {
   canonicalizeRoot,
   deriveProjectKey,
@@ -55,15 +55,10 @@ import {
 import { matchAdvisor, logAdvisorDiag } from '../advisor/detect.js';
 import { runConsolidate } from '../consolidate.js';
 import { runToolRecall, formatToolRecallLines } from './tool-recall.js';
+import { logHookDiag } from '../diagnostics.js';
 
 const EVENT = asString(process.env.KM_HOOK_EVENT) || 'unknown';
 const HOME = kimiHome();
-// Diagnostics live next to the plugin's own source tree so the plugin is
-// self-contained. `import.meta.dirname` of `src/hooks/run.js` resolves to
-// `.../plugins/managed/kimi-memory/src/hooks/`; walk up two levels.
-const DIAG_DIR = path.resolve(import.meta.dirname, '..', '..', '_diagnostics');
-const DIAG_LOG = path.join(DIAG_DIR, 'hooks.log');
-const DIAG_LOG_MAX_BYTES = 1024 * 1024; // 1 MiB before rotation.
 
 // Safety caps. Previews are bounded because the SessionStart payload is
 // forwarded to model context; we never want a runaway payload.
@@ -88,28 +83,13 @@ const PAYLOAD_CWD_KEYS = [
 const PAYLOAD_SESSION_KEYS = ['session_id', 'sessionId', 'session', 'id'];
 const PAYLOAD_PROMPT_KEYS = ['prompt', 'user_prompt', 'text', 'input'];
 
+// Diagnostics route through the shared `diagnostics.js` logger so
+// every hook entry lands in the same `<kimiHome>/kimi-memory/_diagnostics/hooks.log`
+// the `memory_diagnostics` MCP tool reads. The previous implementation
+// wrote a parallel log into `<pluginRoot>/_diagnostics/hooks.log` that
+// the user-facing MCP surface could not see. (Audit SG-4.)
 async function logDiag(level, message, extra) {
-  const line =
-    JSON.stringify({ ts: nowIso(), event: EVENT, level, message, ...(extra || {}) }) + '\n';
-  try {
-    await fs.mkdir(DIAG_DIR, { recursive: true });
-    // Rotate when the file gets too large. The rotation is atomic
-    // enough: rename old -> old.1, append a fresh line. Failures here
-    // are non-fatal — diagnostics are best-effort.
-    try {
-      const st = await fs.stat(DIAG_LOG);
-      if (st.size >= DIAG_LOG_MAX_BYTES) {
-        await fs.rename(DIAG_LOG, DIAG_LOG + '.1').catch(() => {
-          /* ignore */
-        });
-      }
-    } catch {
-      /* missing file is fine */
-    }
-    await fs.appendFile(DIAG_LOG, line, 'utf8');
-  } catch {
-    /* ignore */
-  }
+  await logHookDiag(EVENT, level, message, extra || {}).catch(() => {});
   if (level === 'error') {
     try {
       process.stderr.write('[kimi-memory:hook:' + EVENT + '] ' + message + '\n');
@@ -274,7 +254,7 @@ function readRecentFilePaths(projectDb, projectKey, { limit = 5 } = {}) {
   }
   const out = [];
   const seen = new Set();
-  const pathRegex = /(?:[a-zA-Z]:)?[\\/][^\s"',;]+[\\/][^\s"',;]+/g;
+  const pathRegex = PATH_REGEX;
   for (const r of rows) {
     if (!r.payload) continue;
     let text = r.payload;
@@ -858,7 +838,9 @@ async function handleUserPromptSubmit(payload) {
   try {
     advisorMatch = matchAdvisor(prompt);
   } catch (e) {
-    logAdvisorDiag('matchAdvisor threw: ' + (e && e.message));
+    // Fire-and-forget — the call site must not block on the
+    // diagnostics pipeline.
+    logAdvisorDiag('matchAdvisor threw: ' + (e && e.message)).catch(() => {});
   }
   const lines = [];
   lines.push(

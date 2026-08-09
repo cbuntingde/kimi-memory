@@ -53,25 +53,42 @@ export function validatePrincipalKind(v) {
  * Validate the shared_with array. Each entry is a string descriptor
  * in the form "{kind}:{id}" (e.g. "user:alice", "role:editor").
  * Returns the cleaned array (defaults to [] on missing input).
+ *
+ * Returns `{ value, dropped }` so callers can surface a warning when
+ * input was silently discarded (non-string, empty, too long, or past
+ * the 32-entry cap). (Audit finding B4-10.)
  */
 export function validateSharedWith(v) {
-  if (v == null) return [];
+  if (v == null) return { value: [], dropped: [] };
   if (!Array.isArray(v)) {
     throw new Error('shared_with must be an array of strings');
   }
-  const out = [];
+  const value = [];
+  const dropped = [];
   const seen = new Set();
-  for (const entry of v) {
-    if (typeof entry !== 'string') continue;
+  // entries() gives us the original index so we know where to pick up
+  // when we hit the cap.
+  for (const [idx, entry] of v.entries()) {
+    if (
+      typeof entry !== 'string' ||
+      entry.trim().length === 0 ||
+      entry.length > 128
+    ) {
+      dropped.push(entry);
+      continue;
+    }
     const trimmed = entry.trim();
-    if (trimmed.length === 0) continue;
-    if (trimmed.length > 128) continue;
     if (seen.has(trimmed)) continue;
     seen.add(trimmed);
-    out.push(trimmed);
-    if (out.length >= 32) break;
+    value.push(trimmed);
+    if (value.length >= 32) {
+      // The cap ate the rest. Push every remaining entry to dropped
+      // and stop iterating.
+      for (let i = idx + 1; i < v.length; i++) dropped.push(v[i]);
+      break;
+    }
   }
-  return out;
+  return { value, dropped };
 }
 
 /**

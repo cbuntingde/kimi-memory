@@ -76,9 +76,9 @@ export function extractSummary(parsed) {
     const event = parsed.event;
     if (event.type === 'content.part') return contentText([event.part]);
     if (event.type === 'tool.call')
-      return `[tool_call] ${event.name || 'unknown'}(${truncate(JSON.stringify(event.args || {}), 240)})`;
+      return `[tool_call] ${event.name || 'unknown'}(${truncate(safeStringify(event.args), 240)})`;
     if (event.type === 'tool.result')
-      return `[tool_result] ${truncate(JSON.stringify(event.result || {}), 240)}`;
+      return `[tool_result] ${truncate(safeStringify(event.result), 240)}`;
   }
   // Try common text paths used by agent protocols.
   const fromMessage = parsed.message;
@@ -104,11 +104,11 @@ export function extractSummary(parsed) {
   if (fromText) return fromText;
   if (parsed.tool_call) {
     const t = parsed.tool_call;
-    return `[tool_call] ${t.name || t.tool || 'unknown'}(${truncate(JSON.stringify(t.args || t.arguments || t.input || {}), 240)})`;
+    return `[tool_call] ${t.name || t.tool || 'unknown'}(${truncate(safeStringify(t.args || t.arguments || t.input), 240)})`;
   }
   if (parsed.tool_result) {
     const t = parsed.tool_result;
-    return `[tool_result] ${truncate(typeof t === 'string' ? t : JSON.stringify(t), 240)}`;
+    return `[tool_result] ${truncate(typeof t === 'string' ? t : safeStringify(t), 240)}`;
   }
   return null;
 }
@@ -116,6 +116,18 @@ export function extractSummary(parsed) {
 function truncate(s, n) {
   if (typeof s !== 'string') return s;
   return s.length > n ? s.slice(0, n) + '…' : s;
+}
+
+// JSON.stringify can throw on BigInt, circular references, or other
+// non-serialisable values that occasionally appear in tool-args payloads.
+// Wrap once so the wire walker never aborts on a single bad event.
+// (Audit finding B1-7.)
+function safeStringify(o) {
+  try {
+    return JSON.stringify(o || {});
+  } catch {
+    return '[unserialisable]';
+  }
 }
 
 export function extractCreatedAt(parsed) {
@@ -242,6 +254,11 @@ async function boundedFind(dir, sessionId, depth) {
   } catch {
     return null;
   }
+  // Both loops honour MAX_DIRS. The previous version bounded the
+  // session-id match probe but the recursion loop walked every
+  // directory unconditionally — a directory with thousands of
+  // subdirectories would recurse into all of them.
+  // (Audit finding B1-3.)
   let checked = 0;
   for (const e of entries) {
     if (checked++ > MAX_DIRS) break;
@@ -259,7 +276,9 @@ async function boundedFind(dir, sessionId, depth) {
       return null;
     }
   }
+  let recursed = 0;
   for (const e of entries) {
+    if (recursed++ > MAX_DIRS) break;
     if (e.isDirectory()) {
       const found = await boundedFind(path.join(dir, e.name), sessionId, depth + 1);
       if (found) return found;

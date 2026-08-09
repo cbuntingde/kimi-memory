@@ -83,7 +83,11 @@ export async function loadConfig(filePath) {
 
 // Merge user config with environment overrides.
 export function mergeConfigWithEnv(config) {
-  const merged = JSON.parse(JSON.stringify(config)); // Deep copy
+  // structuredClone handles the deep copy without the lossy round-trip
+  // through JSON (which silently drops undefined / Function / Symbol
+  // values). Available on Node ≥ 17; package.json requires Node ≥ 24.
+  // (Audit finding B1-8.)
+  const merged = structuredClone(config);
   const km = merged['kimi-memory'] || {};
 
   if (process.env.KIMI_MEMORY_AUTO_EXTRACT === 'off') {

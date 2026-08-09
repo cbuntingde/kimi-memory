@@ -11,8 +11,7 @@
 // status line.
 
 import process from 'node:process';
-import path from 'node:path';
-import fs from 'node:fs';
+import { logHookDiag } from '../diagnostics.js';
 
 // Frozen keyword list. Case-insensitive substring match.
 // Keep this list and skills/advisor/SKILL.md's "Triggers" section in sync.
@@ -68,21 +67,12 @@ function sentenceOf(text, index) {
   return text.slice(start, index + end).trim();
 }
 
-// Synchronous, bounded, best-effort log writer. Failures here are
-// swallowed — diagnostics are never allowed to block the hook.
-export function logAdvisorDiag(message) {
-  try {
-    // import.meta.dirname -> .../plugins/managed/kimi-memory/src/advisor/
-    const pluginRoot = path.resolve(import.meta.dirname, '..', '..');
-    const dir = path.join(pluginRoot, '_diagnostics');
-    fs.mkdirSync(dir, { recursive: true });
-    fs.appendFileSync(
-      path.join(dir, 'advisor-hooks.log'),
-      `[${new Date().toISOString()}] ${message}\n`,
-    );
-  } catch {
-    // swallow — diagnostics are best-effort
-  }
+// Best-effort log writer. Routes through the shared diagnostics
+// pipeline so advisor records land in the same
+// `<kimiHome>/kimi-memory/_diagnostics/hooks.log` the user-facing
+// `memory_diagnostics` MCP tool reads. (Audit SG-4.)
+export async function logAdvisorDiag(message) {
+  await logHookDiag('Advisor', 'info', message, {}).catch(() => {});
 }
 
 // Case-insensitive substring match against ADVISOR_KEYWORDS with a

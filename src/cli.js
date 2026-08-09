@@ -48,7 +48,7 @@ import {
   parsePrincipalDescriptor,
 } from './acl.js';
 import { startProxy } from './proxy/server.js';
-import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 
 function parseArgs(argv) {
@@ -445,6 +445,27 @@ function cmdImport(args) {
   if (!inFile) {
     process.stderr.write('error: input file path is required\n');
     process.exit(1);
+  }
+  // Cap the import file size to avoid OOM on a hand-crafted or
+  // accidentally-truncated file. 50 MB is well above any export the
+  // plugin itself can produce.
+  // (Audit finding B1-5.)
+  const MAX_IMPORT_BYTES = 50 * 1024 * 1024;
+  try {
+    const st = statSync(inFile);
+    if (st.size > MAX_IMPORT_BYTES) {
+      process.stderr.write(
+        `error: import file too large (${st.size} bytes; max ${MAX_IMPORT_BYTES})\n`,
+      );
+      process.exit(2);
+    }
+  } catch (e) {
+    if (e && e.code === 'ENOENT') {
+      process.stderr.write(`error: import file not found: ${inFile}\n`);
+      process.exit(1);
+    }
+    process.stderr.write(`error: cannot stat import file: ${e && e.message ? e.message : e}\n`);
+    process.exit(2);
   }
   const cwd = resolveCwd(args);
   if (!cwd) {

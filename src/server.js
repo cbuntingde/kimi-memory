@@ -190,16 +190,9 @@ const TOOL_DEFS = [
         .describe('Search query. Supports basic FTS5 operators: "exact phrase" or -exclude.'),
       type: z.enum(['working', 'episodic', 'semantic', 'procedural']).optional(),
       limit: z.number().int().min(1).max(200).optional(),
-      recent_first: z
-        .boolean()
-        .optional()
-        .describe(
-          'When true, sort by updated_at DESC (most recent first) instead of FTS5 relevance.',
-        ),
-      sort_by: z
-        .enum(['relevance', 'recent', 'confidence', 'priority'])
-        .optional()
-        .describe('Sort order. Default: relevance.'),
+      // Note: `recent_first` and `sort_by` were removed from the schema
+      // (Audit SG-3). Results are always FTS-ranked; the per-type and
+      // per-tier budgets below shape the selection but don't reorder.
       // v10: fusion strategy. 'rrf' (default) uses Reciprocal Rank
       // Fusion across FTS5 and the vector channel with RRF_K=60.
       // 'weighted' preserves the legacy 0.5/0.5 blend for callers that
@@ -984,22 +977,22 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
   // choose the database.
   //
   // `record` controls whether the canonical project root is stamped
-  // into `project_paths` for this open. Write tools pass `true`; read
-  // tools pass `false` (or omit it) so a recall on a slow network
-  // share does not pay a write per call. The first write into a
-  // previously-unseen project is what creates the project_paths row,
-  // which is all `memory_prune` needs to detect orphans.
+  // into `project_paths` for this open, AND whether the parent
+  // directory is lazy-created. Write tools pass `true`; read tools
+  // pass `false` so a recall on a slow network share does not pay a
+  // write per call and does not produce a side effect on disk.
+  // (Audit finding B1-1 / B2-5.)
   function openScopeDb({ cwd, scope, record = false }) {
     if (scope === 'global') {
       const dbPath = globalDbPath(home);
-      mkdirSync(path.dirname(dbPath), { recursive: true });
+      if (record) mkdirSync(path.dirname(dbPath), { recursive: true });
       return { db: openDb(dbPath), projectKey: GLOBAL_PROJECT_KEY, cwd: cwd || null };
     }
     if (!cwd) throw new Error('project cwd is required');
     const c = canonicalizeRoot(cwd);
     if (!c) throw new Error('invalid project cwd');
     const key = deriveProjectKey(c);
-    mkdirSync(path.dirname(projectDbPath(home, key)), { recursive: true });
+    if (record) mkdirSync(path.dirname(projectDbPath(home, key)), { recursive: true });
     const db = openDb(projectDbPath(home, key));
     if (record) recordProjectPath(db, key, c);
     return { db, projectKey: key, cwd: c };
@@ -2227,8 +2220,11 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
         return textError('memory_ids must contain at most 500 entries');
       }
       let sharedWith = [];
+      let droppedSharedWith = [];
       try {
-        sharedWith = validateSharedWith(args.shared_with);
+        const swResult = validateSharedWith(args.shared_with);
+        sharedWith = swResult.value;
+        droppedSharedWith = swResult.dropped;
       } catch (e) {
         return textError(e.message);
       }
@@ -2239,11 +2235,14 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
         toSharedPool: !!args.to_shared_pool,
         kimiHomeDir: home,
       });
+      // Surface dropped entries so the caller knows input was lost.
+      // (Audit finding B4-10.)
       return ok({
         operation: 'acl_shared',
         scope: sc.value,
         visibility: args.visibility,
         shared_with: sharedWith,
+        dropped_shared_with: droppedSharedWith.length ? droppedSharedWith : undefined,
         to_shared_pool: !!args.to_shared_pool,
         moved: result.moved,
         updated: result.updated,
@@ -2722,12 +2721,21 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
     let newEvents = 0;
     let lineNo = force ? 0 : prev.line_count || 0;
     const lineBase = lineNo;
-    for await (const ev of walkWire(filePath, startByte, lineBase)) {
-      finalOffset = ev.nextByteOffset;
-      lineNo = ev.lineNo;
-      recordConversationEvent(db, projectKey, sessionId, ev.lineNo, ev.byteOffset, ev);
-      newEvents += 1;
-      if (ev.created_at) lastEventAt = ev.created_at;
+    let walkerFailed = null;
+    // Persist the cursor even on partial failure so a subsequent
+    // ingest resumes from the last successfully-recorded byte instead
+    // of restarting from byte 0 and re-trying the same failing tail.
+    // (Audit finding B1-6.)
+    try {
+      for await (const ev of walkWire(filePath, startByte, lineBase)) {
+        finalOffset = ev.nextByteOffset;
+        lineNo = ev.lineNo;
+        recordConversationEvent(db, projectKey, sessionId, ev.lineNo, ev.byteOffset, ev);
+        newEvents += 1;
+        if (ev.created_at) lastEventAt = ev.created_at;
+      }
+    } catch (e) {
+      walkerFailed = e && (e.message || String(e));
     }
     updateConversationProgress(db, projectKey, sessionId, finalOffset, lineNo, lastEventAt);
     state.sessions[sessionKey] = {
@@ -2736,6 +2744,7 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
       line_count: lineNo,
       last_event_at: lastEventAt,
       last_import_at: nowIso(),
+      last_error: walkerFailed,
     };
     await saveIngestState(home, projectKey, state);
     return {
@@ -2744,8 +2753,9 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
       session_id: sessionId,
       work_dir_key: wdk,
       project_key: projectKey,
-      status: 'ok',
+      status: walkerFailed ? 'partial' : 'ok',
       byte_offset: finalOffset,
+      last_error: walkerFailed || undefined,
     };
   }
 

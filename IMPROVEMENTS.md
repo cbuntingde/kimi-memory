@@ -166,19 +166,28 @@ Reuses: the existing `makeServer` factory in `src/server.js`; `openScopeDb` + `r
 - **Bulk operations**: `saveMemoryBulk()` now collects per-item errors instead of all-or-nothing rollback
 - **Performance logging**: Track slow/contending writes via diagnostics
 
-### 5. Search Quality & Ranking (`src/search.js`)
+### 5. Search Quality & Ranking
 
-- **Title boosting**: Prioritize title matches over content
-- **Flexible sorting**:
-  - `relevance` (FTS5 rank, default)
-  - `recent` (updated_at DESC)
-  - `confidence` (confidence DESC)
-  - `priority` (priority DESC)
+- **Hybrid FTS5 + cosine recall (RRF-fused)**: combines keyword ranking from
+  `memories_fts` with embedding-cosine similarity from the `embedding`
+  BLOB column. See `src/persist.js#searchMemories` and the v10 RRF
+  combinator (`combineRrfScores`).
 - **Query enhancements**:
   - Support for quoted phrases: `"exact phrase"`
   - Negation support: `-exclude`
-  - Query normalization and validation
-- Enhanced `memory_recall` tool with `sort_by` and `recent_first` parameters
+  - Per-type balancing via `perType: true` (used by the hook layer so a
+    recall surfaces a mix of conventions, procedures, and notes
+    rather than N rows of the same type).
+  - Per-tier budgets via `tier_budgets` and tier-shaped truncation via
+    `max_chars_per_memory` / `max_total_recall_chars` (v10).
+- Visibility filter (`visibility: 'team' | ['private', 'team']`) narrows
+  both channels; the same opt is documented in `acl_share_memory`.
+
+> Title boosting and `sort_by` / `recent_first` are documented in older
+> revisions of this file but were never wired into `searchMemories`. The
+> tool schema accepts `recent_first` and `sort_by` but ignores them;
+> `memory_recall` returns FTS-ranked results. Don't rely on either.
+> (Audit SG-2 / SG-3.)
 
 ### 6. Conversation Archival & Lifecycle (`src/lifecycle.js`)
 
@@ -231,18 +240,18 @@ memory_diagnostics(hours_back=24, type_filter="auto_extract_error")
 kimi-memory diagnostics --hours-back 24 --type auto_extract_error
 ```
 
-### Search with Title Boost & Sorting
+### Search Examples
 
 ```bash
-# Get recent memories first
-memory_recall(query="deployment", sort_by="recent", limit=10)
-
-# Sort by confidence (importance)
-memory_recall(query="decision", sort_by="confidence", limit=10)
+# Recall across the active project (default scope='all')
+memory_recall(query="deployment", limit=10)
 
 # Find similar memories
 memory_similar(id="mem_123", threshold=0.7, limit=20)
 ```
+
+(`sort_by` and `recent_first` were removed from the documented surface;
+they were never wired into `searchMemories`. See note in §5.)
 
 ### Lifecycle Management
 
@@ -281,8 +290,6 @@ npm test tests/21-comprehensive-improvements.test.js
 Coverage includes:
 
 - Exponential backoff calculations with jitter
-- Concurrency tracking and contention detection
-- Search query normalization and title boosting
 - Config parsing and validation
 - Lifecycle identification (archival candidates, prunable memories)
 - Edge cases and error handling
@@ -298,7 +305,7 @@ Coverage includes:
 ### For Agents
 
 1. **Improved error handling**: Auto-extract now retries failed LLM calls automatically
-2. **Better search**: Use `sort_by="recent"` or `confidence` for ranked results
+2. **Better search**: `memory_recall` accepts the per-type / per-tier / visibility filters documented in §5 above.
 3. **Config validation**: Errors in config.toml are logged to diagnostics
 
 ### For Developers

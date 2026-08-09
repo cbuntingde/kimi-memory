@@ -107,22 +107,12 @@ function loadExistingConclusionChildren(db, projectKey) {
   return new Set(rows.map((r) => r.child_id));
 }
 
-// Decode an embedding BLOB into a Float32Array. Mirrors the helper in
-// persist/memory.js but lives here to keep the consolidation pass
-// decoupled from the persist module (avoid circular imports during
-// testing).
-function decodeEmbedding(blob) {
-  if (!blob) return null;
-  try {
-    return new Float32Array(
-      blob.buffer,
-      blob.byteOffset,
-      blob.byteLength / Float32Array.BYTES_PER_ELEMENT,
-    );
-  } catch {
-    return null;
-  }
-}
+// Decode an embedding BLOB into a Float32Array. Reuses the canonical
+// decoder from src/embedding.js which validates BLOB size and rejects
+// NaN/Inf values — the previous local copy silently produced NaN-filled
+// Float32Arrays on corrupt input, causing cosine to silently return 0.
+// (Audit finding B4-7.)
+import { decodeVector as decodeEmbedding } from './embedding.js';
 
 // Cosine similarity between two Float32Arrays of equal length.
 function cosine(a, b) {

@@ -159,6 +159,16 @@ export function clamp(n, lo, hi) {
   return Math.min(Math.max(n, lo), hi);
 }
 
+// Best-effort path-shaped token match used by the hook recall layer.
+// Matches absolute paths (POSIX and Windows) anywhere in a string.
+// The same regex lived in src/hooks/tool-recall.js and
+// src/hooks/run.js; consolidated here so the two call sites cannot
+// drift. (Audit finding B3-7.)
+export const PATH_REGEX = /(?:[a-zA-Z]:)?[\\/][^\s"',;]+[\\/][^\s"',;]+/g;
+// Shell verbs recognised by the tool-call trigger layer.
+export const SHELL_VERB_REGEX =
+  /\b(pnpm|npm|yarn|bun|node|npx|tsx|ts-node|python|pip|cargo|go|make|cmake|gradle|mvn|docker|kubectl|git|curl|wget|brew|apt|systemctl)\b/g;
+
 export function projectKeyFromCwd(cwd) {
   if (!cwd) return null;
   return createHash('sha256').update(path.resolve(cwd)).digest('hex').slice(0, 16);
