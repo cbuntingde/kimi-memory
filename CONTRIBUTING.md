@@ -61,10 +61,11 @@ never depend on the version number — they just run in order on every `openDb`.
   `looksLikeSecret` helper in `src/extract.js` is the auto-extract safety
   net, **and** `saveMemory` in `src/persist.js` runs the same check at
   the lowest layer so `memory_save`, `memory_update`, `memory_merge`,
-  and `memory_save_bulk` all inherit it. The check throws
-  `KIMI_MEMORY_SECRET_DETECTED` and the call rolls back; the only
-  opt-out is `KIMI_MEMORY_SECRET_SCAN=off`, reserved for the rare
-  fixture case. False positives are accepted: dropping a candidate that
+  and `memory_save_bulk` all inherit it. The check covers `title`,
+  `content`, every `tags` entry, and every string value in `metadata`
+  (recursively). It throws `KIMI_MEMORY_SECRET_DETECTED` and the call
+  rolls back; the only opt-out is `KIMI_MEMORY_SECRET_SCAN=off`,
+  reserved for the rare fixture case. False positives are accepted: dropping a candidate that
   mentions a generic `api_key` is far cheaper than persisting a real one.
 - Never echo full memory bodies or raw prompts on hook stdout. The status
   line is bounded; per-memory lines (`[recall: i/N]`) are bounded to 3,

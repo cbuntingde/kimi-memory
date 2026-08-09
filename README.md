@@ -86,7 +86,7 @@ The plugin exposes 46 MCP tools over the `kimi-memory` stdio server.
 **Durable memory** (scope-aware; defaults shown):
 
 - `memory_save(scope?, type, ...)` — `scope: "project"`. Accepts `synthesizes: [childId, ...]` for `conclusion` type to record lineage.
-- `memory_recall(scope?, query, ...)` — `scope: "all"` (project first, then global). Hybrid FTS5 keyword + cosine over stored embeddings, fused via Reciprocal Rank Fusion (`fusion: 'rrf'` default with `rrf_k=60`; `fusion: 'weighted'` preserves the legacy 0.5/0.5 blend). Optional `visibility` filter narrows both channels to one or more ACL levels. Falls back to FTS5-only when embeddings are off.
+- `memory_recall(scope?, query, ...)` — `scope: "all"` (project first, then global). Hybrid FTS5 keyword + cosine over stored embeddings, fused via Reciprocal Rank Fusion (`fusion: 'rrf'` default with `rrf_k=60`; `fusion: 'weighted'` preserves the legacy 0.5/0.5 blend). Optional `visibility` and `tier` filters narrow both channels; `tier_budgets` caps per-tier selection; `max_chars_per_memory` and `max_total_recall_chars` shape the returned payload. Falls back to FTS5-only when embeddings are off.
 - `memory_list(scope?, ...)`, `memory_get(scope?, id)` — both default `scope: "all"`.
 - `memory_update(scope?, id, ...)` — `scope: "project"`.
 - `memory_delete(scope?, id, hard?)` — `scope: "project"`. Soft by default; `hard: true` removes the row permanently.
@@ -163,7 +163,7 @@ Edges (`memory_edges` table) are written by `memory_save(..., supersede: true)`,
 
 The `Stop` hook (and `SessionEnd`, `PreCompact`, `Interrupt`, `StopFailure` that delegate to it) runs an idempotent auto-extract pass: reads the last six conversation summaries, asks the configured provider for up to three candidate memories, and saves the survivors through `memory_save` with `provenance.source = "auto_extract"` (visible on the dashboard as a purple `src-auto_extract` chip).
 
-Cost guards: skips when there are fewer than 6 events, when the latest event is older than 5 minutes, when the same `(type, title)` already exists, when the candidate looks like a transient task or is already covered by a recall hit, or when it contains a likely secret.
+Cost guards: skips when there are fewer than 4 events, when the latest event is older than 30 minutes (override via `KIMI_MEMORY_EXTRACT_MAX_LATENCY_MS`), when the same `(type, title)` already exists, when the candidate looks like a transient task or is already covered by a recall hit, or when it contains a likely secret.
 
 One short LLM call per Stop event to the model configured in `$KIMI_CODE_HOME/config.toml`. Disable via `KIMI_MEMORY_AUTO_EXTRACT=off` or `[kimi-memory] disable_auto_extract = true` in `config.toml`. The agent should still verify an auto-extracted batch before treating it as canon.
 
@@ -238,10 +238,10 @@ node src/cli.js acl revoke <memory-id> --principal-kind <k> --principal-id <id> 
 
 **Layout**: four logical DBs now exist under `$KIMI_CODE_HOME/kimi-memory/`:
 
-- `<project-key>/memory.sqlite` — per-project durable + working memory + conversations (unchanged).
-- `_global/memory.sqlite` — cross-project user durable memory (unchanged).
+- `<project-key>/memory.sqlite` — per-project durable + working memory + conversations.
+- `_global/memory.sqlite` — cross-project user durable memory.
 - `_shared/memory.sqlite` — ACL-promoted cross-project pool (new in v10; lazily created on first `acl_share_memory` call with `to_shared_pool: true`).
-- `_diagnostics/hooks.log` — hook diagnostics (unchanged).
+- `_diagnostics/hooks.log` — hook + advisor diagnostics (one log file for the whole plugin).
 
 ## Conversation archival
 
@@ -280,8 +280,7 @@ $KIMI_CODE_HOME/kimi-memory/_global/memory.sqlite
 Hook diagnostics:
 
 ```text
-$KIMI_CODE_HOME/kimi-memory/_diagnostics/hooks.log          # hook runner (ingest, auto-extract, recall, decay)
-<plugin-root>/_diagnostics/advisor-hooks.log                # advisor keyword detector
+$KIMI_CODE_HOME/kimi-memory/_diagnostics/hooks.log          # every hook (SessionStart, UserPromptSubmit, Stop, SessionEnd, PreCompact, Interrupt, StopFailure, PostToolUse) + the advisor keyword detector
 ```
 
 Local-first: SQLite databases live under `$KIMI_CODE_HOME/kimi-memory/`; the plugin never writes into Kimi's `sessions` tree. Two outbound behaviours:
@@ -292,8 +291,8 @@ Local-first: SQLite databases live under `$KIMI_CODE_HOME/kimi-memory/`; the plu
 Caveats:
 
 - Conversation archives may contain prompts, model responses, tool arguments, and tool output — protect the Kimi data directory.
-- `saveMemory` runs `looksLikeSecret` on title and content and refuses to persist known credential shapes (OpenAI, Anthropic, GitHub, AWS, JWT, PEM, `key=…`, `Authorization: Bearer`). The check is enforced at the lowest layer so every write path (`memory_save`, `memory_update`, `memory_merge`, `memory_save_bulk`, auto-extract) inherits it; `memory_save_bulk` rolls back the whole batch on a single bad item. Opt out via `KIMI_MEMORY_SECRET_SCAN=off` only for legitimate test fixtures. False positives are preferred over persisting a real secret.
-- The plugin never lazy-creates the global DB on a read; it only opens an existing global DB or accepts an explicit global save.
+- `saveMemory` runs `looksLikeSecret` on `title`, `content`, every `tags` entry, and every string value in `metadata` (recursively). It refuses to persist known credential shapes (OpenAI, Anthropic, GitHub, AWS, JWT, PEM, `key=…`, `Authorization: Bearer`). The check is enforced at the lowest layer so every write path (`memory_save`, `memory_update`, `memory_merge`, `memory_save_bulk`, auto-extract) inherits it; `memory_save_bulk` rolls back the whole batch on a single bad item. Opt out via `KIMI_MEMORY_SECRET_SCAN=off` only for legitimate test fixtures. False positives are preferred over persisting a real secret.
+- The plugin never lazy-creates the global DB on a read; it only opens an existing global DB or accepts an explicit global save. Write paths (the MCP server's record-on-write helpers, `acl_share_memory` in-place promotion, `memory_reset_project` confirm=true) DO create the directory on first write, but a `memory_recall` / `memory_list` / `memory_status` over `scope: 'global'` against a fresh install will not create any files.
 
 ## Reading `memory_status`
 
@@ -333,6 +332,28 @@ Top-level fields describe the project layer; `global.memories` describes the cro
 ## Schema
 
 `SCHEMA_VERSION` is `10`. Databases are migrated in place on first open; migrations are idempotent and append a new column or table when missing. Current schema additions: `project_paths` (canonical project root per DB, drives `memory_prune`); `last_embed_error` on `memories` (failed embeddings are observable); `last_canonical_root` + `record_count` on `project_paths` (preserves prior root on re-record); `stability_days` + `last_rehearsed_at` (Ebbinghaus decay, v9); `visibility` + `shared_with` + 5 nullable principal identity columns + `memories_acl` grant table (v10).
+
+## Recent changes (v0.5.0 audit pass)
+
+A line-by-line audit of every source file was done before this release. The fixes below shipped in two commits; see the commit log for the full patch list.
+
+**High-severity fixes** (release-blockers, all shipped):
+
+- `codegraph_extract` MCP tool now refuses `root` arguments that escape the canonical project directory (path-traversal hardening).
+- `migrateAddCodegraphEdges` no longer forces a full `memory_edges` rebuild on every MCP cold-start. The previous probe-insert always failed because it omitted `created_at NOT NULL`.
+- The auto-extract LLM call now scrubs the conversation transcript with `redactSecrets` (provider keys, JWT, PEM blocks, generic `key=value` assignments, `Authorization: Bearer` headers) before sending it to the configured provider. Credentials a user typed in chat never leave the machine.
+- `codegraph_build_edges` switched from per-symbol `LIKE` scans to FTS5 prefix matches; `runConsolidate` caps its input at 640 rows ordered by `updated_at DESC`. Both fixes bound the worst case that previously scaled O(N²) over the project's memories.
+- `rowToMemory` no longer throws on a single corrupt `tags` / `metadata` / `provenance` column — a WAL crash or partial write now degrades the row instead of crashing the entire `memory_recall` result set.
+- `bumpAccess` collapsed from N prepared-statement runs per recall into a single `UPDATE ... WHERE id IN (?, ?, ...)` statement. Per-recall round-trips go from O(N) to O(1).
+
+**Spec / docs alignment**:
+
+- `memory_recall` no longer accepts `recent_first` or `sort_by`. Both fields were accepted by the schema but never read by `searchMemories`, so passing them produced the default FTS order. The schema now matches the implementation.
+- README §Brain-mode line was corrected from `SCHEMA_VERSION = 9` to `10`. IMPROVEMENTS.md §5 no longer claims title-boosting is implemented.
+- All hook and advisor diagnostics route through `<kimiHome>/kimi-memory/_diagnostics/hooks.log`. The previous design wrote a parallel log into `<pluginRoot>/_diagnostics/` that the user-facing `memory_diagnostics` MCP tool could not see, plus a third file for the advisor detector. One log file now.
+- `assertNoSecret` now also scans `tags` (per-element) and `metadata` (recursively) for credential shapes, in addition to `title` and `content`.
+
+**Dead code removed**: `src/search.js` (123 lines) and `src/concurrency.js` (117 lines) were never imported anywhere and have been deleted.
 
 ## Uninstall and data retention
 

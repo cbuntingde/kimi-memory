@@ -174,7 +174,7 @@ const TOOL_DEFS = [
   },
   {
     name: 'memory_recall',
-    desc: 'Keyword search across the active scope\u2019s durable memories using FTS5. Supports hybrid ranking with title boosting and optional temporal ordering.',
+    desc: 'Keyword search across the active scope\u2019s durable memories using FTS5. Hybrid FTS5 + cosine ranking, RRF-fused with the default RRF_K=60. Optional `visibility` (single string or array) and `tier` filters narrow the result set; `tier_budgets` caps per-tier selection; `max_chars_per_memory` truncates individual rows; `max_total_recall_chars` drops tail rows once the cumulative content length exceeds the budget.',
     input: {
       cwd: z.string().describe('Project root (absolute path). Required.'),
       scope: z
