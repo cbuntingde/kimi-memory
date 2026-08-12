@@ -329,3 +329,23 @@ All changes are backward compatible:
 - Archive storage format (JSON/SQLite) not yet implemented
 - Fuzz testing for extract prompts not included
 - GDPR export/delete tools in progress
+
+## Security Audit (2026-08-12)
+
+A `harden-and-clean` pass surfaced the following items. **None of the remaining issues have upstream fixes** as of audit date — they are tracked here so the situation is visible, not hidden.
+
+### Transitive CVEs via `@huggingface/transformers`
+
+| Advisory | Package | Severity | Status | Mitigation |
+|---|---|---|---|---|
+| GHSA-xcpc-8h2w-3j85 | `adm-zip <0.6.0` (via `onnxruntime-node`) | high | No fix available | The embedding pipeline never ingests untrusted ZIP files. The vulnerability requires a crafted ZIP, which the onnxruntime path does not feed. Re-evaluate when upstream resolves. |
+| GHSA-f88m-g3jw-g9cj | `sharp <0.35.0` (via `onnxruntime-node`) | high | No fix available | Same reasoning: `sharp` is used by the embedding for image-preprocessing of model inputs, not user-supplied image uploads. The model's tokenizer gates input shape. |
+
+### Previously fixed (lockfile-only update)
+
+- `fast-uri 3.0.0-3.1.4` (GHSA-7p8r-x3mc-p8w7, host confusion via backslash authority introducer) — fixed transitively by `npm audit fix` on 2026-08-12. No code changes required.
+
+### Re-evaluation cadence
+
+Re-run `npm audit` on every `@huggingface/transformers` minor bump. The two unfixed advisories are blocking only if the attack surface changes (e.g., if a future feature takes untrusted images or ZIPs from `memory_save`). Today's threat model does not.
+

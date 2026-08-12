@@ -70,14 +70,19 @@ Every MCP call requires the active project's absolute root as `cwd` to prevent c
 
 All optional; defaults are tuned for production.
 
-| Variable                            | Default | Effect                                                                                                                                               |
-| ----------------------------------- | ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `KIMI_MEMORY_EMBEDDINGS`            | `on`    | Set to `off` to skip the embedding encoder. `memory_recall` falls back to FTS5-only; `memory_similar` returns `[]`.                                  |
-| `KIMI_MEMORY_EMBED_TIMEOUT_MS`      | `4000`  | Wall-clock cap on a single embedding call; on timeout the row's `embedding_status` flips to `failed` with `last_embed_error = "embed_timeout: ..."`. |
-| `KIMI_MEMORY_AUTO_EXTRACT`          | `on`    | Set to `off` to disable the Stop-hook auto-extraction LLM call. Also configurable as `[kimi-memory] disable_auto_extract = true` in `config.toml`.   |
-| `KIMI_MEMORY_SECRET_SCAN`           | `on`    | Set to `off` to bypass the server-side secret check on save (see Storage and privacy).                                                               |
-| `KIMI_MEMORY_PERF`                  | `on`    | Set to `off` to skip the `tests/16-perf.test.js` benchmarks.                                                                                         |
-| `KIMI_MEMORY_DISABLE_SESSION_FOCUS` | `off`   | Set to `1` to skip the Stop-hook session-focus capture (the "where we left off" memory).                                                             |
+| Variable                            | Default | Effect                                                                                                                                                           |
+| ----------------------------------- | ------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `KIMI_MEMORY_EMBEDDINGS`            | `on`    | Set to `off` to skip the embedding encoder. `memory_recall` falls back to FTS5-only; `memory_similar` returns `[]`.                                              |
+| `KIMI_MEMORY_EMBED_TIMEOUT_MS`      | `4000`  | Wall-clock cap on a single embedding call; on timeout the row's `embedding_status` flips to `failed` with `last_embed_error = "embed_timeout: ..."`.             |
+| `KIMI_MEMORY_AUTO_EXTRACT`          | `on`    | Set to `off` to disable the Stop-hook auto-extraction LLM call. Also configurable as `[kimi-memory] disable_auto_extract = true` in `config.toml`.               |
+| `KIMI_MEMORY_SECRET_SCAN`           | `on`    | Set to `off` to bypass the server-side secret check on save (see Storage and privacy).                                                                           |
+| `KIMI_MEMORY_PERF`                  | `on`    | Set to `off` to skip the `tests/16-perf.test.js` benchmarks.                                                                                                     |
+| `KIMI_MEMORY_DISABLE_SESSION_FOCUS` | `off`   | Set to `1` to skip the Stop-hook session-focus capture (the "where we left off" memory).                                                                         |
+| `KIMI_MEMORY_AUTO_GC`               | `on`    | Master switch for the auto-GC pipeline (prune + archive + tier). Set to `off` to skip every SessionStart pass.                                                   |
+| `KIMI_MEMORY_AUTO_PRUNE`            | `on`    | Set to `off` to skip the auto-prune of dead rows (deleted / superseded / cold / orphans) while keeping the rest of the pipeline.                                 |
+| `KIMI_MEMORY_AUTO_ARCHIVE`          | `on`    | Set to `off` to skip the auto-archive of `conversation_events` / `skill_invocations` / `persona_promotions`.                                                     |
+| `KIMI_MEMORY_AUTO_TIER`             | `on`    | Set to `off` to skip the auto-tier promotion / demotion step.                                                                                                    |
+| `KIMI_MEMORY_AUTO_MERGE`            | `on`    | Set to `off` to disable the auto-merge step that collapses tight clusters of sibling memories into the highest-confidence member (see Background consolidation). |
 
 ## Memory tools
 
@@ -188,9 +193,23 @@ Save with `memory_save({ type: "conclusion", synthesizes: [childId, ...] })`. Li
 - **Mid-turn recall** — `PostToolUse` (a new hook event) surfaces `[tool-recall]` lines when a stored convention matches the tool's arguments (file paths, shell verbs). Cheap; no LLM call. Older Kimi versions that don't declare the event degrade silently.
 - **Ebbinghaus decay** — every memory carries a per-row `stability_days` and `last_rehearsed_at`. Confidence is rewritten on `SessionStart` from the curve `0.1 + 0.9 * exp(-days / stability)`. Every `memory_reinforce` grows stability by 1.5x (cap 365 days) and stamps a fresh rehearsal. The hook auto-reinforces the top project recall hit with a 60-second debounce so the feedback loop is closed without manual calls.
 - **Cross-session narrative** — `SessionStart` lists the last 3 sessions for the project, oldest → newest, with each session's focus title and body snippet. Pick-up phrasing: `Picking up the thread: <oldest session title>`.
-- **Background consolidation ("dream pass")** — every `SessionStart`, related memories (cosine ≥ 0.75, ≥ 2 shared tags) are clustered; each cluster of ≥ 3 siblings without a `conclusion` child gets one synthesised. Idempotent via `memory_synthesizes` coverage check. Opt out via `KIMI_MEMORY_CONSOLIDATE=off`.
+- **Background consolidation ("dream pass")** — every `SessionStart`, related memories (cosine ≥ 0.75, ≥ 2 shared tags) are clustered; each cluster of ≥ 3 siblings without a `conclusion` child gets one synthesised. Idempotent via `memory_synthesizes` coverage check. Opt out via `KIMI_MEMORY_CONSOLIDATE=off`. **Auto-merge** additionally collapses _tight_ clusters (cosine ≥ 0.85, tag overlap ≥ 2, ≥ 3 members) by `memory_merge`-ing each sibling into the highest-confidence member, so a recall hit surfaces the synthesis body rather than a stack of redundant siblings. Siblings are soft-superseded (never hard-deleted); un-merge via the `merged_from` provenance chain. Opt out via `KIMI_MEMORY_AUTO_MERGE=off`.
 
 Schema `SCHEMA_VERSION = 10` is the current migration target. The v9 bump added `stability_days` and `last_rehearsed_at`; the v10 bump added ACL/visibility columns (`visibility`, `shared_with`, `team_id`, `agent_id`, `user_id`, `session_id`, `task_id`) + `tier` + `persona_id` + the `metadata` column on `memory_edges`. Existing rows are backfilled on first open via column defaults; pre-v10 rows get `visibility='private'`, `shared_with='[]'`, `tier='L0'`, `stability_days=30`.
+
+### Auto-GC (background housekeeping)
+
+`src/auto-gc.js` runs three independent, fail-open passes on every `SessionStart`, gated by per-project timestamps so the heavy work happens at most once per `AUTO_GC_THROTTLE_HOURS = 6` hours per project. Tier promotion is cheap (a few prepared statements) and runs every open; prune and archive are throttled. The throttle stamp lives in `schema_meta(key='auto_gc_last_run')` and is round-tripped through the same DB so a project that has never been GC'd runs on its first open.
+
+| Pass             | What it does                                                                                                                                                                                                                                                                     | Tunables                                                  |
+| ---------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------- |
+| `runAutoPrune`   | Hard-deletes rows that have been in their state past the grace window: explicit `deleted` after 30 days; soft-superseded after 90 days; embedding-failed after 30 days; cold rows (confidence < 0.05, zero accesses) after 365 days; orphans (parent hard-deleted) after 7 days. | `KIMI_MEMORY_AUTO_GC=off`, `KIMI_MEMORY_AUTO_PRUNE=off`   |
+| `runAutoArchive` | Hard-deletes raw `conversation_events` after 180 days, raw `skill_invocations` after 90 days, raw `persona_promotions` after 365 days. The aggregate counters stay in the memory row's metadata; only the raw per-event rows drop.                                               | `KIMI_MEMORY_AUTO_GC=off`, `KIMI_MEMORY_AUTO_ARCHIVE=off` |
+| `runAutoTier`    | Promotes active memories by access count: L0 → L1 at ≥ 3 accesses; L1 → L2 at ≥ 10 accesses; L2 → L3 at ≥ 5 accesses **AND** 30 days at L2. Demotes back to L0 when confidence falls below 0.2 for ≥ 14 days since the last rehearsal.                                           | `KIMI_MEMORY_AUTO_GC=off`, `KIMI_MEMORY_AUTO_TIER=off`    |
+
+Each pass returns a counts object (`pruned_deleted`, `archived_conversation_events`, `promoted_l0_to_l1`, …) and is wrapped in a `SAVEPOINT`/`RELEASE` block so a single failure aborts only its own category. The SessionStart status line carries a short `auto_gc=` segment: `auto_gc=tier:prom:2/dem:0/heavy:throttled` when the heavy passes were skipped this open, `auto_gc=prune:3/archive:12/tier:prom:5/dem:1` when they ran. Errors surface as `auto_gc=err:<message>`.
+
+Why this exists: without it, every project DB grows unbounded — soft-deletes linger forever, every Stop event appends a `persona_promotions` row, every tool call appends a `conversation_event`. With a 6-hour throttle, the on-open cost is amortised to near-zero and the database size stays bounded.
 
 ### Session focus — "where we left off"
 
@@ -243,6 +262,8 @@ node src/cli.js acl revoke <memory-id> --principal-kind <k> --principal-id <id> 
 - `_shared/memory.sqlite` — ACL-promoted cross-project pool (new in v10; lazily created on first `acl_share_memory` call with `to_shared_pool: true`).
 - `_diagnostics/hooks.log` — hook + advisor diagnostics (one log file for the whole plugin).
 
+`schema_meta(key, value)` is also stored in every per-project DB. The persistence layer uses it to carry per-DB config such as the `auto_gc_last_run` throttle stamp; the migrations runner reads `schema_version` from the same table.
+
 ## Conversation archival
 
 Hooks run at `SessionStart`, `UserPromptSubmit`, `Stop`, `SessionEnd`, `PreCompact`, `Interrupt`, and `StopFailure`. They incrementally read the current session's `agents/main/wire.jsonl`, preserve every raw JSONL event, and extract searchable summaries. Imports use byte and line cursors and are idempotent. Kimi does not document full conversation text in hook payloads, so archival reads the transcript files directly without modifying them; the parser is tolerant of unknown/malformed records.
@@ -250,7 +271,7 @@ Hooks run at `SessionStart`, `UserPromptSubmit`, `Stop`, `SessionEnd`, `PreCompa
 `SessionStart` and `UserPromptSubmit` emit a structured status line plus a short summary line. The status line reports project key, active/global memory counts, working-slot count, conversations, conversation events, ingest status, and (for `UserPromptSubmit`) project/global recall hit counts:
 
 ```text
-[kimi-memory] event=UserPromptSubmit project_key=59e809561f923b9f pmem.active=0 gmem.active=1 wm=0 conv=3 events=354 ingest=ok:2 recall project:0 global:0 cwd=...
+[kimi-memory] event=UserPromptSubmit project_key=59e809561f923b9f pmem.active=0 gmem.active=1 wm=0 conv=3 events=354 ingest=ok:2 consolidate=saved:0/skipped:0 auto_gc=tier:prom:0/dem:0/heavy:throttled recall project:0 global:0 cwd=...
 ```
 
 Summary lines are intentionally short:
@@ -258,7 +279,9 @@ Summary lines are intentionally short:
 - SessionStart: `Loaded N recent memories. (N project, N global.)` or `No recent memories.`
 - UserPromptSubmit: `Recalled N memory/memories. (N project, N global.) [semantic: 2, procedural: 1]` (per-type breakdown appended when there are hits) or `No recall hits.`
 
-`UserPromptSubmit` is followed by up to three `[recall: i/N] "title" (type, scope, score=…) — <body snippet>` lines (snippet capped at 120 chars). When a session-focus row exists, `[focus] "<title>" (working) — <body snippet>` is also emitted (always, not gated on keyword recall — see Session focus above). Working-memory slots are emitted as `- WM <slot>: <value>` lines. The remaining hooks are silent on stdout and run only the idempotent project-session ingest; they are fail-open and never block Kimi's lifecycle. The hooks never echo full memory bodies, raw prompts, or session transcripts.
+`UserPromptSubmit` also writes a trailing JSON object on stdout with two fields: `systemMessage` (the human-readable lines above — terminal stays clean) and `hookSpecificOutput.additionalContext` (a numbered, AI-facing list of recall hits: `1. (semantic, project, score=0.02) "title" — <body snippet>`, snippet capped at 120 chars). The model sees the recall hits in `additionalContext`; the human sees the counts and types in `systemMessage`. When no hits exist, `additionalContext` is omitted entirely (no "no recall hits" spam on every turn).
+
+When a session-focus row exists, `[focus] "<title>" (working) — <body snippet>` is also emitted (always, not gated on keyword recall — see Session focus above). Working-memory slots are emitted as `- WM <slot>: <value>` lines. The remaining hooks are silent on stdout and run only the idempotent project-session ingest; they are fail-open and never block Kimi's lifecycle. The hooks never echo full memory bodies, raw prompts, or session transcripts.
 
 An advisor match line appears on `UserPromptSubmit` when the prompt contains a frozen keyword:
 
@@ -331,29 +354,32 @@ Top-level fields describe the project layer; `global.memories` describes the cro
 
 ## Schema
 
-`SCHEMA_VERSION` is `10`. Databases are migrated in place on first open; migrations are idempotent and append a new column or table when missing. Current schema additions: `project_paths` (canonical project root per DB, drives `memory_prune`); `last_embed_error` on `memories` (failed embeddings are observable); `last_canonical_root` + `record_count` on `project_paths` (preserves prior root on re-record); `stability_days` + `last_rehearsed_at` (Ebbinghaus decay, v9); `visibility` + `shared_with` + 5 nullable principal identity columns + `memories_acl` grant table (v10).
+`SCHEMA_VERSION` is `10`. Databases are migrated in place on first open; migrations are idempotent and append a new column or table when missing. Current schema additions: `project_paths` (canonical project root per DB, drives `memory_prune`); `last_embed_error` on `memories` (failed embeddings are observable); `last_canonical_root` + `record_count` on `project_paths` (preserves prior root on re-record); `stability_days` + `last_rehearsed_at` (Ebbinghaus decay, v9); `visibility` + `shared_with` + 5 nullable principal identity columns + `memories_acl` grant table (v10); `schema_meta(key, value)` carries `schema_version` and the `auto_gc_last_run` throttle stamp.
 
-## Recent changes (v0.5.0 audit pass)
+The persistence layer is split into focused modules under `src/persist/` (connection, memories, search, reinforce, edges, share, skills, project + a barrel re-export). The top-level `src/persist.js` is a 6-line backward-compatibility shim that re-exports the barrel, so existing `import { … } from './persist.js'` call sites keep working unchanged.
 
-A line-by-line audit of every source file was done before this release. The fixes below shipped in two commits; see the commit log for the full patch list.
+## Recent changes (v0.5.1)
 
-**High-severity fixes** (release-blockers, all shipped):
+Auto-GC + auto-merge + persist split + AI-facing recall context.
 
-- `codegraph_extract` MCP tool now refuses `root` arguments that escape the canonical project directory (path-traversal hardening).
-- `migrateAddCodegraphEdges` no longer forces a full `memory_edges` rebuild on every MCP cold-start. The previous probe-insert always failed because it omitted `created_at NOT NULL`.
-- The auto-extract LLM call now scrubs the conversation transcript with `redactSecrets` (provider keys, JWT, PEM blocks, generic `key=value` assignments, `Authorization: Bearer` headers) before sending it to the configured provider. Credentials a user typed in chat never leave the machine.
-- `codegraph_build_edges` switched from per-symbol `LIKE` scans to FTS5 prefix matches; `runConsolidate` caps its input at 640 rows ordered by `updated_at DESC`. Both fixes bound the worst case that previously scaled O(N²) over the project's memories.
-- `rowToMemory` no longer throws on a single corrupt `tags` / `metadata` / `provenance` column — a WAL crash or partial write now degrades the row instead of crashing the entire `memory_recall` result set.
-- `bumpAccess` collapsed from N prepared-statement runs per recall into a single `UPDATE ... WHERE id IN (?, ?, ...)` statement. Per-recall round-trips go from O(N) to O(1).
+**New features**:
 
-**Spec / docs alignment**:
+- `src/auto-gc.js` — three independent, fail-open passes (auto-prune, auto-archive, auto-tier) run on every `SessionStart`. Tier promotion runs every open; prune + archive are throttled to once per 6 hours per project via `schema_meta(auto_gc_last_run)`. Env opt-outs: `KIMI_MEMORY_AUTO_GC=off` (master), `KIMI_MEMORY_AUTO_PRUNE=off`, `KIMI_MEMORY_AUTO_ARCHIVE=off`, `KIMI_MEMORY_AUTO_TIER=off`. Status line gains an `auto_gc=` segment.
+- `runConsolidate` now calls `mergeMemory` on tight clusters (cosine ≥ 0.85, tag overlap ≥ 2, ≥ 3 members) so the siblings are folded into the highest-confidence member and a recall hit surfaces the synthesis body rather than redundant copies. Siblings are soft-superseded, never hard-deleted. Opt out via `KIMI_MEMORY_AUTO_MERGE=off`.
+- `UserPromptSubmit` now writes a trailing JSON object on stdout with `systemMessage` (the human-readable lines) and `hookSpecificOutput.additionalContext` (a numbered list of recall hits the model can acknowledge). The verbose per-memory `[recall: i/N]` lines are routed to `additionalContext` only — the terminal stays clean.
 
-- `memory_recall` no longer accepts `recent_first` or `sort_by`. Both fields were accepted by the schema but never read by `searchMemories`, so passing them produced the default FTS order. The schema now matches the implementation.
-- README §Brain-mode line was corrected from `SCHEMA_VERSION = 9` to `10`. IMPROVEMENTS.md §5 no longer claims title-boosting is implemented.
-- All hook and advisor diagnostics route through `<kimiHome>/kimi-memory/_diagnostics/hooks.log`. The previous design wrote a parallel log into `<pluginRoot>/_diagnostics/` that the user-facing `memory_diagnostics` MCP tool could not see, plus a third file for the advisor detector. One log file now.
-- `assertNoSecret` now also scans `tags` (per-element) and `metadata` (recursively) for credential shapes, in addition to `title` and `content`.
+**Internal refactor**:
 
-**Dead code removed**: `src/search.js` (123 lines) and `src/concurrency.js` (117 lines) were never imported anywhere and have been deleted.
+- The 3,423-line `src/persist.js` was split into focused modules under `src/persist/`: `connection.js` (schema + openDb), `memories.js` (CRUD + helpers + synthesis), `search.js` (RRF + recall + backfill), `reinforce.js` (reinforce + decay), `edges.js` (typed edges), `share.js` (visibility / tier / persona / wiki), `skills.js` (skill triggers + invocations), `project.js` (working memory + conversations + project_paths + reset), `re-exports.js` (tool-registry + codegraph). The top-level `src/persist.js` is now a 6-line barrel; every existing `import { … } from './persist.js'` call site works unchanged.
+- `src/search.js` (109 lines) holds the FTS5 query helpers (`normalizeFts5Query`, `buildTitleBoostedQuery`, `buildOrderByClause`) that `persist/search.js` consumes. `src/concurrency.js` (94 lines) holds the per-process write-counter used for diagnostics; the two helpers (`isSqliteBusyError`, `getConcurrencyStatus`) are exported for the dashboard. The previous v0.5.0 "dead code removed" line for these two files is now stale — both ship in v0.5.1 with new content.
+- `scripts/check-syntax.js` replaces the hand-maintained &&-chained `node --check` list in `package.json`. The script walks `src/`, `hooks/`, and `tests/`, runs `node --check` on every `.js` file, and reports failures file-by-file. The previous list had drifted out of sync with the tree (it still referenced `src/concurrency.js` and `src/search.js` after their deletion in v0.5.0).
+
+**Tests**:
+
+- New `tests/33-auto-gc-smoke.test.js` (synthetic DB + the three auto-GC passes + the `schema_meta` throttle stamp).
+- `tests/04-hooks.test.js` and `tests/13-recall-per-type.test.js` updated for the new `hookSpecificOutput.additionalContext` shape.
+
+For the v0.5.0 audit fixes (path-traversal, `redactSecrets`, RRF-vs-O(N²), `bumpAccess` collapse, etc.) see the commit log; the audit landed in two commits (`d9ddf33` and `fa8576c`).
 
 ## Uninstall and data retention
 

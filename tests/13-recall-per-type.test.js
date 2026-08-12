@@ -482,25 +482,50 @@ test('MCP round-trip: recall surfaces type breakdown + per-memory [recall: i/N] 
       timeout: 20000,
     });
     assert.equal(r.status, 0);
-    // The recall summary should include a type breakdown and at least
-    // one [recall: i/N] line. The exact type ordering is by count
-    // desc then alphabetical, so we just assert the per-type section
-    // and the per-memory line.
+    // The recall summary should include a type breakdown. The exact
+    // type ordering is by count desc then alphabetical, so we just
+    // assert the per-type section is present in the human-readable
+    // stdout.
+    const jsonMatch = r.stdout.match(/\{[\s\S]+\}\s*$/);
+    assert.ok(jsonMatch, 'trailing JSON object is present in stdout');
+    const json = JSON.parse(jsonMatch[0]);
     assert.match(
-      r.stdout,
+      json.systemMessage,
       /\[\s*semantic:\s*\d+(?:\s*,\s*[a-z]+:\s*\d+)*\s*\]/,
-      'type breakdown is present',
+      'type breakdown is present in systemMessage',
     );
-    assert.match(r.stdout, /\[recall: 1\/\d+\]/, 'first recalled memory is shown');
-    // Each [recall: i/N] line should carry a content snippet (the first
-    // non-empty line of the body) so the user can verify what was
+    // The new design (v9.6+) routes the per-memory recall lines
+    // through `hookSpecificOutput.additionalContext` so the model
+    // sees them but the human-readable stdout stays clean. The new
+    // format is a numbered list:
+    //   "1. (type, scope, score=0.02) \"title\" — snippet"
+    // rather than the legacy `[recall: 1/N]` form.
+    assert.ok(json.hookSpecificOutput, 'hookSpecificOutput is present');
+    assert.ok(
+      json.hookSpecificOutput.additionalContext,
+      'additionalContext is present',
+    );
+    assert.match(
+      json.hookSpecificOutput.additionalContext,
+      /\n1\. \(semantic, project/,
+      'first recalled memory is shown in additionalContext',
+    );
+    // Each recall line should carry a content snippet (the first
+    // non-empty line of the body) so the agent can verify what was
     // recalled without trusting the title alone. We assert on one
     // specific substring — "indent with tabs not spaces" — which comes
     // from the first line of every seeded body.
     assert.match(
-      r.stdout,
-      /\[recall: \d+\/\d+\] "[^"]+" \([^)]+\) — .*indent with tabs not spaces/,
+      json.hookSpecificOutput.additionalContext,
+      /1\. \([^)]+\) "[^"]+" — .*indent with tabs not spaces/,
       'recall lines carry a content snippet from the body',
+    );
+    // The verbose previews must NOT be in the human-readable stdout
+    // (the terminal would be too noisy).
+    assert.equal(
+      json.systemMessage.includes('[recall: '),
+      false,
+      'verbose previews must not be in the human-readable systemMessage',
     );
   } finally {
     mcp.stop();

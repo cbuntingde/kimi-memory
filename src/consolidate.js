@@ -24,6 +24,7 @@
 // and reports counts via { saved, skipped, errors, error? }.
 
 import { nowIso } from './util.js';
+import { AUTO_MERGE_THRESHOLDS } from './auto-gc.js';
 
 const CONSOLIDATE_THRESHOLD = 0.75; // cosine floor for "related enough"
 const MIN_TAG_OVERLAP = 2; // at least this many shared tags
@@ -61,7 +62,7 @@ const CONSOLIDATE_INPUT_CAP =
 function loadActiveMemories(db, projectKey) {
   return db
     .prepare(
-      `SELECT id, type, title, content, tags, embedding, embedding_dim
+      `SELECT id, type, title, content, tags, embedding, embedding_dim, confidence, updated_at
        FROM memories
        WHERE project_key = ?
          AND status = 'active'
@@ -88,6 +89,8 @@ function loadActiveMemories(db, projectKey) {
         tagTokens: tokenizeTags(tags),
         embedding: r.embedding,
         embeddingDim: r.embedding_dim,
+        confidence: r.confidence,
+        updatedAt: r.updated_at,
       };
     });
 }
@@ -232,10 +235,19 @@ export async function runConsolidate({
   projectKey,
   saveMemory,
   memoryLink,
+  mergeMemory,
   isDisabled = () => process.env.KIMI_MEMORY_CONSOLIDATE === 'off',
   decodeEmbeddingImpl = decodeEmbedding,
 }) {
-  const result = { scanned: 0, clusters: 0, saved: 0, skipped: 0, errors: 0 };
+  const result = {
+    scanned: 0,
+    clusters: 0,
+    saved: 0,
+    skipped: 0,
+    errors: 0,
+    merged: 0,
+    mergeSkipped: 0,
+  };
   if (isDisabled()) {
     result.skipped = 'env_opt_out';
     return result;
@@ -248,6 +260,12 @@ export async function runConsolidate({
     result.skipped = 'no_persist';
     return result;
   }
+
+  // Auto-merge defaults: ON. Off only via the explicit env opt-out.
+  // The merge step is non-destructive (soft-supersede) so a wrong
+  // cluster can be un-merged by walking the merged_from provenance.
+  const autoMergeEnabled =
+    process.env.KIMI_MEMORY_AUTO_MERGE !== 'off' && typeof mergeMemory === 'function';
 
   let memories;
   try {
@@ -334,6 +352,75 @@ export async function runConsolidate({
     // Mark cluster members as covered so a subsequent cluster that
     // shares a member does not double-synthesise.
     for (const m of cluster) covered.add(m.id);
+
+    // Auto-merge: tight clusters (cosine ≥ AUTO_MERGE_THRESHOLDS.cosine
+    // AND tag overlap ≥ AUTO_MERGE_THRESHOLDS.tagOverlap) get their
+    // siblings collapsed into the highest-confidence member. The
+    // merged target's content is replaced by the conclusion body, so
+    // a recall hit shows the synthesis rather than the redundant
+    // siblings. Siblings are soft-superseded (status='superseded',
+    // superseded_by=target) — never hard-deleted — so the operator
+    // can un-merge by inspecting the merged_from provenance chain.
+    //
+    // Skipped when:
+    //   - auto-merge is disabled (env var)
+    //   - mergeMemory was not injected (test path)
+    //   - the cluster is not tight enough
+    //   - the cluster has fewer than AUTO_MERGE_THRESHOLDS.clusterSize
+    if (autoMergeEnabled && cluster.length >= AUTO_MERGE_THRESHOLDS.clusterSize) {
+      let isTight = true;
+      const tightVec = decodeEmbeddingImpl(cluster[0].embedding);
+      if (!tightVec) {
+        isTight = false;
+      } else {
+        for (let i = 1; i < cluster.length; i++) {
+          const otherVec = decodeEmbeddingImpl(cluster[i].embedding);
+          if (!otherVec) {
+            isTight = false;
+            break;
+          }
+          if (cosine(tightVec, otherVec) < AUTO_MERGE_THRESHOLDS.cosine) {
+            isTight = false;
+            break;
+          }
+          if (tagOverlap(cluster[0].tagTokens, cluster[i].tagTokens) < AUTO_MERGE_THRESHOLDS.tagOverlap) {
+            isTight = false;
+            break;
+          }
+        }
+      }
+      if (isTight) {
+        // Pick the highest-confidence sibling as the merge target.
+        // Ties broken by updated_at DESC (most recent wins).
+        const target = cluster.reduce((best, m) => {
+          const bestConf = best.confidence || 0;
+          const mConf = m.confidence || 0;
+          return mConf > bestConf ? m : best;
+        });
+        // Chain the others into the target. mergeMemory is
+        // (a, b) -> {a updated, b superseded}; we loop until every
+        // sibling is folded in.
+        for (const sibling of cluster) {
+          if (sibling.id === target.id) continue;
+          try {
+            mergeMemory(db, projectKey, target.id, sibling.id, {
+              mergedContent: content,
+              weight: 1.0,
+            });
+            result.merged += 1;
+          } catch (e) {
+            // Merge failure: the conclusion is still saved, so the
+            // cluster is at least summarised. The next pass will pick
+            // up the (still-active) siblings.
+            result.mergeSkipped += 1;
+          }
+        }
+      } else {
+        result.mergeSkipped += 1;
+      }
+    } else {
+      result.mergeSkipped += 1;
+    }
   }
 
   return result;

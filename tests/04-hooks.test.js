@@ -185,18 +185,60 @@ test('UserPromptSubmit reports real ingest and a brief recall summary instead of
     // prompt is "tabs" / "project" which FTS5 should match in the seeded
     // global row.
     assert.match(r.stdout, /Recalled \d+ memor(?:y|ies)(?:\. \(.+?\))?\.|No recall hits\./);
-    // Per-memory previews must NOT be emitted.
+    // Per-memory previews must NOT be emitted (the verbose
+    // `[global] [semantic] …` style of the legacy implementation).
+    // The new design puts recall snippets in additionalContext only.
     assert.equal(
       r.stdout.includes('[global] [semantic] tabs default'),
       false,
       'verbose global memory preview should not be emitted',
     );
+    // The new format (`[recall: 1/N] "tabs default" ...`) also must
+    // not appear in the human-readable stdout — only in
+    // additionalContext.
     assert.equal(
-      r.stdout.includes('Use tabs everywhere'),
+      r.stdout.includes('[recall: 1/'),
       false,
-      'memory content must not be echoed',
+      'verbose per-memory preview lines must not be in stdout',
     );
-    // Raw prompt must never be echoed.
+    // Per the v9.6+ design, the hook writes a JSON object to stdout
+    // with both `systemMessage` (the human-readable lines) and
+    // `hookSpecificOutput.additionalContext` (the AI-facing recall).
+    // The memory content lives in additionalContext — that is the
+    // point of the feature. Verify the JSON is well-formed and that
+    // the additionalContext contains the recall hits.
+    // The JSON is the trailing brace-delimited object in stdout.
+    const jsonMatch = r.stdout.match(/\{[\s\S]+\}\s*$/);
+    assert.ok(jsonMatch, 'trailing JSON object is present in stdout');
+    const json = JSON.parse(jsonMatch[0]);
+    assert.ok(json.systemMessage, 'systemMessage is present');
+    // The human-readable systemMessage must NOT contain the full
+    // memory content (too noisy for the terminal).
+    assert.equal(
+      json.systemMessage.includes('Use tabs everywhere'),
+      false,
+      'memory content must not be in the human-readable systemMessage',
+    );
+    // additionalContext must contain the recall hits so the AI can
+    // acknowledge them.
+    assert.ok(json.hookSpecificOutput, 'hookSpecificOutput is present');
+    assert.ok(
+      json.hookSpecificOutput.additionalContext,
+      'additionalContext is present',
+    );
+    assert.match(
+      json.hookSpecificOutput.additionalContext,
+      /tabs default/,
+      'additionalContext surfaces the recall hit title',
+    );
+    // The verbose preview line must NOT appear in the human-readable
+    // systemMessage (it's now in additionalContext only).
+    assert.equal(
+      json.systemMessage.includes('[global] [semantic] tabs default'),
+      false,
+      'verbose preview must not be in the human-readable systemMessage',
+    );
+    // Raw prompt must never be echoed anywhere.
     assert.equal(
       r.stdout.includes('remind me, do we use tabs'),
       false,

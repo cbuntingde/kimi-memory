@@ -41,6 +41,7 @@ import {
   detectReclone,
   reinforceIfStale,
   linkMemory,
+  mergeMemory,
 } from '../persist.js';
 import { locateSessionArchive, walkWire, readSessionIndex } from '../wire.js';
 import { runAutoExtract } from '../extract.js';
@@ -54,6 +55,7 @@ import {
 } from '../session-focus.js';
 import { matchAdvisor, logAdvisorDiag } from '../advisor/detect.js';
 import { runConsolidate } from '../consolidate.js';
+import { runAutoGc } from '../auto-gc.js';
 import { runToolRecall, formatToolRecallLines } from './tool-recall.js';
 import { logHookDiag } from '../diagnostics.js';
 
@@ -334,7 +336,8 @@ function diversifyHitsByType(hits, { topN = 3 } = {}) {
 function formatConsolidateSegment(consolidate) {
   if (!consolidate) return 'none';
   if (consolidate.saved && consolidate.saved > 0) {
-    return `saved:${consolidate.saved}/skipped:${consolidate.skipped || 0}`;
+    const merged = consolidate.merged ? `/merged:${consolidate.merged}` : '';
+    return `saved:${consolidate.saved}/skipped:${consolidate.skipped || 0}${merged}`;
   }
   if (consolidate.clusters && consolidate.clusters > 0) {
     return `kept:0/of:${consolidate.clusters}`;
@@ -342,6 +345,38 @@ function formatConsolidateSegment(consolidate) {
   if (consolidate.skipped) return `skip:${consolidate.skipped}`;
   if (consolidate.error) return `err:${consolidate.error}`;
   return 'none';
+}
+
+// Format the auto-GC segment for the status line. The shape mirrors
+// the consolidate segment: a short token string the user can read at
+// a glance. When the heavy passes are throttled, the segment reads
+// "heavy:throttled" so the user knows the pipeline is running but
+// skipped on this open. Errors are surfaced as `err:…`.
+function formatAutoGcSegment(autoGc) {
+  if (!autoGc) return 'none';
+  if (autoGc.error) return `err:${autoGc.error}`;
+  const prune = autoGc.prune || {};
+  const archive = autoGc.archive || {};
+  const tier = autoGc.tier || {};
+  const pruned = (prune.pruned_deleted || 0) +
+    (prune.pruned_superseded || 0) +
+    (prune.pruned_embed_failed || 0) +
+    (prune.pruned_cold || 0) +
+    (prune.pruned_orphans || 0);
+  const archived = (archive.archived_conversation_events || 0) +
+    (archive.archived_skill_invocations || 0) +
+    (archive.archived_persona_promotions || 0);
+  const promoted = (tier.promoted_l0_to_l1 || 0) +
+    (tier.promoted_l1_to_l2 || 0) +
+    (tier.promoted_l2_to_l3 || 0);
+  const demoted = tier.demoted_to_l0 || 0;
+  if (prune.skipped === 'throttled' && archive.skipped === 'throttled') {
+    return `tier:prom:${promoted}/dem:${demoted}/heavy:throttled`;
+  }
+  if (pruned === 0 && archived === 0 && promoted === 0 && demoted === 0) {
+    return 'none';
+  }
+  return `prune:${pruned}/archive:${archived}/tier:prom:${promoted}/dem:${demoted}`;
 }
 
 // Build a "[thread]" line listing the last few distinct sessions
@@ -480,6 +515,7 @@ function buildStatusLine({
   workLog,
   focus,
   consolidate,
+  autoGc,
 }) {
   const ingestSeg = formatIngestSegment(ingest);
   const recallSeg = recall ? ` recall project:${recall.project} global:${recall.global}` : '';
@@ -491,6 +527,7 @@ function buildStatusLine({
   const workLogSeg = workLog ? ` work_log=${formatWorkLogSegment(workLog)}` : '';
   const focusSeg = focus ? ` focus=${formatFocusSegment(focus)}` : '';
   const consolidateSeg = consolidate ? ` consolidate=${formatConsolidateSegment(consolidate)}` : '';
+  const autoGcSeg = autoGc ? ` auto_gc=${formatAutoGcSegment(autoGc)}` : '';
   return [
     `[kimi-memory] event=${event}`,
     `project_key=${key}`,
@@ -499,7 +536,7 @@ function buildStatusLine({
     `wm=${counts.wm.length}`,
     `conv=${counts.conv}`,
     `events=${counts.events}`,
-    `ingest=${ingestSeg}${extractSeg}${workLogSeg}${focusSeg}${consolidateSeg}${recallSeg}`,
+    `ingest=${ingestSeg}${extractSeg}${workLogSeg}${focusSeg}${consolidateSeg}${autoGcSeg}${recallSeg}`,
     `cwd=${cwd}`,
   ].join(' ');
 }
@@ -657,6 +694,19 @@ async function buildRecallSummary({ projectDb, globalDb, key, prompt }) {
     }
   }
 
+  // Annotate topHits with scope + snippet so the caller can build
+  // the AI-facing context without re-deriving either. Keeps the
+  // user-facing line format (recallLines) and the AI-facing format
+  // (additionalContext) using the same source of truth.
+  const annotatedTopHits = topHits.map((m) => ({
+    id: m.id,
+    type: m.type,
+    title: (m.title || '').trim() || (m.content || '').slice(0, 80),
+    snippet: firstContentLine(m.content),
+    score: m.score,
+    scope: projectIdSet.has(m.id) ? 'project' : 'global',
+  }));
+
   return {
     summary,
     projectHits,
@@ -664,7 +714,104 @@ async function buildRecallSummary({ projectDb, globalDb, key, prompt }) {
     recallLines,
     perTypeCounts,
     query,
+    topHits: annotatedTopHits,
   };
+}
+
+// Build the AI-facing recall context. The hook emits this as
+// `hookSpecificOutput.additionalContext` so the model sees a
+// structured summary of what was retrieved on its behalf. Without
+// this, recall happens behind the model's back and it has no way
+// to know "I recall X" — the user sees the recall lines but the
+// model's reply never acknowledges them.
+//
+// Returns null when there are no hits, so the caller can skip the
+// `additionalContext` field entirely (no "no recall hits" spam on
+// every turn).
+//
+// Format choice: numbered list with (type, scope, score) per row,
+// followed by a one-line permission to cite. The model is told
+// explicitly that a memory may be wrong, so it can speak up if
+// recall is stale or off-topic.
+function buildRecallContextLines(recall, topHits) {
+  if (!topHits || topHits.length === 0) return null;
+  const total = recall.projectHits.length + recall.globalHits.length;
+  const lines = [];
+  lines.push(
+    `[kimi-memory recall] ${total} memories surfaced — briefly acknowledge what you remember when relevant. If a memory is wrong or stale, say so and we can update it.`,
+  );
+  for (let i = 0; i < topHits.length; i++) {
+    const m = topHits[i];
+    const score = m.score != null ? `, score=${m.score.toFixed(2)}` : '';
+    const tail = m.snippet ? ` — ${m.snippet}` : '';
+    lines.push(`${i + 1}. (${m.type}, ${m.scope}${score}) "${m.title}"${tail}`);
+  }
+  return lines.join('\n');
+}
+
+// Throttle window for heavy auto-GC passes (prune + archive). The
+// tier-promotion step is cheap (a few prepared statements) and runs
+// every SessionStart; the prune + archive steps touch more rows and
+// only run once per AUTO_GC_THROTTLE_HOURS hours per project.
+const AUTO_GC_THROTTLE_HOURS = 6;
+
+// Run auto-GC, with the heavy passes (prune + archive) gated on a
+// per-project timestamp stored in schema_meta. Tier promotion
+// (cheap) runs every open. The timestamp is round-tripped through
+// the same DB so a project that has never been GC'd runs on its
+// first open.
+function runAutoGcThrottled(db, projectKey) {
+  if (!db || !projectKey) return { skipped: 'no_inputs' };
+  if (process.env.KIMI_MEMORY_AUTO_GC === 'off') {
+    return { skipped: 'env_opt_out' };
+  }
+
+  const now = new Date();
+  // Tier promotion is cheap; always run it.
+  const tier = runAutoTier(db, projectKey, { now });
+
+  // Prune + archive are throttled. Read the last-run timestamp from
+  // schema_meta (key 'auto_gc_last_run'). Missing row === never run.
+  let lastRun = null;
+  try {
+    const row = db
+      .prepare('SELECT value FROM schema_meta WHERE key = ?')
+      .get('auto_gc_last_run');
+    if (row && row.value) {
+      const t = Date.parse(row.value);
+      if (Number.isFinite(t)) lastRun = new Date(t);
+    }
+  } catch {
+    /* missing — first run */
+  }
+
+  const throttleMs = AUTO_GC_THROTTLE_HOURS * 60 * 60 * 1000;
+  const isThrottled = lastRun && now - lastRun < throttleMs;
+
+  let prune = null;
+  let archive = null;
+  if (isThrottled) {
+    prune = { skipped: 'throttled' };
+    archive = { skipped: 'throttled' };
+  } else {
+    try {
+      const r = runAutoGc(db, projectKey, { now });
+      prune = r.prune || { skipped: 'no_db' };
+      archive = r.archive || { skipped: 'no_db' };
+      // Stamp the last-run time so the next SessionStart honours the
+      // throttle window. Use INSERT OR REPLACE so a re-run on the
+      // same DB doesn't fail on the duplicate key.
+      db.prepare(
+        `INSERT INTO schema_meta (key, value) VALUES ('auto_gc_last_run', ?)
+         ON CONFLICT(key) DO UPDATE SET value=excluded.value`,
+      ).run(new Date().toISOString());
+    } catch (e) {
+      prune = { error: e && e.message ? e.message : String(e) };
+      archive = { error: e && e.message ? e.message : String(e) };
+    }
+  }
+
+  return { prune, archive, tier };
 }
 
 function emitLines(lines) {
@@ -714,6 +861,13 @@ async function handleSessionStart(payload) {
   // embedding model is already loaded for recall. Idempotent — a
   // re-run on a project with existing conclusions is a no-op via the
   // memory_synthesizes coverage check.
+  //
+  // When the cluster is tight enough (cosine ≥ 0.85, tag overlap ≥ 2,
+  // ≥ 3 members), the consolidate pass also calls mergeMemory to
+  // collapse the siblings into the highest-confidence one. The
+  // merged target's content is replaced by the conclusion body; the
+  // siblings are soft-superseded (never hard-deleted) so the
+  // operator can un-merge by walking the merged_from provenance.
   let consolidate = null;
   if (projectDb) {
     try {
@@ -722,12 +876,31 @@ async function handleSessionStart(payload) {
         projectKey: key,
         saveMemory,
         memoryLink: linkMemory,
+        mergeMemory,
       });
-      if (consolidate && (consolidate.saved || consolidate.skipped)) {
+      if (consolidate && (consolidate.saved || consolidate.skipped || consolidate.merged)) {
         await logDiag('info', 'consolidate result', { key, consolidate });
       }
     } catch (e) {
       consolidate = { error: e && e.message };
+    }
+  }
+
+  // Auto-GC: prune dead rows, archive old audit tables, and
+  // migrate tiers. Throttled by a per-DB timestamp so the heavy
+  // passes run at most once per AUTO_GC_THROTTLE_HOURS hours.
+  // The decay / consolidate / tier-promotion steps are cheap (a
+  // handful of prepared statements) and run every open; the prune
+  // + archive steps are throttled.
+  let autoGc = null;
+  if (projectDb) {
+    try {
+      autoGc = runAutoGcThrottled(projectDb, key);
+      if (autoGc && (autoGc.pruned || autoGc.archived || autoGc.prune || autoGc.archive)) {
+        await logDiag('info', 'auto-gc result', { key, autoGc });
+      }
+    } catch (e) {
+      autoGc = { error: e && e.message };
     }
   }
   const lines = [];
@@ -742,6 +915,7 @@ async function handleSessionStart(payload) {
       workLog: latestWorkLog,
       focus: latestFocus,
       consolidate,
+      autoGc,
     }),
   );
   lines.push(recentSummary);
@@ -860,11 +1034,12 @@ async function handleUserPromptSubmit(payload) {
     }),
   );
   if (recall.summary) lines.push(recall.summary);
-  // Per-memory title lines so the user (and the agent) can see which
-  // memories the recall surfaced. Bounded to top 3 by score; emits
-  // nothing when there are zero hits (the summary already says
-  // "No recall hits.").
-  for (const l of recall.recallLines) lines.push(l);
+  // Per-memory previews (the verbose `[recall: i/N] "title" …` lines)
+  // are NOT emitted to the human-readable status block anymore. The
+  // v9.6+ design routes them through `hookSpecificOutput.additionalContext`
+  // (below) so the model sees exactly what was retrieved, but the
+  // terminal stays clean. The legacy format was loud and the new
+  // format is intentionally terse.
   // "Where we left off" — surface the latest session-focus row so the
   // agent can pick up after a session restart. Always emitted (not
   // gated on keyword recall) because it is the answer to "continue"
@@ -886,6 +1061,30 @@ async function handleUserPromptSubmit(payload) {
   const staleMemoryLine = buildStaleMemoryLine(projectDb, key, cwd);
   if (staleMemoryLine) lines.push(staleMemoryLine);
   emitLines(lines);
+  // Build the AI-facing recall context. Only injected when there are
+  // actual hits — emitting "no recall hits" on every turn trains the
+  // model to ignore the signal. The context tells the model what was
+  // retrieved AND gives it permission to acknowledge/correct, so
+  // "I recall X" stops being a behavior we hope for and starts being
+  // a behavior the model is told to do.
+  const additionalContext = buildRecallContextLines(recall, recall.topHits);
+  // Emit a JSON object the harness can parse. `systemMessage` is the
+  // existing human-readable status line stack (harness shows it to the
+  // user; emitLines above prints it directly to stdout for clients that
+  // don't parse the JSON). `hookSpecificOutput.additionalContext`
+  // injects the recall summary into the model's prompt for this turn.
+  const output = {
+    systemMessage: lines.join('\n'),
+    hookSpecificOutput: {
+      hookEventName: 'UserPromptSubmit',
+      ...(additionalContext ? { additionalContext } : {}),
+    },
+  };
+  try {
+    process.stdout.write(JSON.stringify(output) + '\n');
+  } catch {
+    /* stdout closed; not fatal */
+  }
   return {
     ok: true,
     key,
@@ -900,6 +1099,7 @@ async function handleUserPromptSubmit(payload) {
     focus: focusLine ? true : false,
     advisor: advisorMatch,
     stale_memory: staleMemoryLine ? true : false,
+    additional_context: additionalContext,
   };
 }
 
