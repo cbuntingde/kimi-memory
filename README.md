@@ -29,7 +29,7 @@ A local Kimi Code plugin that provides three-layer memory — cross-project user
 In the Kimi Code chat input:
 
 ```text
-/plugins install https://github.com/cbuntingde/kimi-memory-testing
+/plugins install https://github.com/cbuntingde/kimi-memory
 ```
 
 Kimi pulls the source into `$KIMI_CODE_HOME/plugins/managed/kimi-memory/`. On
