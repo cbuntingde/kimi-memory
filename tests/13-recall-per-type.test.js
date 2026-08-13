@@ -501,10 +501,7 @@ test('MCP round-trip: recall surfaces type breakdown + per-memory [recall: i/N] 
     //   "1. (type, scope, score=0.02) \"title\" — snippet"
     // rather than the legacy `[recall: 1/N]` form.
     assert.ok(json.hookSpecificOutput, 'hookSpecificOutput is present');
-    assert.ok(
-      json.hookSpecificOutput.additionalContext,
-      'additionalContext is present',
-    );
+    assert.ok(json.hookSpecificOutput.additionalContext, 'additionalContext is present');
     assert.match(
       json.hookSpecificOutput.additionalContext,
       /\n1\. \(semantic, project/,

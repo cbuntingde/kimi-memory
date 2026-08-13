@@ -158,7 +158,7 @@ kimi-memory acl revoke    <memory-id> --principal-kind <k> --principal-id <id> [
 
 ### Vector similarity search
 
-The `memories` table carries an optional 384-dim `embedding` (`BLOB`, float32). Every `memory_save`, `memory_recall`, `memory_save_bulk`, and `memory_merge` computes and stores an embedding by default; `memory_recall` runs FTS5 and cosine in parallel and merges the two ranked lists. The model is `Xenova/all-MiniLM-L6-v2` (~25 MB), fetched lazily from Hugging Face and cached locally. Set `KIMI_MEMORY_EMBEDDINGS=off` to skip embedding entirely; `memory_similar` returns `[]` and `memory_recall` falls back to FTS5-only. Encoding is wall-clock bounded at 4 s (`KIMI_MEMORY_EMBED_TIMEOUT_MS`); on timeout the row's `embedding_status` flips to `failed` and `last_embed_error` records the cause. The next call rides the in-flight load if it eventually lands.
+The `memories` table carries an optional 384-dim `embedding` (`BLOB`, float32). Every `memory_save`, `memory_recall`, `memory_save_bulk`, and `memory_merge` computes and stores an embedding by default; `memory_recall` runs FTS5 and cosine in parallel and merges the two ranked lists. The model is `Xenova/all-MiniLM-L6-v2` (~25 MB), fetched lazily from Hugging Face and cached locally. Set `KIMI_MEMORY_EMBEDDINGS=off` to skip new encoding; existing stored embeddings are still queryable, so `memory_similar` continues to work against rows that already have a vector. Encoding is wall-clock bounded at 4 s (`KIMI_MEMORY_EMBED_TIMEOUT_MS`); on timeout the row's `embedding_status` flips to `failed` and `last_embed_error` records the cause. The next call rides the in-flight load if it eventually lands.
 
 ### Edges
 
@@ -195,7 +195,7 @@ Save with `memory_save({ type: "conclusion", synthesizes: [childId, ...] })`. Li
 - **Cross-session narrative** — `SessionStart` lists the last 3 sessions for the project, oldest → newest, with each session's focus title and body snippet. Pick-up phrasing: `Picking up the thread: <oldest session title>`.
 - **Background consolidation ("dream pass")** — every `SessionStart`, related memories (cosine ≥ 0.75, ≥ 2 shared tags) are clustered; each cluster of ≥ 3 siblings without a `conclusion` child gets one synthesised. Idempotent via `memory_synthesizes` coverage check. Opt out via `KIMI_MEMORY_CONSOLIDATE=off`. **Auto-merge** additionally collapses _tight_ clusters (cosine ≥ 0.85, tag overlap ≥ 2, ≥ 3 members) by `memory_merge`-ing each sibling into the highest-confidence member, so a recall hit surfaces the synthesis body rather than a stack of redundant siblings. Siblings are soft-superseded (never hard-deleted); un-merge via the `merged_from` provenance chain. Opt out via `KIMI_MEMORY_AUTO_MERGE=off`.
 
-Schema `SCHEMA_VERSION = 10` is the current migration target. The v9 bump added `stability_days` and `last_rehearsed_at`; the v10 bump added ACL/visibility columns (`visibility`, `shared_with`, `team_id`, `agent_id`, `user_id`, `session_id`, `task_id`) + `tier` + `persona_id` + the `metadata` column on `memory_edges`. Existing rows are backfilled on first open via column defaults; pre-v10 rows get `visibility='private'`, `shared_with='[]'`, `tier='L0'`, `stability_days=30`.
+Schema `SCHEMA_VERSION = 11` is the current migration target. The v9 bump added `stability_days` and `last_rehearsed_at`; the v10 bump added ACL/visibility columns (`visibility`, `shared_with`, `team_id`, `agent_id`, `user_id`, `session_id`, `task_id`) + `tier` + `persona_id` + the `metadata` column on `memory_edges`. Existing rows are backfilled on first open via column defaults; pre-v10 rows get `visibility='private'`, `shared_with='[]'`, `tier='L0'`, `stability_days=30`. The v11 bump made `memories_fts.project_key` and `memories_fts.type` indexed (probe-then-rebuild, idempotent).
 
 ### Auto-GC (background housekeeping)
 
@@ -245,7 +245,7 @@ Ported from TencentDB-Agent-Memory. Every memory carries one of five visibility 
 - `acl_share_memory({cwd, memory_ids, visibility, shared_with?, to_shared_pool?})` — promote rows to a new visibility level. With `to_shared_pool: true` the row is physically moved to the cross-project shared DB at `$KIMI_CODE_HOME/kimi-memory/_shared/memory.sqlite` (literal `project_key='_shared'`); without it, the row stays in its project DB and only `visibility` + `shared_with` change.
 - `acl_resolve_principal({cwd, descriptor})` — parse a `kind:id` descriptor into parts.
 
-`memory_recall` accepts an optional `visibility: 'team' | ['private', 'team']` filter that narrows both the FTS and the vector channels. `memory_save`, `memory_save_bulk`, and `memory_update` accept the same `visibility` + `shared_with` + `team_id` / `agent_id` / `user_id` / `session_id` / `task_id` fields; existing callers continue to work byte-identical because every new field has a safe default.
+`memory_recall` accepts an optional `visibility: 'team' | ['private', 'team']` filter that narrows both the FTS and the vector channels. `memory_save`, `memory_save_bulk`, and `memory_update` accept the shared ACL fields `visibility` + `shared_with`; identity columns (`team_id` / `agent_id` / `user_id` / `session_id` / `task_id`) exist on the row but are populated by the hook layer, not the MCP tool surface. See `CONVENTIONS.md §7` for the rationale.
 
 **CLI additions**:
 
@@ -354,7 +354,7 @@ Top-level fields describe the project layer; `global.memories` describes the cro
 
 ## Schema
 
-`SCHEMA_VERSION` is `10`. Databases are migrated in place on first open; migrations are idempotent and append a new column or table when missing. Current schema additions: `project_paths` (canonical project root per DB, drives `memory_prune`); `last_embed_error` on `memories` (failed embeddings are observable); `last_canonical_root` + `record_count` on `project_paths` (preserves prior root on re-record); `stability_days` + `last_rehearsed_at` (Ebbinghaus decay, v9); `visibility` + `shared_with` + 5 nullable principal identity columns + `memories_acl` grant table (v10); `schema_meta(key, value)` carries `schema_version` and the `auto_gc_last_run` throttle stamp.
+`SCHEMA_VERSION` is `11`. Databases are migrated in place on first open; migrations are idempotent and append a new column or table when missing. Current schema additions: `project_paths` (canonical project root per DB, drives `memory_prune`); `last_embed_error` on `memories` (failed embeddings are observable); `last_canonical_root` + `record_count` on `project_paths` (preserves prior root on re-record); `stability_days` + `last_rehearsed_at` (Ebbinghaus decay, v9); `visibility` + `shared_with` + 5 nullable principal identity columns + `memories_acl` grant table (v10); `schema_meta(key, value)` carries `schema_version` and the `auto_gc_last_run` throttle stamp.
 
 The persistence layer is split into focused modules under `src/persist/` (connection, memories, search, reinforce, edges, share, skills, project + a barrel re-export). The top-level `src/persist.js` is a 6-line backward-compatibility shim that re-exports the barrel, so existing `import { … } from './persist.js'` call sites keep working unchanged.
 

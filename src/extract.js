@@ -75,7 +75,7 @@ export function redactSecrets(text) {
   if (!text) return '';
   let out = text;
   out = out.replace(
-    /\b(sk-[A-Za-z0-9]{20,}|sk-ant-[A-Za-z0-9-]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|ghp_[A-Za-z0-9]{36}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})\b/g,
+    /\b(?:sk-[A-Za-z0-9]{20,}|sk-ant-[A-Za-z0-9-]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|ghp_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{40,}|glpat-[A-Za-z0-9_-]{20,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})\b/g,
     '[REDACTED_PROVIDER_KEY]',
   );
   out = out.replace(
@@ -245,12 +245,19 @@ function buildExtractionPrompt(transcript, existingTitles, projectMeta) {
     existingTitles && existingTitles.length
       ? `\nFor dedup, here are titles already in this project's memory (avoid repeating these):\n- ${existingTitles.slice(0, 50).join('\n- ')}\n`
       : '';
+  // Project metadata is serialised JSON pulled from manifest files in
+  // the active project. Redact it too — a secret-bearing build script
+  // would otherwise leave the machine unchanged while a credential
+  // copy ships to the LLM. (Audit finding F-003.)
   const metaLine = projectMeta
-    ? `\nProject metadata (from manifest files):\n${JSON.stringify(projectMeta, null, 2)}\n`
+    ? `\nProject metadata (from manifest files):\n${redactSecrets(JSON.stringify(projectMeta, null, 2)).slice(0, MAX_INPUT_CHARS)}\n`
     : '';
   return {
     system: EXTRACT_SYSTEM_PROMPT,
-    user: `${titlesLine}${metaLine}Conversation transcript:\n"""\n${trimmed}\n"""\n\nJSON array of candidate memories:`,
+    user: `${titlesLine}${metaLine}Conversation transcript:\n"""\n${trimmed}\n"""\n\nJSON array of candidate memories:`.slice(
+      0,
+      MAX_INPUT_CHARS,
+    ),
   };
 }
 
@@ -398,10 +405,19 @@ export async function dedupeCandidates({
 }) {
   const kept = [];
   const duplicates = [];
-  // Pull all active memory titles once. Cheap enough for the working
-  // set and lets the cheap overlap check run in O(candidates * titles).
+  // Stage 1: bound to the most recent 500 active rows so a 50k-corpus
+  // doesn't stall the Stop hook. The cheap overlap check runs in
+  // O(candidates × titles) inside the limit. Duplicates that survive
+  // stage 1 still hit the hybrid recall in stage 2.
+  // (Audit finding F-008.)
+  const DEDUPE_TITLE_LIMIT = 500;
   const existing = db
-    .prepare("SELECT id, title, content FROM memories WHERE project_key = ? AND status = 'active'")
+    .prepare(
+      `SELECT id, title, content FROM memories
+         WHERE project_key = ? AND status = 'active'
+         ORDER BY datetime(updated_at) DESC, id DESC
+         LIMIT ${DEDUPE_TITLE_LIMIT}`,
+    )
     .all(projectKey)
     .map((r) => ({
       id: r.id,

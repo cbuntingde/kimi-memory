@@ -35,6 +35,13 @@ const MIN_RELEVANCE_SCORE = 0.01;
 // default 60 is the standard RRF textbook value.
 const RRF_K = 60;
 
+// Vector-scan ceiling: bounds the number of embedding BLOBs read into
+// Node memory per recall / similarity call. Without this, a project
+// with 50k memories pays 50k × 1.5 KB IO on every `memory_similar`
+// call. 500 matches the recall-channel cap; tests/16-perf.test.js
+// gates the behaviour at 5k-corpus scale.
+const RECALL_VECTOR_CAP = 500;
+
 /**
  * Pure RRF combiner. Returns the RRF score for a single candidate.
  *
@@ -152,9 +159,8 @@ export async function searchMemories(db, projectKey, query, opts = {}) {
   // (opts.titleBoost true) or by default for backward parity with the
   // documented IMPROVEMENTS.md §5 surface. The boosted form wraps the
   // query in `title:"q" OR "q"` so FTS5 ranks title matches higher.
-  const normalised = opts.titleBoost === false
-    ? normalizeFts5Query(query)
-    : buildTitleBoostedQuery(query);
+  const normalised =
+    opts.titleBoost === false ? normalizeFts5Query(query) : buildTitleBoostedQuery(query);
   const ftsRows = [];
   if (normalised) {
     const params = [normalised, projectKey];
@@ -199,15 +205,20 @@ export async function searchMemories(db, projectKey, query, opts = {}) {
   // before passing to the diversifier. The fall-through default is
   // the RRF score (computed below).
   const sortBy = opts.sortBy || opts.sort_by || null;
-  const recentFirst = opts.recentFirst !== undefined
-    ? !!opts.recentFirst
-    : opts.recent_first !== undefined
-    ? !!opts.recent_first
-    : null;
+  const recentFirst =
+    opts.recentFirst !== undefined
+      ? !!opts.recentFirst
+      : opts.recent_first !== undefined
+        ? !!opts.recent_first
+        : null;
   if (sortBy === 'recent' || recentFirst === true) {
-    ftsRows.sort((a, b) => (a.updated_at < b.updated_at ? 1 : a.updated_at > b.updated_at ? -1 : 0));
+    ftsRows.sort((a, b) =>
+      a.updated_at < b.updated_at ? 1 : a.updated_at > b.updated_at ? -1 : 0,
+    );
   } else if (sortBy === 'oldest') {
-    ftsRows.sort((a, b) => (a.updated_at < b.updated_at ? -1 : a.updated_at > b.updated_at ? 1 : 0));
+    ftsRows.sort((a, b) =>
+      a.updated_at < b.updated_at ? -1 : a.updated_at > b.updated_at ? 1 : 0,
+    );
   }
   // The buildOrderByClause helper is exported for callers that want
   // to compose SQL themselves; the in-memory resort above is what
@@ -242,9 +253,28 @@ export async function searchMemories(db, projectKey, query, opts = {}) {
       where.push(`tier IN (${tierFilter.map(() => '?').join(',')})`);
       params.push(...tierFilter);
     }
+    // Bound the vector scan: every row's embedding BLOB is read into
+    // Node memory, so a project with 50k memories pays 50k × 1.5 KB
+    // IO per recall. The (project_key, embedding_dim) index drives
+    // the WHERE, but capping the IO keeps the hot path bounded at
+    // RECALL_VECTOR_CAP rows. RECALL_VECTOR_CAP = limit * 10 gives
+    // a comfortable overshoot so the vector channel can still
+    // contribute rank-1 hits; tests/16-perf.test.js gates the
+    // behaviour at 5k-corpus scale.
+    const vectorCap = Math.min(
+      RECALL_VECTOR_CAP,
+      Math.max(50, (perType ? Math.max(limit * 5, 100) : limit) * 10),
+    );
     const rows = db
-      .prepare(`SELECT id, embedding FROM memories WHERE ${where.join(' AND ')}`)
-      .all(...params);
+      .prepare(
+        `SELECT id, embedding FROM (
+           SELECT id, embedding FROM memories
+           WHERE ${where.join(' AND ')}
+           ORDER BY randomblob(8)
+           LIMIT ?
+         )`,
+      )
+      .all(...params, vectorCap);
     for (const r of rows) {
       const v = decodeVector(r.embedding);
       if (!v || v.length !== EMBEDDING_DIM) continue;
@@ -476,7 +506,20 @@ export async function similarMemories(db, projectKey, id, { limit = 10, threshol
     'embedding_dim = ?',
   ];
   const params = [projectKey, id, EMBEDDING_DIM];
-  const rows = db.prepare(`SELECT * FROM memories WHERE ${where.join(' AND ')}`).all(...params);
+  // Same candidate cap as the recall channel: every row's embedding
+  // BLOB is materialised and decoded, so a 50k-memory project would
+  // otherwise pay 50k × 1.5 KB IO on every memory_similar call.
+  // (Audit finding F-005.)
+  const rows = db
+    .prepare(
+      `SELECT * FROM (
+         SELECT * FROM memories
+         WHERE ${where.join(' AND ')}
+         ORDER BY randomblob(8)
+         LIMIT ?
+       )`,
+    )
+    .all(...params, RECALL_VECTOR_CAP);
 
   const scored = [];
   for (const row of rows) {

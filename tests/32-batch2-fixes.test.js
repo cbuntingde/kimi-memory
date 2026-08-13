@@ -11,12 +11,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkTempHome, rmRf } from './_helpers.js';
-import {
-  openDb,
-  closeDb,
-  saveMemory,
-  setMemoryTier,
-} from '../src/persist.js';
+import { openDb, closeDb, saveMemory, setMemoryTier } from '../src/persist.js';
 import { projectDbPath, deriveProjectKey } from '../src/project-key.js';
 import { validateSharedWith } from '../src/acl.js';
 import { mergeConfigWithEnv } from '../src/config.js';

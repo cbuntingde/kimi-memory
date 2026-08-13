@@ -8,7 +8,7 @@ import { mkdirSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { logPersistError } from '../diagnostics.js';
 
-const SCHEMA_VERSION = 10;
+const SCHEMA_VERSION = 11;
 
 // Schema migrations. Each entry is idempotent: it inspects the live
 // schema, no-ops when its target shape is already in place, and
@@ -469,11 +469,11 @@ const MIGRATIONS = [
     // probe-insert approach always failed (omitted created_at NOT NULL)
     // and forced a full rebuild on every open.
     const createSql =
-      db
-        .prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='memory_edges'")
-        .get()?.sql || '';
-    const hasCodegraphKinds =
-      /kind\s+IN\s*\([^)]*\bimports\b[^)]*\bcalls\b[^)]*\bdefines\b/i.test(createSql);
+      db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='memory_edges'").get()
+        ?.sql || '';
+    const hasCodegraphKinds = /kind\s+IN\s*\([^)]*\bimports\b[^)]*\bcalls\b[^)]*\bdefines\b/i.test(
+      createSql,
+    );
     if (!hasCodegraphKinds) {
       db.exec(`
         BEGIN;
@@ -528,11 +528,6 @@ const MIGRATIONS = [
   },
 
   // v10: extend the memories CHECK to include 'skill' (Phase 6).
-  // Same probe-then-rebuild shape as the v5 (conclusion) and v10
-  // (visibility) migrations: SQLite cannot ALTER a CHECK constraint,
-  // so we probe a throwaway row to detect the current shape; if the
-  // probe fails, rebuild the table with the expanded vocabulary and
-  // copy every row across. Re-runs are no-ops.
   function migrateAddSkillType(db) {
     // Same shape as migrateAddConclusionType: the prior probe INSERT
     // always failed (omitted NOT NULL created_at/updated_at) and forced
@@ -605,6 +600,43 @@ const MIGRATIONS = [
       `);
     }
   },
+  // v11: index project_key on memories_fts so the FTS5 MATCH can
+  // filter on project_key directly (via the virtual table's
+  // auxiliary columns) instead of always reading every match back
+  // through the JOIN to memories. In the per-project-per-DB model
+  // the benefit is modest (every row in this DB shares the same
+  // project_key), but it future-proofs the schema against a
+  // multi-tenant DB layout and removes a WHERE-clause layer.
+  //
+  // Idempotent: probe the CREATE TABLE SQL on sqlite_master, and
+  // only rebuild when `project_key UNINDEXED` is still on the
+  // existing virtual table. Re-runs after a successful rebuild
+  // short-circuit.
+  // (Audit finding F-010.)
+  function migrateFts5IndexProjectKey(db) {
+    const row = db
+      .prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='memories_fts'")
+      .get();
+    const sql = (row && row.sql) || '';
+    if (!sql) return;
+    if (!/project_key\s+UNINDEXED/i.test(sql)) return;
+    db.exec(`
+      BEGIN;
+      DROP TABLE IF EXISTS memories_fts;
+      CREATE VIRTUAL TABLE memories_fts USING fts5(
+        id UNINDEXED,
+        project_key,
+        type,
+        title,
+        content,
+        tags,
+        tokenize = 'unicode61 remove_diacritics 2'
+      );
+      INSERT INTO memories_fts (id, project_key, type, title, content, tags)
+        SELECT id, project_key, type, title, content, tags FROM memories;
+      COMMIT;
+    `);
+  },
 ];
 
 const SCHEMA_SQL = `
@@ -651,8 +683,8 @@ CREATE INDEX IF NOT EXISTS idx_memories_supersedes ON memories(supersedes);
 
 CREATE VIRTUAL TABLE IF NOT EXISTS memories_fts USING fts5(
   id UNINDEXED,
-  project_key UNINDEXED,
-  type UNINDEXED,
+  project_key,
+  type,
   title,
   content,
   tags,
@@ -692,6 +724,11 @@ CREATE TABLE IF NOT EXISTS conversation_events (
   PRIMARY KEY (session_id, project_key, line_no)
 );
 CREATE INDEX IF NOT EXISTS idx_events_role ON conversation_events(session_id, project_key, role);
+-- Supports readRecentFilePaths: the hot query filters by project_key
+-- AND kind, then sorts by line_no. The composite index matches both
+-- the equality filter and the sort. (Audit finding F-006.)
+CREATE INDEX IF NOT EXISTS idx_events_project_kind_line
+  ON conversation_events(project_key, kind, line_no);
 
 -- v6: per-DB project_paths registry. Each row pins a project_key to the
 -- canonical project root the DB was last opened with. Memory_prune uses

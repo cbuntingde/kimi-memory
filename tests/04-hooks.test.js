@@ -222,10 +222,7 @@ test('UserPromptSubmit reports real ingest and a brief recall summary instead of
     // additionalContext must contain the recall hits so the AI can
     // acknowledge them.
     assert.ok(json.hookSpecificOutput, 'hookSpecificOutput is present');
-    assert.ok(
-      json.hookSpecificOutput.additionalContext,
-      'additionalContext is present',
-    );
+    assert.ok(json.hookSpecificOutput.additionalContext, 'additionalContext is present');
     assert.match(
       json.hookSpecificOutput.additionalContext,
       /tabs default/,

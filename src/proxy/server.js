@@ -57,8 +57,20 @@ export async function startProxy({
 } = {}) {
   const log =
     logger || ((...a) => process.stderr.write('[kimi-memory proxy] ' + a.join(' ') + '\n'));
-  const token = authToken != null ? authToken : process.env.KIMI_MEMORY_PROXY_TOKEN || null;
-  const bypass = process.env.KIMI_MEMORY_PROXY_AUTH === 'off';
+  // Token lookup: trim the env-supplied token once at init so an
+  // operator-supplied trailing space can't silently desync client and
+  // server (constant-time comparison still rejects the mismatch, but
+  // a clean cut makes the failure obvious).
+  const token =
+    authToken != null
+      ? authToken.trim()
+      : process.env.KIMI_MEMORY_PROXY_TOKEN
+        ? process.env.KIMI_MEMORY_PROXY_TOKEN.trim()
+        : null;
+  // Auth bypass accepts the common truthy set so `KIMI_MEMORY_PROXY_AUTH=0`,
+  // `=false`, `=no`, or `=off` all turn auth off — not just `=off`
+  // literally.
+  const bypass = proxyAuthBypass();
 
   // Refuse the dangerous combo: auth bypass on a non-loopback bind
   // exposes the entire MCP surface (read + write) to the network with
@@ -189,11 +201,23 @@ export async function startProxy({
     }
     const path = url.pathname.replace(/\/+$/, '') || '/';
 
-    // CORS-lite: allow the agent browser to call from any origin;
-    // responses are JSON. The auth check still applies on the actual
-    // tool endpoints.
-    res.setHeader('access-control-allow-origin', '*');
-    res.setHeader('access-control-allow-methods', 'GET, POST, OPTIONS');
+    // CORS: list-based allowlist via `KIMI_MEMORY_PROXY_CORS_ORIGINS`
+    // (comma-separated). The proxy is a server-to-server transport by
+    // default; a wildcard CORS would let any browser-origin exfiltrate a
+    // token via a stolen cookie or shared workstation. Setting the env
+    // var to e.g. "https://dashboard.local" narrows the cross-origin
+    // surface to exactly the call sites that need it. Auth still applies
+    // on every tool endpoint regardless.
+    const allowedOrigins = (process.env.KIMI_MEMORY_PROXY_CORS_ORIGINS || '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+    const reqOrigin = req.headers.origin || '';
+    if (allowedOrigins.includes(reqOrigin)) {
+      res.setHeader('access-control-allow-origin', reqOrigin);
+      res.setHeader('vary', 'Origin');
+    }
+    res.setHeader('access-control-allow-methods', 'POST');
     res.setHeader('access-control-allow-headers', 'authorization, content-type');
     if (req.method === 'OPTIONS') {
       res.writeHead(204);
@@ -208,14 +232,15 @@ export async function startProxy({
       return;
     }
 
-    // Auth gate for everything else.
-    if (path !== '/tools') {
-      const auth = authenticate(req);
-      if (!auth.ok) {
-        res.writeHead(401, { 'content-type': 'application/json' });
-        res.end(JSON.stringify({ error: auth.error }));
-        return;
-      }
+    // Auth gate for every other route, including /tools. Free tool
+    // enumeration would let an unauthenticated probe catalogue the
+    // proxy's attack surface; require the bearer for everything that
+    // is not a liveness probe.
+    const auth = authenticate(req);
+    if (!auth.ok) {
+      res.writeHead(401, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ error: auth.error }));
+      return;
     }
 
     if (path === '/tools' && req.method === 'GET') {
@@ -239,27 +264,12 @@ export async function startProxy({
       log('shutdown requested; closing server');
       res.writeHead(200, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ ok: true }));
-      // Defer the close so the response is flushed first. closeDb()
-      // is called alongside the HTTP close so the cached SQLite handle
-      // is released — without this the next process restart inherits a
-      // handle whose underlying WAL was not checkpointed. flushEmbeddings
-      // drains any in-flight embedding microtasks before the handle
-      // closes so a partial row write cannot be truncated.
+      // Defer the close so the response is flushed first. gracefulShutdown
+      // drains in-flight embeddings + closes the SQLite cache so the
+      // next process restart inherits a handle whose WAL was
+      // checkpointed.
       setImmediate(() => {
-        Promise.resolve(flushEmbeddings({ timeoutMs: 10000 }))
-          .catch(() => {})
-          .finally(() => {
-            try {
-              server.close();
-            } catch {
-              /* ignore */
-            }
-            try {
-              closeDb();
-            } catch {
-              /* ignore */
-            }
-          });
+        gracefulShutdown().catch(() => {});
       });
       return;
     }
@@ -307,19 +317,42 @@ export async function startProxy({
   });
   log(`proxy listening on http://${host}:${port} (auth ${state.authEnabled ? 'on' : 'off'})`);
 
+  // gracefulShutdown is the single teardown path: stops accepting
+  // new HTTP connections and waits for in-flight requests to drain
+  // FIRST, then flushes embedding microtasks, then releases SQLite
+  // handles. Closing SQLite before the HTTP server drains lets an
+  // active tool request race database teardown — a transient 500
+  // or a corrupted in-flight row. (Audit finding F-009.)
+  // /shutdown and the exported close() both route here so the two
+  // surfaces can never drift.
+  async function gracefulShutdown() {
+    const serverClosed = new Promise((resolve) => {
+      try {
+        server.close(() => resolve());
+      } catch {
+        resolve();
+      }
+    });
+    await serverClosed;
+
+    try {
+      await Promise.resolve(flushEmbeddings({ timeoutMs: 10000 }));
+    } catch {
+      /* ignore */
+    }
+    try {
+      closeDb();
+    } catch {
+      /* ignore */
+    }
+  }
+
   return {
     server,
     host,
     port,
     state,
-    close: () =>
-      new Promise((resolve) => {
-        try {
-          server.close(() => resolve());
-        } catch {
-          resolve();
-        }
-      }),
+    close: () => gracefulShutdown(),
   };
 }
 
@@ -329,5 +362,11 @@ export async function startProxy({
  * dev only).
  */
 export function proxyAuthBypass() {
-  return process.env.KIMI_MEMORY_PROXY_AUTH === 'off';
+  // Accept the common truthy set so `KIMI_MEMORY_PROXY_AUTH=0`,
+  // `=false`, `=no`, or `=off` all turn auth off — not just the
+  // literal string `off`. Read at call time so a test that toggles
+  // the env var mid-suite sees the new value without re-instantiating
+  // the proxy.
+  const v = (process.env.KIMI_MEMORY_PROXY_AUTH || '').toLowerCase().trim();
+  return v === 'off' || v === '0' || v === 'false' || v === 'no';
 }

@@ -165,11 +165,13 @@ const TOOL_DEFS = [
         .max(32)
         .optional()
         .describe('v10: principal descriptors allowed to read this row.'),
-      team_id: z.string().max(128).optional().describe('v10: team identity (optional).'),
-      agent_id: z.string().max(128).optional().describe('v10: agent identity (optional).'),
-      user_id: z.string().max(128).optional().describe('v10: user identity (optional).'),
-      session_id: z.string().max(128).optional().describe('v10: session identity (optional).'),
-      task_id: z.string().max(128).optional().describe('v10: task identity (optional).'),
+      // team_id / agent_id / user_id are principal identity claims and
+      // are no longer accepted from the tool surface: the MCP server
+      // has no authenticated caller, so a tool input here would be a
+      // forge vector. The columns exist on the row for the hook layer
+      // (which has access to the running session principal) and for
+      // future signed-token auth. session_id / task_id are dropped for
+      // the same reason — the hook layer stamps them when it runs.
     },
   },
   {
@@ -315,11 +317,9 @@ const TOOL_DEFS = [
         .max(32)
         .optional()
         .describe('v10: principal descriptors allowed to read this row.'),
-      team_id: z.string().max(128).optional(),
-      agent_id: z.string().max(128).optional(),
-      user_id: z.string().max(128).optional(),
-      session_id: z.string().max(128).optional(),
-      task_id: z.string().max(128).optional(),
+      // identity columns (team_id / agent_id / user_id / session_id /
+      // task_id) are not accepted on update; the persisted columns
+      // are hook-layer-managed to keep the tool surface unforgeable.
     },
   },
   {
@@ -453,11 +453,8 @@ const TOOL_DEFS = [
             // v10 ACL fields (same shape as memory_save).
             visibility: z.enum(['private', 'team', 'restricted', 'agent', 'task']).optional(),
             shared_with: z.array(z.string().min(1).max(128)).max(32).optional(),
-            team_id: z.string().max(128).optional(),
-            agent_id: z.string().max(128).optional(),
-            user_id: z.string().max(128).optional(),
-            session_id: z.string().max(128).optional(),
-            task_id: z.string().max(128).optional(),
+            // identity columns are intentionally absent on bulk too;
+            // see memory_save for rationale.
           }),
         )
         .min(1)
@@ -969,7 +966,7 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
   // Bump together with the manifest; tests/06-manifest.test.js asserts the manifest
   // and package-lock equality, but the MCP `initialize` response is what Kimi logs
   // at plugin load — drift there confuses users about the running version.
-  const server = new McpServer({ name: 'kimi-memory', version: '0.5.0' });
+  const server = new McpServer({ name: 'kimi-memory', version: '0.5.1' });
 
   // Resolve the database handle and key for a given scope. `cwd` is
   // required for `project` and `all`; for `global` it is audit context
@@ -1055,11 +1052,11 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
         // it to []).
         visibility: args.visibility || 'private',
         shared_with: Array.isArray(args.shared_with) ? args.shared_with : undefined,
-        team_id: args.team_id || null,
-        agent_id: args.agent_id || null,
-        user_id: args.user_id || null,
-        session_id: args.session_id || null,
-        task_id: args.task_id || null,
+        // team_id / agent_id / user_id / session_id / task_id are
+        // intentionally NOT forwarded from the tool surface — see the
+        // TOOL_DEFS comment for memory_save (lines 168-173) for the
+        // rationale. The columns remain on the row, set by the hook
+        // layer where the principal is observable.
       });
       return ok({
         operation: 'saved',
@@ -1342,11 +1339,9 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
         }
         merged.shared_with = args.shared_with;
       }
-      if (args.team_id !== undefined) merged.team_id = args.team_id;
-      if (args.agent_id !== undefined) merged.agent_id = args.agent_id;
-      if (args.user_id !== undefined) merged.user_id = args.user_id;
-      if (args.session_id !== undefined) merged.session_id = args.session_id;
-      if (args.task_id !== undefined) merged.task_id = args.task_id;
+      // Identity columns (team_id / agent_id / user_id / session_id /
+      // task_id) are not accepted on update; see memory_save TOOL_DEFS
+      // comment.
       const mem = saveMemory(target.db, target.projectKey, merged);
       return ok({
         operation: 'updated',
@@ -1657,11 +1652,9 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
           // saveMemory; shared_with is pass-through.
           visibility: item.visibility || 'private',
           shared_with: Array.isArray(item.shared_with) ? item.shared_with : undefined,
-          team_id: item.team_id || null,
-          agent_id: item.agent_id || null,
-          user_id: item.user_id || null,
-          session_id: item.session_id || null,
-          task_id: item.task_id || null,
+          // team_id / agent_id / user_id / session_id / task_id are
+          // intentionally not accepted on bulk — see memory_save
+          // TOOL_DEFS comment.
         });
       }
       if (errors.length > 0) {

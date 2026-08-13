@@ -25,30 +25,36 @@ const NEGATED_TERM = /(^|\s)(-\S+(?:\s+\S+)?)/g;
 // The transformation rules (matching the test contract):
 //
 //   - "exact phrase"                    => "exact phrase"        (preserved)
-//   - -exclude term                     => -exclude term         (preserved)
+//   - -exclude term                     => NOT "exclude"         (FTS5 NOT)
 //   - single bare token                 => "token"
 //   - two+ bare tokens                  => "token1" OR "token2" OR ...
 //   - whitespace / empty / null         => ""
 //
 // Tokens are lowercased and stripped of non-word characters so a
-// common typo drift does not blow up the FTS5 parser.
+// common typo drift does not blow up the FTS5 parser. Negated terms
+// are emitted as FTS5 `NOT "..."` clauses — the prior shape appended
+// a raw `-term` which FTS5 treats as a syntax error.
+// (Audit finding F-008.)
 export function normalizeFts5Query(input) {
   if (input == null) return '';
   const raw = String(input);
   if (!raw.trim()) return '';
 
-  // Pull out quoted phrases and negated terms verbatim; they survive
-  // tokenisation untouched. The negated-term regex captures the
-  // leading `-` AND the term that follows (one or two words), so
-  // "-exclude term" is preserved as a single fragment.
+  // Pull out quoted phrases verbatim; they survive tokenisation.
   const quoted = [];
   const negated = [];
   raw.replace(QUOTED_TERM, (m) => {
     quoted.push(m);
     return ' ';
   });
+  // Negated-term tokens are normalised the same way bare tokens are
+  // (lowercased, non-word stripped) and re-quoted. `-exclude term`
+  // becomes `NOT "exclude term"` in the emitted expression. The
+  // leading `-` is stripped here — FTS5 NOT does not take a unary
+  // minus, and the regex captures it as part of `term`.
   raw.replace(NEGATED_TERM, (_, prefix, term) => {
-    negated.push((prefix || '') + term.trim());
+    const cleaned = term.trim().replace(/^-/, '').replace(/"/g, '""');
+    if (cleaned) negated.push(cleaned);
     return ' ';
   });
 
@@ -65,9 +71,13 @@ export function normalizeFts5Query(input) {
   const parts = [];
   for (const t of stripped) parts.push(`"${t.replace(/"/g, '""')}"`);
   for (const q of quoted) parts.push(q);
-  for (const n of negated) parts.push(n);
 
-  return parts.join(' OR ');
+  const positive = parts.join(' OR ');
+  const negative = negated.map((n) => `"${n.replace(/"/g, '""')}"`).join(' NOT ');
+  if (negative) {
+    return positive ? `${positive} NOT ${negative}` : `"*" NOT ${negative}`;
+  }
+  return positive;
 }
 
 // Wrap a query so the title column is matched first. Returned
@@ -75,9 +85,15 @@ export function normalizeFts5Query(input) {
 // syntax). Falls back to a general match when the title field is
 // not part of the FTS table — the expansion keeps recall usable
 // even when title-boosting gives no surface.
+//
+// When the query contains a NOT clause (an exclusion), we skip
+// the title-boost wrapping. Wrapping a NOT expression in
+// `title:foo NOT bar OR foo NOT bar` produces a parse error — the
+// OR binds tighter than NOT. (Audit finding F-008.)
 export function buildTitleBoostedQuery(input) {
   const norm = normalizeFts5Query(input);
   if (!norm) return '';
+  if (/\bNOT\b/.test(norm)) return norm;
   // The `title:` field is part of the FTS5 schema (column-list in
   // memories_fts CREATE VIRTUAL TABLE). The OR fallback ensures
   // that a project without title-bearing content still gets the

@@ -168,27 +168,32 @@ export function runAutoPrune(db, projectKey, { now = new Date() } = {}) {
   };
 
   // 1. status='deleted', older than PRUNE_DELETED_AFTER_DAYS.
-  // Both the FTS row and the memories row are deleted so the row
-  // does not haunt search.
-  result.pruned_deleted = safeDelete(
+  // Single DELETE on memories drives the count; one on FTS sweeps
+  // the index in lockstep. Both share the same WHERE so the row
+  // count is the truth. The previous version issued two DELETEs
+  // (FTS first, then memories) and overwrote pruned_deleted with
+  // the second, hiding the FTS count. (Audit finding F-006 / B2-7.)
+  //
+  // (Audit finding F-004 — collect the candidate IDs first, sweep
+  // FTS by those IDs, then delete from `memories`. The prior shape
+  // deleted `memories` before FTS, leaving the FTS subquery empty
+  // and stale FTS rows behind. Same helper reused for superseded,
+  // embed_failed, and cold.)
+  const deleteExpiredPair = (label, memoryWhere, ...args) => {
+    const ids = db.prepare(`SELECT id FROM memories WHERE ${memoryWhere}`).all(...args);
+    if (ids.length === 0) return 0;
+    const placeholders = ids.map(() => '?').join(',');
+    safeDelete(
+      `${label}_fts`,
+      `DELETE FROM memories_fts WHERE id IN (${placeholders})`,
+      ...ids.map((row) => row.id),
+    );
+    return safeDelete(`${label}_mem`, `DELETE FROM memories WHERE ${memoryWhere}`, ...args);
+  };
+
+  result.pruned_deleted = deleteExpiredPair(
     'deleted',
-    `DELETE FROM memories_fts WHERE id IN (
-       SELECT id FROM memories
-       WHERE project_key = ? AND status = 'deleted'
-         AND datetime(updated_at) <= datetime(?, ? || ' days')
-     )`,
-    projectKey,
-    nowIso(),
-    String(-PRUNE_DELETED_AFTER_DAYS),
-  );
-  // Note: the negative days trick above works because datetime(now, '-30 days')
-  // is the same as datetime('now', '-30 days') but parameterised. SQLite
-  // binding for the days scalar is finicky across versions; the safer
-  // form is below, computed inline.
-  result.pruned_deleted = safeDelete(
-    'deleted2',
-    `DELETE FROM memories
-     WHERE project_key = ? AND status = 'deleted'
+    `project_key = ? AND status = 'deleted'
        AND julianday('now') - julianday(updated_at) >= ?`,
     projectKey,
     PRUNE_DELETED_AFTER_DAYS,
@@ -198,32 +203,19 @@ export function runAutoPrune(db, projectKey, { now = new Date() } = {}) {
   // The superseded_by backlink is preserved elsewhere (memory_edges
   // supersedes + the conclusion) so the deletion is non-destructive
   // for the recall graph.
-  result.pruned_superseded = safeDelete(
+  result.pruned_superseded = deleteExpiredPair(
     'superseded',
-    `DELETE FROM memories
-     WHERE project_key = ? AND status = 'superseded'
+    `project_key = ? AND status = 'superseded'
        AND julianday('now') - julianday(updated_at) >= ?`,
-    projectKey,
-    PRUNE_SUPERSEDED_AFTER_DAYS,
-  );
-  // Drop the FTS rows too.
-  safeDelete(
-    'superseded_fts',
-    `DELETE FROM memories_fts WHERE id IN (
-       SELECT id FROM memories
-       WHERE project_key = ? AND status = 'superseded'
-         AND julianday('now') - julianday(updated_at) >= ?
-     )`,
     projectKey,
     PRUNE_SUPERSEDED_AFTER_DAYS,
   );
 
   // 3. embedding_status='failed' (last_embed_error set, embedding NULL)
   // older than PRUNE_EMBED_FAILED_AFTER_DAYS.
-  result.pruned_embed_failed = safeDelete(
+  result.pruned_embed_failed = deleteExpiredPair(
     'embed_failed',
-    `DELETE FROM memories
-     WHERE project_key = ? AND status = 'active'
+    `project_key = ? AND status = 'active'
        AND embedding IS NULL AND last_embed_error IS NOT NULL
        AND julianday('now') - julianday(updated_at) >= ?`,
     projectKey,
@@ -231,10 +223,9 @@ export function runAutoPrune(db, projectKey, { now = new Date() } = {}) {
   );
 
   // 4. Cold memories: low confidence, no accesses, very old.
-  result.pruned_cold = safeDelete(
+  result.pruned_cold = deleteExpiredPair(
     'cold',
-    `DELETE FROM memories
-     WHERE project_key = ? AND status = 'active'
+    `project_key = ? AND status = 'active'
        AND confidence < ?
        AND (access_count IS NULL OR access_count = 0)
        AND julianday('now') - julianday(updated_at) >= ?`,

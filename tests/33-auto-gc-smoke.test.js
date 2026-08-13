@@ -207,7 +207,10 @@ test('runAutoPrune deletes deleted>30d, superseded>90d, embed-failed>30d, cold r
     });
 
     const result = runAutoPrune(db, 'proj1');
-    assert.ok(result.pruned_deleted >= 1, `expected ≥1 deleted pruned, got ${result.pruned_deleted}`);
+    assert.ok(
+      result.pruned_deleted >= 1,
+      `expected ≥1 deleted pruned, got ${result.pruned_deleted}`,
+    );
     assert.ok(
       result.pruned_superseded >= 1,
       `expected ≥1 superseded pruned, got ${result.pruned_superseded}`,
@@ -274,9 +277,9 @@ test('runAutoArchive drops old conversation_events + skill_invocations', () => {
     );
 
     // Old row gone, recent row stays.
-    const conv = db.prepare("SELECT COUNT(*) AS n FROM conversation_events").get().n;
+    const conv = db.prepare('SELECT COUNT(*) AS n FROM conversation_events').get().n;
     assert.ok(conv >= 1, `recent conv event should survive, got ${conv}`);
-    const skill = db.prepare("SELECT COUNT(*) AS n FROM skill_invocations").get().n;
+    const skill = db.prepare('SELECT COUNT(*) AS n FROM skill_invocations').get().n;
     assert.ok(skill >= 1, `recent skill inv should survive, got ${skill}`);
   } finally {
     cleanup(dir);
@@ -346,8 +349,10 @@ test('runConsolidate merges tight clusters via mergeMemory', async () => {
         tags: ['convention', 'git', 'workflow'],
         confidence: id === 'a' ? 0.9 : 0.5,
       });
-      db.prepare('UPDATE memories SET embedding = ?, embedding_dim = 384 WHERE id = ?')
-        .run(blob, id);
+      db.prepare('UPDATE memories SET embedding = ?, embedding_dim = 384 WHERE id = ?').run(
+        blob,
+        id,
+      );
     }
 
     // Inject a fake mergeMemory and saveMemory to track what happens.
@@ -372,9 +377,9 @@ test('runConsolidate merges tight clusters via mergeMemory', async () => {
     const fakeMergeMemory = (dbArg, projectKey, intoId, fromId, opts) => {
       calls.merge += 1;
       // Soft-supersede the from-row.
-      dbArg.prepare(
-        "UPDATE memories SET status = 'superseded', superseded_by = ? WHERE id = ?",
-      ).run(intoId, fromId);
+      dbArg
+        .prepare("UPDATE memories SET status = 'superseded', superseded_by = ? WHERE id = ?")
+        .run(intoId, fromId);
       return { into: { id: intoId }, from: { id: fromId, status: 'superseded' } };
     };
 

@@ -8,6 +8,7 @@
 // stats / ranking.
 import { nowIso, hashId, shortId } from '../util.js';
 import { rowToMemory } from './memories.js';
+import crypto from 'node:crypto';
 
 /**
  * Score every active skill against an arbitrary (command?, file_path?,
@@ -117,7 +118,7 @@ export function recordSkillInvocation(
   // Three calls in the same millisecond would otherwise collide on
   // PRIMARY KEY; mix in nanoseconds + a per-call counter so the id
   // is unique even under tight loops.
-  const stamp = `${nowIso()}:${Date.now() % 1e9}:${Math.floor(Math.random() * 1e9)}`;
+  const stamp = `${nowIso()}:${Date.now() % 1e9}:${crypto.randomUUID()}`;
   const id = shortId(hashId('skinv', projectKey, skillId, stamp), 16);
   db.prepare(
     `INSERT INTO skill_invocations (id, skill_id, project_key, tool_name, success, duration_ms, invoked_at)

@@ -242,24 +242,39 @@ function buildRecallQuery({ prompt, workingSlots, focusRow, recentFiles }) {
 // should never...") match.
 function readRecentFilePaths(projectDb, projectKey, { limit = 5 } = {}) {
   if (!projectDb) return [];
+  // (Audit finding F-011 / B3-7.)
+  const TOOL_PAYLOAD_LIMIT = 64 * 1024;
+  const MAX_PATHS_PER_ROW = 16;
   let rows;
   try {
+    // Bound the projected payload in SQL, not after materialisation,
+    // so a multi-MB tool_call blob never enters Node memory in full.
+    // (Audit finding F-006.)
     rows = projectDb
       .prepare(
-        `SELECT payload FROM conversation_events
+        `SELECT substr(payload, 1, ?) AS payload
+         FROM conversation_events
          WHERE project_key = ? AND kind = 'tool_call'
          ORDER BY line_no DESC LIMIT ?`,
       )
-      .all(projectKey, limit);
+      .all(TOOL_PAYLOAD_LIMIT, projectKey, limit);
   } catch {
     return [];
   }
+  // Bound the JSON.parse + path-match cost: large tool-call payloads
+  // (heredocs, big file blobs, …) ship multi-MB strings into this
+  // hook on every UserPromptSubmit. Cap the parse and the regex
+  // match to a per-row ceiling, and skip rows that exceed it.
   const out = [];
   const seen = new Set();
   const pathRegex = PATH_REGEX;
   for (const r of rows) {
     if (!r.payload) continue;
     let text = r.payload;
+    if (text.length > TOOL_PAYLOAD_LIMIT) {
+      // Truncate to the head; cheaper than skipping outright.
+      text = text.slice(0, TOOL_PAYLOAD_LIMIT);
+    }
     if (text.length > 0 && text[0] === '{') {
       try {
         const parsed = JSON.parse(text);
@@ -268,7 +283,7 @@ function readRecentFilePaths(projectDb, projectKey, { limit = 5 } = {}) {
         /* keep raw text */
       }
     }
-    const matches = text.match(pathRegex) || [];
+    const matches = (text.match(pathRegex) || []).slice(0, MAX_PATHS_PER_ROW);
     for (const m of matches) {
       // Normalise: collapse Windows backslashes for the tokeniser.
       const norm = m.replace(/\\/g, '/').toLowerCase();
@@ -358,17 +373,18 @@ function formatAutoGcSegment(autoGc) {
   const prune = autoGc.prune || {};
   const archive = autoGc.archive || {};
   const tier = autoGc.tier || {};
-  const pruned = (prune.pruned_deleted || 0) +
+  const pruned =
+    (prune.pruned_deleted || 0) +
     (prune.pruned_superseded || 0) +
     (prune.pruned_embed_failed || 0) +
     (prune.pruned_cold || 0) +
     (prune.pruned_orphans || 0);
-  const archived = (archive.archived_conversation_events || 0) +
+  const archived =
+    (archive.archived_conversation_events || 0) +
     (archive.archived_skill_invocations || 0) +
     (archive.archived_persona_promotions || 0);
-  const promoted = (tier.promoted_l0_to_l1 || 0) +
-    (tier.promoted_l1_to_l2 || 0) +
-    (tier.promoted_l2_to_l3 || 0);
+  const promoted =
+    (tier.promoted_l0_to_l1 || 0) + (tier.promoted_l1_to_l2 || 0) + (tier.promoted_l2_to_l3 || 0);
   const demoted = tier.demoted_to_l0 || 0;
   if (prune.skipped === 'throttled' && archive.skipped === 'throttled') {
     return `tier:prom:${promoted}/dem:${demoted}/heavy:throttled`;
@@ -416,15 +432,19 @@ function buildSessionThread(projectDb, projectKey) {
     const c = ordered[i];
     let focus = null;
     try {
+      // Filter on the metadata flag set by captureSessionFocus
+      // (session-focus.js); the predicate is cheaper than the previous
+      // `tags LIKE '%session-focus%'` because the (project_key, type)
+      // index covers the WHERE prefix and `instr` is bounded by
+      // `instr(metadata, ...) > 0`. (Audit finding F-009.)
       focus = projectDb
         .prepare(
           `SELECT id, title, content FROM memories
            WHERE project_key = ? AND status = 'active' AND type = 'working'
-             AND tags LIKE ?
-             AND (session_id = ? OR metadata LIKE ?)
+             AND (session_id = ? OR instr(metadata, '"session_focus":true') > 0)
            ORDER BY datetime(updated_at) DESC LIMIT 1`,
         )
-        .get(projectKey, '%session-focus%', c.session_id, `%"session_id":"${c.session_id}"%`);
+        .get(projectKey, c.session_id);
     } catch {
       /* ignore — fall back to the title only */
     }
@@ -774,9 +794,7 @@ function runAutoGcThrottled(db, projectKey) {
   // schema_meta (key 'auto_gc_last_run'). Missing row === never run.
   let lastRun = null;
   try {
-    const row = db
-      .prepare('SELECT value FROM schema_meta WHERE key = ?')
-      .get('auto_gc_last_run');
+    const row = db.prepare('SELECT value FROM schema_meta WHERE key = ?').get('auto_gc_last_run');
     if (row && row.value) {
       const t = Date.parse(row.value);
       if (Number.isFinite(t)) lastRun = new Date(t);

@@ -39,8 +39,16 @@ export function rowToMemory(row) {
   // now the row degrades to empty arrays/objects and the rest of the
   // set still returns. (Audit finding B2-3.)
   const tags = safeParseJson(row.tags, [], (v) => Array.isArray(v));
-  const provenance = safeParseJson(row.provenance, {}, (v) => v && typeof v === 'object' && !Array.isArray(v));
-  const metadata = safeParseJson(row.metadata, {}, (v) => v && typeof v === 'object' && !Array.isArray(v));
+  const provenance = safeParseJson(
+    row.provenance,
+    {},
+    (v) => v && typeof v === 'object' && !Array.isArray(v),
+  );
+  const metadata = safeParseJson(
+    row.metadata,
+    {},
+    (v) => v && typeof v === 'object' && !Array.isArray(v),
+  );
   // Surface processing_status as a top-level field for callers that
   // don't want to dig into metadata. Defaults to 'ready' on rows that
   // pre-date the v10 processing pipeline (scaffold tests assert this).
@@ -165,9 +173,20 @@ function assertNoSecret(input) {
   if (input.metadata && typeof input.metadata === 'object') {
     scan(input.metadata, 'metadata');
   }
+  // Provenance is caller-supplied JSON that lands in the row. The
+  // prior scan covered only title / content / tags / metadata — a
+  // thin shell over metadata could still smuggle a secret through.
+  // (Audit finding F-007.)
+  if (input.provenance && typeof input.provenance === 'object') {
+    scan(input.provenance, 'provenance');
+  }
   if (matched.length === 0) return;
   // De-dupe matched paths so the error message is concise.
-  const unique = [...new Set(matched.map((p) => p.split(/[.\[]/)[0] === 'metadata' ? 'metadata' : p.split(/[.\[]/)[0]))];
+  const unique = [
+    ...new Set(
+      matched.map((p) => (p.split(/[.\[]/)[0] === 'metadata' ? 'metadata' : p.split(/[.\[]/)[0])),
+    ),
+  ];
   const where = unique.length > 1 ? unique.join(' + ') : unique[0];
   const err = new Error(
     `secret_detected: refusing to persist a memory whose ${where} matches a known credential shape. ` +
@@ -240,13 +259,14 @@ export function saveMemory(db, projectKey, input) {
       )
       .all(projectKey, input.type, input.title || '', id);
     if (existing.length > 0) {
-      // Link back to the most-recent prior; mark every prior superseded.
+      // Replace only the most-recent prior row. The plural form
+      // (marking every match superseded) silently retired distinct
+      // memories that happened to share a title — a docstring
+      // contract violation. (Audit finding F-002.)
       supersedesId = existing[0].id;
-      for (const ex of existing) {
-        db.prepare(
-          "UPDATE memories SET status='superseded', superseded_by=?, updated_at=? WHERE id=?",
-        ).run(id, now, ex.id);
-      }
+      db.prepare(
+        "UPDATE memories SET status='superseded', superseded_by=?, updated_at=? WHERE id=?",
+      ).run(id, now, existing[0].id);
       // Record a typed supersedes edge in memory_edges so the new
       // graph primitive stays the canonical source going forward.
       // Deduped via UNIQUE(project_key, from_id, to_id, kind); the
@@ -258,9 +278,9 @@ export function saveMemory(db, projectKey, input) {
           VALUES (?, ?, ?, ?, 'supersedes', 1.0, ?)
         `,
         ).run(
-          shortId(hashId('edge', projectKey, ex.id, id, 'supersedes'), 16),
+          shortId(hashId('edge', projectKey, existing[0].id, id, 'supersedes'), 16),
           projectKey,
-          ex.id,
+          existing[0].id,
           id,
           now,
         );
@@ -615,61 +635,21 @@ export function deleteMemory(db, projectKey, id, { hard = false } = {}) {
 // this layer trusts the shape. Supersede behaviour is identical to
 // saveMemory: within a batch, earlier rows can be superseded by later
 // rows that share the same (project_key, type, title).
+//
+// (Audit finding F-001 — partial-commit was a bug; the documented
+// all-or-nothing contract is now actually all-or-nothing.)
 export function saveMemoryBulk(db, projectKey, inputs) {
   if (!Array.isArray(inputs) || inputs.length === 0) return [];
 
-  // Enhanced error handling: collect per-item errors instead of total rollback.
-  // This allows the caller to know which items failed and which succeeded.
   const results = [];
-  const errors = [];
 
   db.exec('BEGIN');
   try {
     for (let i = 0; i < inputs.length; i++) {
-      try {
-        const result = saveMemory(db, projectKey, inputs[i]);
-        results.push(result);
-      } catch (err) {
-        // Record the error but continue to process remaining items.
-        // This gives visibility into which items failed without losing all progress.
-        errors.push({
-          index: i,
-          input: inputs[i],
-          error: err,
-        });
-        results.push(null);
-      }
-    }
-
-    // If any item failed due to secret detection or other validation,
-    // roll back the entire transaction for safety. Secret-related errors
-    // should fail the whole batch.
-    const hasSecretError = errors.some(
-      (e) =>
-        e.error &&
-        (e.error.code === 'KIMI_MEMORY_SECRET_DETECTED' || e.error.message?.includes('secret')),
-    );
-
-    if (hasSecretError) {
-      try {
-        db.exec('ROLLBACK');
-      } catch {
-        /* ignore */
-      }
-      // Surface the established `secret_detected:` error code in the
-      // message so callers (and tests) can match the same token the
-      // single-save path uses. The structured `code` field carries
-      // the bulk-specific variant for finer-grained dispatch.
-      const err = new Error(
-        `secret_detected: refusing to persist a batch containing item(s) that match a known credential shape (bulk save failed: ${errors.length} of ${inputs.length} item(s) rejected). Remove the secret and retry.`,
-      );
-      err.code = 'BULK_SAVE_SECRET_DETECTED';
-      err.details = {
-        total: inputs.length,
-        failed: errors.length,
-        failed_indices: errors.map((e) => e.index),
-      };
-      throw err;
+      // saveMemory throws on any error (secret detection, FK / CHECK
+      // constraint, validation failure). The outer catch below rolls
+      // the whole transaction back, so the batch is genuinely atomic.
+      results.push(saveMemory(db, projectKey, inputs[i]));
     }
 
     db.exec('COMMIT');
@@ -682,7 +662,6 @@ export function saveMemoryBulk(db, projectKey, inputs) {
     throw err;
   }
 
-  // Return all results, marking failures as null for introspection.
   return results;
 }
 

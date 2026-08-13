@@ -153,6 +153,15 @@ export async function captureSessionFocus({
       title,
       content,
       tags: ['focus', SESSION_FOCUS_TAG, 'in-flight'],
+      // Metadata stamp: buildSessionThread (and readLatestSessionFocus)
+      // filter on `instr(metadata, '"session_focus":true') > 0` instead
+      // of `tags LIKE '%session-focus%'`, so the tag predicate stops
+      // being a full scan over working rows. The flag is set once at
+      // capture time. (Audit finding F-009.)
+      metadata: {
+        session_focus: true,
+        session_id: sessionId,
+      },
       confidence: 0.7,
       priority: 1,
       expires_at: expiresAt,
@@ -209,6 +218,10 @@ export function _resetSessionFocusRegistryForTests() {
 export function readLatestSessionFocus(db, projectKey) {
   if (!db || !projectKey) return null;
   try {
+    // Filter on the metadata flag set by captureSessionFocus: replaces
+    // the previous `tags LIKE '%session-focus%'` predicate so the query
+    // can ride idx_memories_project_type's prefix instead of a full scan
+    // over every working row. (Audit finding F-009.)
     const row = db
       .prepare(
         `SELECT id, type, title, content, tags, updated_at
@@ -217,11 +230,11 @@ export function readLatestSessionFocus(db, projectKey) {
            AND status = 'active'
            AND type = 'working'
            AND (expires_at IS NULL OR datetime(expires_at) > datetime('now'))
-           AND tags LIKE ?
+           AND instr(metadata, '"session_focus":true') > 0
          ORDER BY datetime(updated_at) DESC, priority DESC
          LIMIT 1`,
       )
-      .get(projectKey, `%${SESSION_FOCUS_TAG}%`);
+      .get(projectKey);
     if (!row) return null;
     let tags = [];
     try {

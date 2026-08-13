@@ -92,7 +92,11 @@ test('searchMemories: a corrupt row does not break the recall result set', async
   try {
     const db = openDb(dbPath);
     saveMemory(db, key, { type: 'semantic', title: 'tabs policy', content: 'we use tabs' });
-    const bad = saveMemory(db, key, { type: 'semantic', title: 'tabs note', content: 'something about tabs' });
+    const bad = saveMemory(db, key, {
+      type: 'semantic',
+      title: 'tabs note',
+      content: 'something about tabs',
+    });
     saveMemory(db, key, { type: 'semantic', title: 'spaces note', content: 'spaces info' });
     db.prepare("UPDATE memories SET tags='{garbage' WHERE id=?").run(bad.id);
     const hits = await searchMemories(db, key, 'tabs', { limit: 10, minScore: 0 });

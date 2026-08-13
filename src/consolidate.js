@@ -57,8 +57,7 @@ function tagOverlap(a, b) {
 // stalling the SessionStart hook. Rows are ordered by updated_at DESC
 // so the freshest memories (the ones the user is most likely to want
 // summarised) are preferred over ancient ones.
-const CONSOLIDATE_INPUT_CAP =
-  CONSOLIDATE_MAX_CLUSTERS * CONSOLIDATE_MAX_MEMBERS * 4; // 640 rows
+const CONSOLIDATE_INPUT_CAP = CONSOLIDATE_MAX_CLUSTERS * CONSOLIDATE_MAX_MEMBERS * 4; // 640 rows
 function loadActiveMemories(db, projectKey) {
   return db
     .prepare(
@@ -383,7 +382,10 @@ export async function runConsolidate({
             isTight = false;
             break;
           }
-          if (tagOverlap(cluster[0].tagTokens, cluster[i].tagTokens) < AUTO_MERGE_THRESHOLDS.tagOverlap) {
+          if (
+            tagOverlap(cluster[0].tagTokens, cluster[i].tagTokens) <
+            AUTO_MERGE_THRESHOLDS.tagOverlap
+          ) {
             isTight = false;
             break;
           }

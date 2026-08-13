@@ -69,11 +69,7 @@ export function validateSharedWith(v) {
   // entries() gives us the original index so we know where to pick up
   // when we hit the cap.
   for (const [idx, entry] of v.entries()) {
-    if (
-      typeof entry !== 'string' ||
-      entry.trim().length === 0 ||
-      entry.length > 128
-    ) {
+    if (typeof entry !== 'string' || entry.trim().length === 0 || entry.length > 128) {
       dropped.push(entry);
       continue;
     }

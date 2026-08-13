@@ -13,7 +13,10 @@ test('redactSecrets replaces provider key shapes with stable tokens', () => {
       token: '[REDACTED_PROVIDER_KEY]',
     },
     { in: 'AKIAIOSFODNN7EXAMPLE for the staging env.', token: '[REDACTED_PROVIDER_KEY]' },
-    { in: 'GitHub PAT: ghp_abcdefghijklmnopqrstuvwxyz0123456789', token: '[REDACTED_PROVIDER_KEY]' },
+    {
+      in: 'GitHub PAT: ghp_abcdefghijklmnopqrstuvwxyz0123456789',
+      token: '[REDACTED_PROVIDER_KEY]',
+    },
     {
       in: 'JWT: eyJabcdefghijk.eyJabcdefghijk.eyJabcdefghijk_',
       token: '[REDACTED_PROVIDER_KEY]',
@@ -22,7 +25,10 @@ test('redactSecrets replaces provider key shapes with stable tokens', () => {
   for (const s of samples) {
     const out = redactSecrets(s.in);
     assert.match(out, new RegExp(s.token.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')), s.in);
-    assert.ok(!out.includes(s.in.match(/sk-[A-Za-z0-9]+|AKIA\w+|ghp_\w+|eyJ[^.]+/)?.[0] || ''), 'original key bytes were scrubbed');
+    assert.ok(
+      !out.includes(s.in.match(/sk-[A-Za-z0-9]+|AKIA\w+|ghp_\w+|eyJ[^.]+/)?.[0] || ''),
+      'original key bytes were scrubbed',
+    );
   }
 });
 
@@ -44,7 +50,10 @@ test('redactSecrets replaces generic key=value assignments', () => {
 test('redactSecrets replaces Authorization Bearer headers', () => {
   const out = redactSecrets('Authorization: Bearer abcdefghijklmnopqrstuvwxyz1234567890');
   assert.match(out, /Authorization: Bearer \[REDACTED\]/);
-  assert.ok(!out.includes('abcdefghijklmnopqrstuvwxyz1234567890'), 'bearer token bytes were scrubbed');
+  assert.ok(
+    !out.includes('abcdefghijklmnopqrstuvwxyz1234567890'),
+    'bearer token bytes were scrubbed',
+  );
 });
 
 test('redactSecrets leaves clean text unchanged', () => {

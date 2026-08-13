@@ -7,6 +7,7 @@ import { nowIso, hashId, shortId } from '../util.js';
 import { looksLikeSecret } from '../extract.js';
 import { openSharedDb } from './connection.js';
 import { rowToMemory, getMemory } from './memories.js';
+import crypto from 'node:crypto';
 
 // v10 ACL / visibility vocabulary. Five visibility levels mirroring
 // TencentDB-Agent-Memory's `AssetVisibility` enum (private, team,
@@ -255,7 +256,7 @@ function recordPromotion(db, memoryId, fromTier, toTier, reason) {
   // recordSkillInvocation. INSERT OR IGNORE keeps the PRIMARY KEY
   // safety net for the rare ms-collision case.
   // (Audit finding B2-6.)
-  const stamp = `${nowIso()}:${Date.now() % 1e9}:${Math.floor(Math.random() * 1e9)}`;
+  const stamp = `${nowIso()}:${Date.now() % 1e9}:${crypto.randomUUID()}`;
   const id = shortId(hashId('promo', memoryId, fromTier, toTier, reason || '', stamp), 16);
   db.prepare(
     `INSERT OR IGNORE INTO persona_promotions (id, memory_id, from_tier, to_tier, reason, at)

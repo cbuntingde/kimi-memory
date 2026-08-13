@@ -16,7 +16,7 @@ Ported from TencentDB-Agent-Memory's `AssetVisibility` and ACL primitives. Addit
 - **New exports** in `src/acl.js`: `validateVisibility(v)`, `validatePrincipalKind(v)`, `validateSharedWith(arr)`, `grantMemoryAcl(db, key, memId, kind, id)`, `revokeMemoryAcl(...)`, `listMemoryAcls(...)`, `parsePrincipalDescriptor(s)`.
 - **5 new MCP tools**: `acl_grant`, `acl_revoke`, `acl_list`, `acl_share_memory`, `acl_resolve_principal`. Total tool count: **26 → 31**.
 - **`memory_recall` gains an optional `visibility` filter** (single string or array of level names) that narrows both the FTS and the vector channels.
-- **`memory_save` / `memory_save_bulk` / `memory_update`** accept the same v10 fields; existing callers that omit them get safe defaults.
+- **`memory_save` / `memory_save_bulk` / `memory_update`** accept the v10 ACL fields `visibility` + `shared_with`; existing callers that omit them get safe defaults. The five identity columns (`team_id` / `agent_id` / `user_id` / `session_id` / `task_id`) are populated by the hook layer, not accepted from the MCP tool surface.
 - **CLI**: `node src/cli.js acl list|grant|revoke <memory-id> [--cwd <path>] [--scope project|global] [--json]`.
 - **Idempotency**: `acl_grant` no-ops via UNIQUE; `acl_share_memory` re-running is a no-op for already-shared rows; `acl_revoke` on a non-existent grant returns `removed=false`.
 - **Schema**: single `SCHEMA_VERSION = 9 → 10` bump; the v10 migration `migrateAddVisibilityAndSharedWith` is idempotent and backfills `visibility='private'` / `shared_with='[]'` for pre-existing rows via the column defaults.
@@ -336,10 +336,10 @@ A `harden-and-clean` pass surfaced the following items. **None of the remaining 
 
 ### Transitive CVEs via `@huggingface/transformers`
 
-| Advisory | Package | Severity | Status | Mitigation |
-|---|---|---|---|---|
-| GHSA-xcpc-8h2w-3j85 | `adm-zip <0.6.0` (via `onnxruntime-node`) | high | No fix available | The embedding pipeline never ingests untrusted ZIP files. The vulnerability requires a crafted ZIP, which the onnxruntime path does not feed. Re-evaluate when upstream resolves. |
-| GHSA-f88m-g3jw-g9cj | `sharp <0.35.0` (via `onnxruntime-node`) | high | No fix available | Same reasoning: `sharp` is used by the embedding for image-preprocessing of model inputs, not user-supplied image uploads. The model's tokenizer gates input shape. |
+| Advisory            | Package                                   | Severity | Status           | Mitigation                                                                                                                                                                        |
+| ------------------- | ----------------------------------------- | -------- | ---------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| GHSA-xcpc-8h2w-3j85 | `adm-zip <0.6.0` (via `onnxruntime-node`) | high     | No fix available | The embedding pipeline never ingests untrusted ZIP files. The vulnerability requires a crafted ZIP, which the onnxruntime path does not feed. Re-evaluate when upstream resolves. |
+| GHSA-f88m-g3jw-g9cj | `sharp <0.35.0` (via `onnxruntime-node`)  | high     | No fix available | Same reasoning: `sharp` is used by the embedding for image-preprocessing of model inputs, not user-supplied image uploads. The model's tokenizer gates input shape.               |
 
 ### Previously fixed (lockfile-only update)
 
@@ -348,4 +348,3 @@ A `harden-and-clean` pass surfaced the following items. **None of the remaining 
 ### Re-evaluation cadence
 
 Re-run `npm audit` on every `@huggingface/transformers` minor bump. The two unfixed advisories are blocking only if the attack surface changes (e.g., if a future feature takes untrusted images or ZIPs from `memory_save`). Today's threat model does not.
-

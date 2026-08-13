@@ -37,24 +37,13 @@ export {
 } from './memories.js';
 
 // ----- Search / recall / backfill -----
-export {
-  combineRrfScores,
-  searchMemories,
-  similarMemories,
-  backfillEmbeddings,
-} from './search.js';
+export { combineRrfScores, searchMemories, similarMemories, backfillEmbeddings } from './search.js';
 
 // ----- Reinforcement / decay -----
 export { reinforceMemory, reinforceIfStale, decayMemories } from './reinforce.js';
 
 // ----- Typed edges -----
-export {
-  validEdgeKinds,
-  isValidEdgeKind,
-  linkMemory,
-  unlinkMemory,
-  listEdges,
-} from './edges.js';
+export { validEdgeKinds, isValidEdgeKind, linkMemory, unlinkMemory, listEdges } from './edges.js';
 
 // ----- Visibility / tier / share -----
 export {

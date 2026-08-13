@@ -240,8 +240,17 @@ export function decodeVector(buf) {
 
 // Pure-JS dot product. The MiniLM pipeline returns L2-normalized
 // vectors, so the dot product equals cosine similarity in [-1, 1].
+// (Audit finding F-014: dimension mismatch used to silently return 0,
+// letting a corrupted-but-parseable embedding slip through as a no-
+// match. Throw a typed error matching the encoder's dim-mismatch
+// code so corrupt rows are visible in diagnostics rather than
+// silently dropped from recall.)
 export function cosineSimilarity(a, b) {
-  if (!a || !b || a.length !== b.length) return 0;
+  if (!a || !b || a.length !== b.length) {
+    const err = new Error(`cosine: dimension mismatch (a=${a && a.length}, b=${b && b.length})`);
+    err.code = 'KIMI_MEMORY_EMBED_DIM_MISMATCH';
+    throw err;
+  }
   let s = 0;
   for (let i = 0; i < a.length; i++) s += a[i] * b[i];
   return s;

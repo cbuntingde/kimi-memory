@@ -71,7 +71,10 @@ test('search: normalize FTS5 query', () => {
   assert.equal(q2, '"exact phrase"', 'should preserve quoted phrases');
 
   const q3 = normalizeFts5Query('-exclude term');
-  assert.equal(q3, '-exclude term', 'should preserve negation');
+  // FTS5 doesn't accept a unary `-`; emit `NOT "..."` instead. An
+  // all-negative query falls back to `"*"` as the positive side.
+  // (Audit finding F-008.)
+  assert.equal(q3, '"*" NOT "exclude term"', 'should emit FTS5 NOT clause');
 });
 
 test('search: build title-boosted query', () => {
