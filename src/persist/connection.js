@@ -8,7 +8,7 @@ import { mkdirSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { logPersistError } from '../diagnostics.js';
 
-const SCHEMA_VERSION = 11;
+const SCHEMA_VERSION = 12;
 
 // Schema migrations. Each entry is idempotent: it inspects the live
 // schema, no-ops when its target shape is already in place, and
@@ -637,6 +637,39 @@ const MIGRATIONS = [
       COMMIT;
     `);
   },
+
+  // v12: dedicated is_session_focus column. The previous read path used
+  // `instr(metadata, '"session_focus":true') > 0`, a function predicate
+  // that cannot ride any B-tree index — every session-focus lookup paid
+  // a scan over every working-type row in the project. The dedicated
+  // column + composite index turns the predicate into a range scan
+  // bound to a tiny constant working set per project.
+  function migrateAddSessionFocusColumn(db) {
+    const cols = db.prepare('PRAGMA table_info(memories)').all();
+    const have = new Set(cols.map((c) => c.name));
+    if (!have.has('is_session_focus')) {
+      db.exec('ALTER TABLE memories ADD COLUMN is_session_focus INTEGER NOT NULL DEFAULT 0');
+    }
+    // Backfill: any working-type row whose metadata already contains the
+    // canonical flag gets the column stamped so legacy rows survive the
+    // migration without a manual step. Idempotent — re-running on a
+    // fully-stamped DB updates 0 rows.
+    db.exec(
+      'UPDATE memories SET is_session_focus = 1 ' +
+        "WHERE is_session_focus = 0 AND type = 'working' " +
+        'AND instr(metadata, \'"session_focus":true\') > 0',
+    );
+    const idx = db
+      .prepare(
+        "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_memories_session_focus'",
+      )
+      .get();
+    if (!idx)
+      db.exec(
+        'CREATE INDEX idx_memories_session_focus ' +
+          'ON memories(project_key, is_session_focus, updated_at)',
+      );
+  },
 ];
 
 const SCHEMA_SQL = `
@@ -670,7 +703,12 @@ CREATE TABLE IF NOT EXISTS memories (
   embedded_at     TEXT,
   -- v3: usage tracking for importance / decay (will be used by #3).
   access_count     INTEGER NOT NULL DEFAULT 0,
-  last_accessed_at TEXT
+  last_accessed_at TEXT,
+  -- v12: dedicated session-focus column. Replaces the function
+  -- predicate on metadata JSON so the hook thread can ride
+  -- idx_memories_session_focus instead of scanning every working
+  -- row in the project.
+  is_session_focus INTEGER NOT NULL DEFAULT 0
 );
 
 CREATE INDEX IF NOT EXISTS idx_memories_project_type ON memories(project_key, type);

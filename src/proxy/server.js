@@ -22,7 +22,13 @@
 //
 // The proxy is bound to the loopback interface by default. Pass
 // `--host 0.0.0.0` to expose it on the network — strongly discouraged
-// outside of a trusted LAN.
+// outside of a trusted LAN. Non-loopback binds default to a read-only
+// tool surface; the destructive set is opt-in via
+// `KIMI_MEMORY_PROXY_ALLOW_TOOLS` (comma-separated). See
+// `nonLoopbackToolGuard()` for the exact set.
+//
+// (Prior audit flag F-003 — a network bind with bearer auth alone was
+// the network-wide admin path the audit called out.)
 
 import http from 'node:http';
 import { URL } from 'node:url';
@@ -98,6 +104,11 @@ export async function startProxy({
     port,
   };
 
+  // Bind the non-loopback guard to this server's actual host. Reads of
+  // the host env var are a fallback only — startProxy() is the
+  // authoritative source for the bind address.
+  const guardToolName = (name) => nonLoopbackToolGuard(name, { host });
+
   function authenticate(req) {
     if (bypass) return { ok: true, bypass: true };
     if (!token) {
@@ -152,6 +163,17 @@ export async function startProxy({
   }
 
   async function dispatchTool(toolName, args) {
+    // Refuse destructive tools on a non-loopback bind unless the
+    // operator explicitly opted in via KIMI_MEMORY_PROXY_ALLOW_TOOLS.
+    // A network bind with a single shared bearer token is a
+    // network-wide admin path otherwise — the audit floor requires
+    // this default-off shape. (Prior audit flag F-003.)
+    const deny = guardToolName(toolName);
+    if (deny) {
+      const err = new Error(deny);
+      err.code = 'tool_not_allowed';
+      throw err;
+    }
     // The MCP McpServer exposes `server._registeredTools` (private)
     // in some SDK versions; we fall back to invoking the named
     // tool via the server's tool registry. For an external proxy the
@@ -369,4 +391,42 @@ export function proxyAuthBypass() {
   // the proxy.
   const v = (process.env.KIMI_MEMORY_PROXY_AUTH || '').toLowerCase().trim();
   return v === 'off' || v === '0' || v === 'false' || v === 'no';
+}
+
+// Destructive MCP tools that must not be reachable on a non-loopback
+// bind without an explicit operator opt-in. Read-only and routine-write
+// tools (memory_recall, memory_list, memory_get, memory_save, …) stay
+// available. The opt-in env var is `KIMI_MEMORY_PROXY_ALLOW_TOOLS`
+// (comma-separated). (Prior audit flag F-003.)
+const NETWORK_DESTRUCTIVE_TOOLS = new Set([
+  'memory_reset_project',
+  'memory_prune',
+  'memory_delete',
+  'acl_grant',
+  'acl_revoke',
+  'acl_share_memory',
+  'memory_save_bulk',
+  'memory_update',
+  'memory_merge',
+  'memory_link',
+  'memory_unlink',
+  'memory_reinforce',
+  'codegraph_build_edges',
+]);
+
+export function nonLoopbackToolGuard(toolName, { host } = {}) {
+  // Loopback binds never trip the guard; the bearer-auth boundary is
+  // considered sufficient for the same machine.
+  const bindHost = host != null ? host : process.env.KIMI_MEMORY_PROXY_HOST || '127.0.0.1';
+  const loopback =
+    bindHost === '127.0.0.1' || bindHost === '::1' || bindHost === 'localhost' || bindHost === '';
+  if (loopback) return null;
+  if (!NETWORK_DESTRUCTIVE_TOOLS.has(toolName)) return null;
+  // Operator-opt-in: each destructive tool must be named explicitly.
+  const allowed = (process.env.KIMI_MEMORY_PROXY_ALLOW_TOOLS || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (allowed.includes(toolName)) return null;
+  return `tool ${toolName} is not allowed on a non-loopback bind (host=${bindHost}). Set KIMI_MEMORY_PROXY_ALLOW_TOOLS=${toolName} to opt in.`;
 }

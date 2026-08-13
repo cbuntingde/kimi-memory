@@ -432,16 +432,15 @@ function buildSessionThread(projectDb, projectKey) {
     const c = ordered[i];
     let focus = null;
     try {
-      // Filter on the metadata flag set by captureSessionFocus
-      // (session-focus.js); the predicate is cheaper than the previous
-      // `tags LIKE '%session-focus%'` because the (project_key, type)
-      // index covers the WHERE prefix and `instr` is bounded by
-      // `instr(metadata, ...) > 0`. (Audit finding F-009.)
+      // v12: query the dedicated is_session_focus column (and the
+      // session_id column, which is a normal indexed equality) instead
+      // of a function predicate over metadata JSON. The composite
+      // index covers the WHERE prefix.
       focus = projectDb
         .prepare(
           `SELECT id, title, content FROM memories
            WHERE project_key = ? AND status = 'active' AND type = 'working'
-             AND (session_id = ? OR instr(metadata, '"session_focus":true') > 0)
+             AND (session_id = ? OR is_session_focus = 1)
            ORDER BY datetime(updated_at) DESC LIMIT 1`,
         )
         .get(projectKey, c.session_id);

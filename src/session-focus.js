@@ -218,10 +218,12 @@ export function _resetSessionFocusRegistryForTests() {
 export function readLatestSessionFocus(db, projectKey) {
   if (!db || !projectKey) return null;
   try {
-    // Filter on the metadata flag set by captureSessionFocus: replaces
-    // the previous `tags LIKE '%session-focus%'` predicate so the query
-    // can ride idx_memories_project_type's prefix instead of a full scan
-    // over every working row. (Audit finding F-009.)
+    // Query by the dedicated is_session_focus column (v12) so the
+    // lookup rides idx_memories_session_focus instead of evaluating
+    // a function predicate against every working row. The metadata
+    // flag is kept as the source of truth that saveMemory reads;
+    // the column is a denormalised index-friendly mirror of it.
+    // (Audit flag — session-focus indexability.)
     const row = db
       .prepare(
         `SELECT id, type, title, content, tags, updated_at
@@ -229,8 +231,8 @@ export function readLatestSessionFocus(db, projectKey) {
          WHERE project_key = ?
            AND status = 'active'
            AND type = 'working'
+           AND is_session_focus = 1
            AND (expires_at IS NULL OR datetime(expires_at) > datetime('now'))
-           AND instr(metadata, '"session_focus":true') > 0
          ORDER BY datetime(updated_at) DESC, priority DESC
          LIMIT 1`,
       )

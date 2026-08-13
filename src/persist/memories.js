@@ -291,6 +291,13 @@ export function saveMemory(db, projectKey, input) {
   }
 
   const row = db.prepare('SELECT id, created_at FROM memories WHERE id=?').get(id);
+  // Dedicated session-focus column: stamped when the metadata carries
+  // the canonical flag. The hook thread's read path queries this
+  // column instead of `instr(metadata, '"session_focus":true') > 0`,
+  // so the lookup rides idx_memories_session_focus rather than
+  // scanning every working row. (Audit flag — session-focus
+  // indexability.)
+  const isSessionFocus = metadata && /"session_focus":true/.test(metadata) ? 1 : 0;
   if (row) {
     db.prepare(
       `
@@ -314,6 +321,7 @@ export function saveMemory(db, projectKey, input) {
         task_id = COALESCE(?, task_id),
         tier = COALESCE(?, tier),
         persona_id = COALESCE(?, persona_id),
+        is_session_focus = ?,
         updated_at = ?,
         last_rehearsed_at = ?
       WHERE id = ?
@@ -338,6 +346,7 @@ export function saveMemory(db, projectKey, input) {
       input.task_id ?? null,
       input.tier ?? null,
       input.persona_id ?? null,
+      isSessionFocus,
       now,
       now,
       id,
@@ -345,8 +354,8 @@ export function saveMemory(db, projectKey, input) {
   } else {
     db.prepare(
       `
-      INSERT INTO memories (id, project_key, type, title, content, tags, metadata, provenance, confidence, status, priority, supersedes, created_at, updated_at, expires_at, last_rehearsed_at, visibility, shared_with, team_id, agent_id, user_id, session_id, task_id, tier, persona_id)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      INSERT INTO memories (id, project_key, type, title, content, tags, metadata, provenance, confidence, status, priority, supersedes, created_at, updated_at, expires_at, last_rehearsed_at, visibility, shared_with, team_id, agent_id, user_id, session_id, task_id, tier, persona_id, is_session_focus)
+      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     `,
     ).run(
       id,
@@ -374,6 +383,7 @@ export function saveMemory(db, projectKey, input) {
       taskId,
       tier,
       personaId,
+      isSessionFocus,
     );
   }
 

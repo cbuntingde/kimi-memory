@@ -679,7 +679,7 @@ function cmdResetProject(args) {
   }
   // Apply: wipe the per-project rows. resetProject runs in a
   // transaction so a mid-reset error leaves the DB untouched.
-  const summary = resetProject(db, key);
+  const summary = resetProject(db, key, { canonicalRoot: cwd });
   closeDb(dbPath);
   const out = {
     operation: 'reset_project',

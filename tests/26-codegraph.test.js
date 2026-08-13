@@ -1,9 +1,11 @@
 // Tests for v10 code-graph extraction + BFS query.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkTempHome, rmRf, writeRaw } from './_helpers.js';
+import { mkTempHome, rmRf, writeRaw, StdioMcp } from './_helpers.js';
 import path from 'node:path';
 import { promises as fs } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { mkdtempSync } from 'node:fs';
 import {
   openDb,
   closeDb,
@@ -168,5 +170,72 @@ test('queryMemoryGraph: BFS honors max_depth and kind filter', () => {
   } finally {
     closeDb();
     rmRf(home);
+  }
+});
+
+test('codegraph_extract: refuses a root outside the project directory', async () => {
+  // The path-traversal guard at src/server.js:2540-2544 (added via
+  // audit finding H1 / B1-2) refuses any root that is not equal to or
+  // nested under the active project root. This test exercises the
+  // MCP surface to confirm the guard stays in place across refactors.
+  // (Audit flag F-202.)
+  const home = mkTempHome();
+  const cwd = mkdtempSync(path.join(tmpdir(), 'km-cg-cwd-'));
+  const evilRoot = mkdtempSync(path.join(tmpdir(), 'km-cg-evil-'));
+  const mcp = new StdioMcp({ home });
+  mcp.start();
+  try {
+    await mcp.call('initialize', {
+      protocolVersion: '2024-11-05',
+      capabilities: {},
+      clientInfo: { name: 'test', version: '0' },
+    });
+    const res = await mcp.toolCall('codegraph_extract', {
+      cwd,
+      root: evilRoot,
+      limit: 10,
+    });
+    assert.equal(res.isError, true, 'codegraph_extract must refuse an out-of-project root');
+    const text = res.content[0].text;
+    assert.match(
+      text,
+      /codegraph_extract root must be within the project directory/,
+      'error message names the path-escape guard',
+    );
+  } finally {
+    mcp.stop();
+    closeDb();
+    rmRf(home);
+    rmRf(cwd);
+    rmRf(evilRoot);
+  }
+});
+
+test('codegraph_extract: accepts the project root itself', async () => {
+  // The path-escape guard allows the active project root equal to the
+  // boundary — `root === projectRoot` must not be misclassified as an
+  // escape. (Audit flag F-202.)
+  const home = mkTempHome();
+  const cwd = mkdtempSync(path.join(tmpdir(), 'km-cg-self-'));
+  writeRaw(path.join(cwd, 'index.js'), "export function hello() { return 'world'; }\n");
+  const mcp = new StdioMcp({ home });
+  mcp.start();
+  try {
+    await mcp.call('initialize', {
+      protocolVersion: '2024-11-05',
+      capabilities: {},
+      clientInfo: { name: 'test', version: '0' },
+    });
+    const res = await mcp.toolCall('codegraph_extract', { cwd, limit: 10 });
+    assert.equal(res.isError, undefined, 'codegraph_extract on the project root succeeds');
+    const payload = JSON.parse(res.content[0].text);
+    assert.equal(payload.operation, 'codegraph_extract');
+    assert.equal(payload.root, path.resolve(cwd));
+    assert.ok(payload.files.length >= 1, 'picks up the index.js we wrote');
+  } finally {
+    mcp.stop();
+    closeDb();
+    rmRf(home);
+    rmRf(cwd);
   }
 });

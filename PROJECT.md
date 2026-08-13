@@ -183,7 +183,7 @@ A new contributor should open these first:
   `mcpServers.kimi-memory.command` in the manifest.
 - `src/cli.js` — the standalone CLI entry point (`kimi-memory` bin).
 - `src/persist/connection.js` — schema + migrations. `MIGRATIONS` array is
-  the single source of truth for `SCHEMA_VERSION = 11`; bump the version
+  the single source of truth for `SCHEMA_VERSION = 12`; bump the version
   when an entry is added.
 - `hooks/` — eight lifecycle hook scripts (`session-start.js`,
   `user-prompt-submit.js`, `stop.js`, `session-end.js`, `pre-compact.js`,
@@ -209,7 +209,7 @@ Two outbound calls. Both have opt-outs. No other network behavior.
 
 ## 8. Open context
 
-- **Schema is at v11 and may keep moving.** ACL/visibility (`visibility`,
+- **Schema is at v12 and may keep moving.** ACL/visibility (`visibility`,
   `shared_with`, `memories_acl` grant table), tier (`L0`–`L3`,
   `persona_id`), wiki (`wiki_pages`, `wiki_links`), codegraph
   (`codegraph_files`, `codegraph_edges`, `codegraph_symbols`), and the

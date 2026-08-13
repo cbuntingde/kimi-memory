@@ -217,7 +217,7 @@ sha256(canonical_root).slice(0, 16)`.
   ordered array of idempotent functions. Each entry probes the live
   schema (e.g. `PRAGMA table_info(...)`, or `SELECT sql FROM
 sqlite_master WHERE type='table' …`) and mutates only when the
-  target shape is missing. `SCHEMA_VERSION = 11` is an audit stamp,
+  target shape is missing. `SCHEMA_VERSION = 12` is an audit stamp,
   not a gate.
 - **Considered.** Version-gated migrations (Prisma, drizzle-kit) where
   each migration runs once per upgrade.

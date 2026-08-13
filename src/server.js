@@ -982,6 +982,14 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
   function openScopeDb({ cwd, scope, record = false }) {
     if (scope === 'global') {
       const dbPath = globalDbPath(home);
+      // Read paths must not create the global DB on a fresh install —
+      // PROJECT.md §3 contract. openDb's `create: true` flag would
+      // otherwise touch the file on every `memory_recall` / `memory_list`
+      // / `memory_status` over scope='global'. (Audit flag B1-1/B2-5.)
+      if (!existsSync(dbPath)) {
+        if (record) mkdirSync(path.dirname(dbPath), { recursive: true });
+        else return { db: null, projectKey: GLOBAL_PROJECT_KEY, cwd: cwd || null };
+      }
       if (record) mkdirSync(path.dirname(dbPath), { recursive: true });
       return { db: openDb(dbPath), projectKey: GLOBAL_PROJECT_KEY, cwd: cwd || null };
     }
@@ -1124,12 +1132,14 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
       if (Number.isFinite(args.max_total_recall_chars) && args.max_total_recall_chars > 0) {
         opts.maxTotalRecallChars = args.max_total_recall_chars;
       }
-      const projectItems = projectHandle
-        ? await searchMemories(projectHandle.db, projectHandle.projectKey, args.query, opts)
-        : [];
-      const globalItems = globalHandle
-        ? await searchMemories(globalHandle.db, GLOBAL_PROJECT_KEY, args.query, opts)
-        : [];
+      const projectItems =
+        projectHandle && projectHandle.db
+          ? await searchMemories(projectHandle.db, projectHandle.projectKey, args.query, opts)
+          : [];
+      const globalItems =
+        globalHandle && globalHandle.db
+          ? await searchMemories(globalHandle.db, GLOBAL_PROJECT_KEY, args.query, opts)
+          : [];
       if (scope === 'project') {
         return ok({
           operation: 'recalled',
@@ -1198,12 +1208,14 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
         offset: off.value,
         includeExpired: !!args.includeExpired,
       };
-      const projectItems = projectHandle
-        ? listMemories(projectHandle.db, projectHandle.projectKey, opts)
-        : [];
-      const globalItems = globalHandle
-        ? listMemories(globalHandle.db, GLOBAL_PROJECT_KEY, opts)
-        : [];
+      const projectItems =
+        projectHandle && projectHandle.db
+          ? listMemories(projectHandle.db, projectHandle.projectKey, opts)
+          : [];
+      const globalItems =
+        globalHandle && globalHandle.db
+          ? listMemories(globalHandle.db, GLOBAL_PROJECT_KEY, opts)
+          : [];
       if (scope === 'project') {
         return ok({
           operation: 'listed',
@@ -1262,14 +1274,16 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
       }
       if (scope === 'global' || scope === 'all') {
         const target = openScopeDb({ cwd: pr.value, scope: 'global' });
-        const mem = getMemory(target.db, GLOBAL_PROJECT_KEY, id.value);
-        if (mem)
-          return ok({
-            operation: 'got',
-            scope,
-            memory: { ...mem, scope: 'global' },
-            project_key: GLOBAL_PROJECT_KEY,
-          });
+        if (target.db) {
+          const mem = getMemory(target.db, GLOBAL_PROJECT_KEY, id.value);
+          if (mem)
+            return ok({
+              operation: 'got',
+              scope,
+              memory: { ...mem, scope: 'global' },
+              project_key: GLOBAL_PROJECT_KEY,
+            });
+        }
       }
       return textError(`memory not found: ${id.value}`);
     } catch (e) {
@@ -1526,7 +1540,22 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
       const project = openScopeDb({ cwd: pr.value, scope: 'project' });
       const global = openScopeDb({ cwd: pr.value, scope: 'global' });
       const projectMem = memoryCounts(project.db, project.projectKey);
-      const globalMem = memoryCounts(global.db, GLOBAL_PROJECT_KEY);
+      // Global DB may be absent on a fresh install — return zeros rather
+      // than throw. PROJECT.md §3 forbids lazy-creating the global DB
+      // on a read. (Audit flag B1-1/B2-5.)
+      const globalMem = global.db
+        ? memoryCounts(global.db, GLOBAL_PROJECT_KEY)
+        : {
+            total: 0,
+            active: 0,
+            retained: 0,
+            expired: 0,
+            superseded: 0,
+            deleted: 0,
+            by_type: {},
+            by_status: {},
+            latest_update_at: null,
+          };
       const wm = project.db
         .prepare('SELECT COUNT(*) AS n FROM working_memory WHERE project_key=?')
         .get(project.projectKey).n;
@@ -1712,11 +1741,13 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
       }
       if (scope === 'global' || scope === 'all') {
         const target = openScopeDb({ cwd: pr.value, scope: 'global' });
-        const items = await similarMemories(target.db, GLOBAL_PROJECT_KEY, id.value, {
-          limit: lim.value,
-          threshold,
-        });
-        merged.push(...items.map((m) => ({ ...m, scope: 'global' })));
+        if (target.db) {
+          const items = await similarMemories(target.db, GLOBAL_PROJECT_KEY, id.value, {
+            limit: lim.value,
+            threshold,
+          });
+          merged.push(...items.map((m) => ({ ...m, scope: 'global' })));
+        }
       }
       // Sort across scopes by similarity desc, then trim to limit.
       merged.sort((a, b) => (b.similarity || 0) - (a.similarity || 0));
@@ -1812,11 +1843,13 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
       }
       if (scope === 'global' || scope === 'all') {
         const target = openScopeDb({ cwd: pr.value, scope: 'global' });
-        const items = listEdges(target.db, GLOBAL_PROJECT_KEY, id.value, {
-          direction: dir.value,
-          kind: kind.value,
-        });
-        merged.push(...items.map((e) => ({ ...e, scope: 'global' })));
+        if (target.db) {
+          const items = listEdges(target.db, GLOBAL_PROJECT_KEY, id.value, {
+            direction: dir.value,
+            kind: kind.value,
+          });
+          merged.push(...items.map((e) => ({ ...e, scope: 'global' })));
+        }
       }
       // Sort by created_at desc; ties broken by kind alphabetical.
       merged.sort((a, b) => {
@@ -1918,10 +1951,12 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
       }
       if (scope === 'global' || scope === 'all') {
         const target = openScopeDb({ cwd: pr.value, scope: 'global' });
-        const items = listConclusionsFor(target.db, GLOBAL_PROJECT_KEY, id.value, {
-          limit: lim.value,
-        });
-        merged.push(...items.map((m) => ({ ...m, scope: 'global' })));
+        if (target.db) {
+          const items = listConclusionsFor(target.db, GLOBAL_PROJECT_KEY, id.value, {
+            limit: lim.value,
+          });
+          merged.push(...items.map((m) => ({ ...m, scope: 'global' })));
+        }
       }
       merged.sort((a, b) => {
         const tc = (b.updated_at || '').localeCompare(a.updated_at || '');
@@ -1956,6 +1991,7 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
       const lim = validateLimit(args.limit, 1, 500, 200);
       if (!lim.ok) return textError(lim.error);
       const target = openScopeDb({ cwd: pr.value, scope: sc.value });
+      if (!target.db) return textError(`memory not found: ${id.value}`);
       const items = getParents(target.db, target.projectKey, id.value, { limit: lim.value });
       return ok({
         operation: 'parents',
@@ -2082,7 +2118,7 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
             'The global database and every other project DB are never touched.',
         });
       }
-      const summary = resetProject(handle, key);
+      const summary = resetProject(handle, key, { canonicalRoot: pr.value });
       // Drop the cached handle so the next open re-reads the file.
       closeDb(dbPath);
       return ok({

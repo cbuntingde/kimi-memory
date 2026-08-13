@@ -382,7 +382,7 @@ export function detectReclone(db, projectKey, canonicalRoot) {
 //     file itself: schema + migrations stay in place.
 //
 // Returns a summary so the caller can render a confirmation message.
-export function resetProject(db, projectKey) {
+export function resetProject(db, projectKey, { canonicalRoot = '' } = {}) {
   if (!db || !projectKey) {
     throw new Error('resetProject: db and projectKey are required');
   }
@@ -428,13 +428,19 @@ export function resetProject(db, projectKey) {
     // incarnation. last_canonical_root is preserved as the audit
     // breadcrumb of the pre-reset project. record_count is left as-is
     // (it counts re-records, which we want to keep).
+    //
+    // canonicalRoot is preserved when the caller does not supply one:
+    // overwriting it with '' would mark the just-reset project as a
+    // self-orphan on the next `memory_prune` run, until the next
+    // SessionStart hook re-stamps it. (Audit flag F-102.)
     const r = db
       .prepare(
         `UPDATE project_paths
-         SET first_seen_at = ?, last_seen_at = ?, canonical_root = ?
+         SET first_seen_at = ?, last_seen_at = ?,
+             canonical_root = COALESCE(NULLIF(?, ''), canonical_root)
          WHERE project_key = ?`,
       )
-      .run(nowIso(), nowIso(), '', projectKey);
+      .run(nowIso(), nowIso(), canonicalRoot, projectKey);
     summary.project_path_preserved = r.changes > 0;
     db.exec('COMMIT');
   } catch (err) {

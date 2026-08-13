@@ -269,9 +269,13 @@ test('resetProject: wipes per-project rows but preserves the project_paths row a
     );
 
     // project_paths is preserved; first_seen_at was reset to now.
+    // canonical_root is preserved across the reset when the caller does
+    // not pass a fresh value — overwriting with '' would mark the
+    // just-reset project as a self-orphan on the next memory_prune run.
+    // (Audit flag F-102.)
     const row = listProjectPaths(db).find((r) => r.project_key === key);
     assert.ok(row, 'project_paths row preserved');
-    assert.equal(row.canonical_root, '', 'canonical_root reset to empty so re-stamp re-fills it');
+    assert.equal(row.canonical_root, cwd, 'canonical_root preserved when caller passes none');
     const ageMs = Date.now() - Date.parse(row.first_seen_at);
     assert.ok(ageMs < 10_000, 'first_seen_at is recent (within 10s)');
 
@@ -279,6 +283,34 @@ test('resetProject: wipes per-project rows but preserves the project_paths row a
   } finally {
     rmRf(home);
     rmRf(cwd);
+  }
+});
+
+test('resetProject: passes a fresh canonical_root through to project_paths', () => {
+  // When the caller supplies a canonical root (the MCP handler and CLI
+  // both have one), resetProject overwrites the existing value with
+  // the new one. (Audit flag F-102.)
+  const home = freshHome();
+  const oldCwd = mkdtempSync(path.join(tmpdir(), 'km-rp-old-'));
+  const newCwd = mkdtempSync(path.join(tmpdir(), 'km-rp-new-'));
+  const key = deriveProjectKey(oldCwd);
+  try {
+    const db = openDb(projectDbPath(home, key));
+    recordProjectPath(db, key, oldCwd);
+    const before = listProjectPaths(db).find((r) => r.project_key === key);
+    assert.equal(before.canonical_root, oldCwd);
+
+    const summary = resetProject(db, key, { canonicalRoot: newCwd });
+    assert.equal(summary.project_path_preserved, true);
+
+    const after = listProjectPaths(db).find((r) => r.project_key === key);
+    assert.equal(after.canonical_root, newCwd, 'canonical_root updated to caller-supplied value');
+
+    closeDb(projectDbPath(home, key));
+  } finally {
+    rmRf(home);
+    rmRf(oldCwd);
+    rmRf(newCwd);
   }
 });
 
