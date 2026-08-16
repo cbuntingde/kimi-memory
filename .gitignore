@@ -1,31 +1,66 @@
+# Dependencies
 node_modules/
-*.log
-.DS_Store
-coverage/
+
+# Build output
 dist/
-.cache/
-.vscode/
-.idea/
-_diagnostics/
-.claude/
+build/
+coverage/
+*.tsbuildinfo
 
-# Development / planning docs that should not ship with the plugin. The
-# repo's user-facing surface is README.md and CONTRIBUTING.md. Internal notes
-# for AI agents and humans working on the plugin itself stay on disk but out
-# of the public index.
-AGENTS.md
-plans/
-todo/
-TODO.md
-ROADMAP.md
-.audit/
+# Local config / secrets
+.env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+*.local
 
-# Editor / OS scratch files
-*.bak
-*.swp
-*.swo
-*~
-\#*\#
+# Logs
+*.log
+logs/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# OS / editor scratch
 .DS_Store
 Thumbs.db
 desktop.ini
+ehthumbs.db
+ehthumbs_view.db
+*.swp
+*.swo
+*.swn
+*.bak
+*.tmp
+*~
+\#*\#
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace
+
+# Runtime diagnostics (written by hooks)
+_diagnostics/
+
+# Tooling artifacts
+.craftsman/
+.cache/
+.worktrees/
+ships/
+*.tgz
+*.tar.gz
+
+# Internal planning / AI-shared docs.
+# The repo's public surface is README.md + CONTRIBUTING.md +
+# ARCHITECTURE.md + CONVENTIONS.md + PROJECT.md + CHANGELOG.md.
+# Internal notes stay on disk but out of the public tree.
+AGENTS.md
+plans/
+todo/
+todo.md
+TODO.md
+ROADMAP.md
+.audit/

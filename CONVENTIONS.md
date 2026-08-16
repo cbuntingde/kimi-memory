@@ -25,8 +25,8 @@ review a diff. Get it wrong and they'll fight the codebase instead of fixing it.
 - **`src/`** holds the runtime. Each file is one concern; cross-module
   boundaries map to files. The current top-level layout:
   `acl.js`, `auto-gc.js`, `backfill.js`, `cli.js`, `codegraph.js`,
-  `codegraph.js`, `consolidate.js`, `decay.js`, `diagnostics.js`,
-  `embedding.js`, `extract.js`, `lifecycle.js`, `performance.js`,
+  `concurrency.js`, `config.js`, `consolidate.js`, `decay.js`,
+  `diagnostics.js`, `embedding.js`, `extract.js`, `persist.js`,
   `project-key.js`, `prune.js`, `retry.js`, `search.js`, `server.js`,
   `session-focus.js`, `toml.js`, `tool-registry.js`, `util.js`,
   `validation.js`, `wiki.js`, `wire.js`, `work-log.js`; plus subdirs
@@ -48,7 +48,7 @@ review a diff. Get it wrong and they'll fight the codebase instead of fixing it.
   instruction sheet loaded at every `SessionStart`. Update whenever the
   recall-ack contract, hooks contract, or routing rules change
   (`CONTRIBUTING.md:4-6`, `20-24`).
-- **`tests/`** holds 34 `tests/*.test.js` files plus `tests/_helpers.js`,
+- **`tests/`** holds 39 `tests/*.test.js` files plus `tests/_helpers.js`,
   all running under `node --test`. New tests start by importing from
   `tests/_helpers.js` (`StdioMcp`, `tempDb`, env-var defaults).
 
@@ -235,7 +235,7 @@ clarifications:
 
 1. `npm run check` — `node --check` on every `.js` file under `src/`,
    `hooks/`, `tests/`.
-2. `npm test` — all 34 test files pass.
+2. `npm test` — all 39 test files pass.
 3. `npm run format:check` — Prettier clean.
 4. New persistence helper → unit test added.
 5. New MCP tool → MCP round-trip test added.
