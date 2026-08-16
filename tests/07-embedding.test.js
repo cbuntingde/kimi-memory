@@ -65,6 +65,24 @@ function vecC() {
   return v;
 }
 
+test('EMBEDDING_MODEL uses the legacy-free transformers.js v4 id', () => {
+  // transformers.js v4 rejects model ids that carry a "@v1" revision
+  // suffix — the legacy version-pin syntax that used to be allowed.
+  // Passing the bare model id resolves; adding the suffix makes the
+  // ModelRegistry treat the whole `@v1` string as part of the path,
+  // producing "Local file missing at 'Xenova/all-MiniLM-L6-v2@v1/config.json'
+  // and download aborted due to invalid model ID …". Every embed call
+  // then fails open through embedRaw(); recall silently degrades to
+  // FTS5-only and the user sees the same error every prompt.
+  // Pin the same id consistently so the (string-equality) caching in
+  // backfillEmbeddings / search.js keeps working.
+  assert.equal(EMBEDDING_MODEL, 'Xenova/all-MiniLM-L6-v2');
+  assert.ok(
+    !EMBEDDING_MODEL.includes('@'),
+    `EMBEDDING_MODEL must not contain a "@"-prefixed revision tag (was ${EMBEDDING_MODEL})`,
+  );
+});
+
 test('encodeVector / decodeVector round-trip preserves the vector exactly', () => {
   const v = vecA();
   const buf = encodeVector(v);

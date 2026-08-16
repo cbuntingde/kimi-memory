@@ -626,5 +626,8 @@ Short, honest list. Items here are not bugs; they are deferred.
 - **Embedding model is opaque.** A future overhaul would want a model
   registry that honours user's choice (Anthropic embeddings,
   Voyage, etc.). Today it is hard-coded to
-  `Xenova/all-MiniLM-L6-v2@v1` with version pinning
-  (`embedding.js:38`).
+  `Xenova/all-MiniLM-L6-v2`. The legacy `@v1` revision suffix that
+  previously pinned the model was removed: transformers.js v4
+  rejects `…@v1` with "invalid model ID" and fails every embedding
+  call (`embedding.js:38`). If a snapshot pin is needed, pass
+  `revision` as an option to `pipeline()`.

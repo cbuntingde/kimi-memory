@@ -17,19 +17,20 @@ const requiredPackages = [
 
 if (requiredPackages.some((file) => !existsSync(path.join(pluginRoot, 'node_modules', file)))) {
   const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm';
-  // shell: false (the default) and windowsVerbatimArguments: true so the
-  // argument vector is passed verbatim — without shell:true a future
-  // arg that contains `&` or `|` would never be misinterpreted, and
-  // we never pick up npm's `npm_config_*` env-var expansion. The fixed
-  // binary path and fixed arg list make this call safe.
+  // On Windows, .cmd / .bat files require `shell: true` — without it
+  // Node's child_process throws EINVAL before execve is ever called,
+  // surfacing as `spawnSync npm.cmd EINVAL` and killing the plugin
+  // bootstrap with an MCP "Connection closed" error. The hard-coded
+  // binary path and the static argument vector below keep `shell: true`
+  // safe (no user input reaches the command line). On non-Windows
+  // platforms the default shell-less path applies.
   const result = spawnSync(
     npm,
     ['ci', '--omit=dev', '--ignore-scripts', '--no-audit', '--no-fund'],
     {
       cwd: pluginRoot,
       stdio: ['ignore', 'ignore', 'inherit'],
-      shell: false,
-      windowsVerbatimArguments: true,
+      shell: process.platform === 'win32',
     },
   );
 

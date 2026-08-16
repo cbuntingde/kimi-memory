@@ -5,8 +5,14 @@
 // `embed(text) -> Float32Array(EMBEDDING_DIM)` plus `encode`/`decode`
 // helpers for storing vectors as SQLite BLOBs.
 //
-// The default model is `Xenova/all-MiniLM-L6-v2@v1` (384-dim, ~25 MB on
-// disk, with explicit version pinning to prevent silent incompatibilities).
+// The default model is `Xenova/all-MiniLM-L6-v2` (384-dim, ~25 MB on
+// disk). transformers.js v4 dropped support for the legacy `@v1`
+// revision-tag suffix on model ids — passing `…@v1` now produces
+// `Local file missing at "Xenova/all-MiniLM-L6-v2@v1/config.json" and
+// download aborted due to invalid model ID`, and every embedding call
+// fails open through `embedRaw()`. Pin a specific snapshot by passing
+// `revision: 'refs/pr/N'` to `pipeline()` if needed; the bare id is the
+// upstream-recommended default for transformers.js >=4.
 // The plugin is local-first: no API key, no remote calls at runtime once
 // the model is cached.
 //
@@ -35,7 +41,7 @@
 import { logEmbeddingError } from './diagnostics.js';
 
 export const EMBEDDING_DIM = 384;
-export const EMBEDDING_MODEL = 'Xenova/all-MiniLM-L6-v2@v1';
+export const EMBEDDING_MODEL = 'Xenova/all-MiniLM-L6-v2';
 
 // Default wall-clock cap for one embed call. Picked at 4s so the
 // persist layer (which is given 5s by the hook runner) can write the

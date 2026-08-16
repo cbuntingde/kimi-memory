@@ -150,7 +150,11 @@ Reuses: the existing `makeServer` factory in `src/server.js`; `openScopeDb` + `r
 
 ### 3. Embedding Robustness (`src/embedding.js`)
 
-- **Explicit version pinning**: `Xenova/all-MiniLM-L6-v2@v1` (prevents silent incompatibilities)
+- **Explicit version pinning removed**: `Xenova/all-MiniLM-L6-v2`. The
+  earlier `@v1` suffix stopped working under transformers.js v4
+  (the model id is taken literally and the download is rejected as
+  an "invalid model ID"). Pin a specific snapshot via
+  `pipeline(..., { revision: 'refs/pr/N' })` if needed.
 - **Dimension validation** on encode/decode:
   - `encodeVector()` throws `KIMI_MEMORY_EMBED_DIM_MISMATCH` on dimension mismatch
   - `decodeVector()` validates BLOB size and checks for NaN/Inf values
