@@ -606,16 +606,18 @@ Short, honest list. Items here are not bugs; they are deferred.
   being discovered in production. The conservative grace windows
   (`auto-gc.js:36-65`) buy time; a `craftsman audit --focus gc` pass
   would tighten these.
-- **Prettier drift in 15 files.** `PROJECT.md`, `IMPROVEMENTS.md`,
-  `src/acl.js`, `src/consolidate.js`, `src/hooks/run.js`,
-  `src/persist/{connection,index,memories,search}.js`,
-  `tests/{04-hooks,13-recall-per-type,30-redact-secrets,31-row-corruption,
-32-batch2-fixes,33-auto-gc-smoke}.test.js` carry format drift from
-  prior work. `npx prettier --write <each>` clears them.
-- **`PROJECT.md:78` under-counts tests.** The document says "33 numbered
-  test files plus _helpers.js"; the actual count is 34 `tests/*.test.js`
-  files plus `_helpers.js`. Cosmetic; future `craftsman init` should
-  regenerate this line.
+- **Prettier drift in 9 files** (closed 2026-08-16 by `prettier --write`).
+  `src/{auto-gc,consolidate,retry,server,session-focus}.js`,
+  `src/hooks/run.js`, `src/persist/{memories,share}.js`,
+  `tests/37-share-move-metadata.test.js` were the last 9 hold-outs
+  from prior work. `npx prettier --check src/ hooks/ tests/` now
+  reports clean.
+- **`PROJECT.md:78` under-counts tests.** The document claimed "33 numbered
+  test files plus _helpers.js"; the actual count is 38 `tests/*.test.js`
+  files plus `_helpers.js` (added 35-session-focus-column, 36-launcher-spawn-opts,
+  37-share-move-metadata since the line was last touched). Same drift in
+  this file's `§5` listing. Future `craftsman init` should regenerate both
+  lines.
 - **`auto-merge` can soft-supersede a member a user expected to keep.**
   Tight-cluster auto-merge is conservative (cosine ≥ 0.85, tag overlap
   ≥ 2, ≥ 3 members) but the merge target is picked by `confidence`

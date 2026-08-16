@@ -27,13 +27,22 @@ export function sleep(ms) {
 }
 
 // Retry a function with exponential backoff.
-// fn: async function that may throw
+// fn: async function that may throw OR may resolve to a falsy outcome
+// (e.g. null). The previous shape only retried on thrown errors; any
+// caller that swallows failures into null/undefined (the LLM
+// `callChat`, for example) never saw its retry budget consumed, and a
+// single flapping provider silently dropped every extract call.
+// (Audit fix.) `shouldRetry` may inspect either a thrown error or a
+// resolved value via the same predicate — both `thrown` and
+// `resolved` falsy/exception states are routed through the same
+// retry classifier.
 // maxAttempts: total attempts (default 3)
 // baseDelayMs: initial delay between retries (default 1000)
 // maxDelayMs: max delay cap (default 60000)
 // jitterFraction: ±randomness factor (default 0.1)
 // diagnosticContext: { projectKey?, operationType?, extra? } for logging
-// shouldRetry: (error) => boolean to decide if error is retryable (default: always true)
+// shouldRetry: (error|outcome) => boolean to decide if the failure is retryable
+// (default: retries on either thrown errors OR null/undefined outcomes).
 export async function withRetry(
   fn,
   {
@@ -42,43 +51,66 @@ export async function withRetry(
     maxDelayMs = 60000,
     jitterFraction = 0.1,
     diagnosticContext = {},
-    shouldRetry = () => true,
+    shouldRetry = (state) => {
+      // `state` is `{ error?: Error, value?: any }` — retry when either
+      // a real exception was thrown OR the resolved outcome is missing.
+      // Throwing is the legacy path; the resolved-null path is what the
+      // LLM retry needs to fire today.
+      return Boolean(state && (state.error || state.value == null));
+    },
   } = {},
 ) {
   let lastError = null;
+  let lastValue;
+  let lastHadValue = false;
 
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    let outcome;
     try {
-      return await fn();
+      outcome = { value: await fn() };
     } catch (error) {
-      lastError = error;
-      const retryable = shouldRetry(error);
-
-      if (!retryable || attempt === maxAttempts - 1) {
-        // Either not retryable or this was the last attempt.
-        throw error;
-      }
-
-      // Calculate backoff and retry.
-      const delayMs = calculateBackoffMs(attempt, baseDelayMs, maxDelayMs, jitterFraction);
-      const { projectKey, operationType, extra } = diagnosticContext;
-
-      // Log the retry for observability.
-      if (projectKey && operationType) {
-        await logAutoExtractRetry(
-          projectKey,
-          attempt + 1,
-          delayMs,
-          `${operationType}: ${error?.code || error?.name || 'unknown'}`,
-        ).catch(() => {});
-      }
-
-      await sleep(delayMs);
+      outcome = { error };
     }
+    const { error, value } = outcome;
+    lastError = error || null;
+    lastValue = value;
+    lastHadValue = !error;
+
+    // Success: an exception-free call that returned a defined value is
+    // a final answer. Return immediately.
+    if (!error && value != null) return value;
+
+    // Build the (error|outcome) view that shouldRetry expects.
+    const state = error ? { error } : { value };
+    const retryable = shouldRetry(state);
+
+    if (!retryable || attempt === maxAttempts - 1) {
+      // Either not retryable or last attempt. Propagate the original
+      // error if one was thrown; otherwise resolve to the last
+      // (likely-null) outcome so the caller can still inspect it.
+      if (error) throw error;
+      return value;
+    }
+
+    const delayMs = calculateBackoffMs(attempt, baseDelayMs, maxDelayMs, jitterFraction);
+    const { projectKey, operationType, extra } = diagnosticContext;
+    if (projectKey && operationType) {
+      await logAutoExtractRetry(
+        projectKey,
+        attempt + 1,
+        delayMs,
+        `${operationType}: ${error ? error.code || error.name || 'error' : 'no_reply'}`,
+      ).catch(() => {});
+    }
+    await sleep(delayMs);
   }
 
-  // Should never reach here, but just in case:
-  throw lastError;
+  // Final attempt path: return the last resolved value (likely null)
+  // so a caller that distinguishes "got an empty reply" from "errored"
+  // can still tell. Errors thrown on the final attempt were already
+  // propagated by the in-loop branch above.
+  if (lastError) throw lastError;
+  return lastHadValue ? lastValue : undefined;
 }
 
 // Wrapper for auto-extract retry with semantic error classification.

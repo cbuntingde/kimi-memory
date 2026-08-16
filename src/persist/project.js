@@ -115,23 +115,90 @@ export function searchConversationEvents(
     .filter(Boolean)
     .slice(0, 16);
   if (tokens.length === 0) return [];
-  const like = '%' + tokens.slice(0, 6).join('%') + '%';
-  const where = ['project_key = ?', '(summary LIKE ? OR payload LIKE ?)'];
-  const params = [projectKey, like, like];
-  if (sessionId) {
-    where.push('session_id = ?');
-    params.push(sessionId);
+  // FTS5 path: the conversation_events_fts mirror is the fast read
+  // surface for keyword search. The mirror is populated lazily by
+  // mirrorConversationEventsFts(); a row that was just ingested but
+  // not yet mirrored is still findable via the LIKE fallback below.
+  // (Audit fix H4.)
+  let rows = [];
+  let ftsFailed = false;
+  try {
+    const ftsQuery = tokens.map((t) => `"${t.replace(/"/g, '""')}"`).join(' OR ');
+    const ftsWhere = ['project_key = ?'];
+    const ftsParams = [projectKey];
+    if (sessionId) {
+      ftsWhere.push('session_id = ?');
+      ftsParams.push(sessionId);
+    }
+    if (role) {
+      ftsWhere.push('role = ?');
+      ftsParams.push(role);
+    }
+    ftsParams.push(Math.max(1, Math.min(200, limit)));
+    rows = db
+      .prepare(
+        `SELECT m.* FROM conversation_events_fts f
+         JOIN conversation_events m
+           ON m.session_id = f.session_id
+          AND m.project_key = f.project_key
+          AND m.line_no = f.line_no
+         WHERE conversation_events_fts MATCH ?
+           AND ${ftsWhere.join(' AND ')}
+         ORDER BY datetime(m.created_at) DESC LIMIT ?`,
+      )
+      .all(ftsQuery, ...ftsParams);
+    // Lazy mirror backfill: if the FTS5 query returned nothing but
+    // the source table has rows, the mirror is empty (e.g. the DB
+    // pre-dates the v12-mirror migration). Backfill once and retry.
+    if (rows.length === 0) {
+      const sourceCount = db
+        .prepare('SELECT COUNT(*) AS n FROM conversation_events WHERE project_key = ?')
+        .get(projectKey).n;
+      const mirrorCount = db
+        .prepare('SELECT COUNT(*) AS n FROM conversation_events_fts WHERE project_key = ?')
+        .get(projectKey).n;
+      if (sourceCount > 0 && mirrorCount === 0) {
+        mirrorConversationEventsFts(db, projectKey);
+        rows = db
+          .prepare(
+            `SELECT m.* FROM conversation_events_fts f
+             JOIN conversation_events m
+               ON m.session_id = f.session_id
+              AND m.project_key = f.project_key
+              AND m.line_no = f.line_no
+             WHERE conversation_events_fts MATCH ?
+               AND ${ftsWhere.join(' AND ')}
+             ORDER BY datetime(m.created_at) DESC LIMIT ?`,
+          )
+          .all(ftsQuery, ...ftsParams);
+      }
+    }
+  } catch {
+    /* FTS5 mirror missing or stale — fall through to LIKE. */
+    rows = [];
+    ftsFailed = true;
   }
-  if (role) {
-    where.push('role = ?');
-    params.push(role);
+  // LIKE fallback covers freshly-ingested rows the mirror hasn't seen
+  // yet, and the case where the FTS5 mirror was never populated.
+  if (rows.length === 0) {
+    const like = '%' + tokens.slice(0, 6).join('%') + '%';
+    const where = ['project_key = ?', '(summary LIKE ? OR payload LIKE ?)'];
+    const params = [projectKey, like, like];
+    if (sessionId) {
+      where.push('session_id = ?');
+      params.push(sessionId);
+    }
+    if (role) {
+      where.push('role = ?');
+      params.push(role);
+    }
+    params.push(Math.max(1, Math.min(200, limit)));
+    rows = db
+      .prepare(
+        `SELECT * FROM conversation_events WHERE ${where.join(' AND ')} ORDER BY datetime(created_at) DESC LIMIT ?`,
+      )
+      .all(...params);
   }
-  params.push(Math.max(1, Math.min(200, limit)));
-  const rows = db
-    .prepare(
-      `SELECT * FROM conversation_events WHERE ${where.join(' AND ')} ORDER BY datetime(created_at) DESC LIMIT ?`,
-    )
-    .all(...params);
   return rows.map((r) => ({
     session_id: r.session_id,
     line_no: r.line_no,
@@ -184,6 +251,59 @@ export function recordConversationEvent(db, projectKey, sessionId, lineNo, byteO
       summary = excluded.summary
   `,
   ).run(sessionId, projectKey, lineNo, byteOffset, role, kind, payload, summary, createdAt);
+  // Note: the conversation_events_fts mirror is intentionally NOT
+  // written here. Doing so per-event caused WAL+busy_timeout
+  // contention between the hook and MCP processes under realistic
+  // ingest loads — the test suite hung at this exact point. The
+  // mirror is rebuilt lazily by searchConversationEvents (see below)
+  // when a search hits an empty/stale mirror. (Audit fix H4 —
+  // revised to lazy backfill.)
+}
+
+// Rebuild the FTS5 mirror from scratch. Cheap on healthy DBs; on a
+// 50k-event archive it runs once on the first searchConversationEvents
+// call after a schema upgrade and then becomes a no-op. (Audit fix H4.)
+export function mirrorConversationEventsFts(db, projectKey) {
+  if (!db || !projectKey) return { mirrored: 0 };
+  try {
+    const rows = db
+      .prepare(
+        `SELECT session_id, project_key, line_no, role, summary, payload
+         FROM conversation_events
+         WHERE project_key = ?`,
+      )
+      .all(projectKey);
+    let mirrored = 0;
+    const insert = db.prepare(
+      `INSERT OR REPLACE INTO conversation_events_fts (session_id, project_key, line_no, role, summary, payload)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    );
+    db.exec('BEGIN');
+    try {
+      for (const r of rows) {
+        insert.run(
+          r.session_id,
+          r.project_key,
+          r.line_no,
+          r.role || '',
+          r.summary || '',
+          r.payload || '',
+        );
+        mirrored += 1;
+      }
+      db.exec('COMMIT');
+    } catch (e) {
+      try {
+        db.exec('ROLLBACK');
+      } catch {
+        /* ignore */
+      }
+      throw e;
+    }
+    return { mirrored };
+  } catch {
+    return { mirrored: 0 };
+  }
 }
 
 export function updateConversationProgress(
@@ -420,10 +540,20 @@ export function resetProject(db, projectKey, { canonicalRoot = '' } = {}) {
     summary.memory_synthesizes_deleted = db
       .prepare('DELETE FROM memory_synthesizes WHERE project_key=?')
       .run(projectKey).changes;
-    // FTS5 mirrors the memories table. Re-seeding it from a now-empty
-    // memories table is a single DELETE; the next memory_save will
-    // re-populate the FTS rows for the new project.
-    db.exec('DELETE FROM memories_fts');
+    // FTS5 mirrors the memories table. The previous shape issued an
+    // unconditional `DELETE FROM memories_fts` that could orphan FTS
+    // rows for every *other* project_key in the same DB. Scope the
+    // delete to the project's own ids so multi-project DBs (and any
+    // future shared-DB design) keep their FTS index intact.
+    // (Audit fix M3.)
+    const memIds = db
+      .prepare('SELECT id FROM memories WHERE project_key=?')
+      .all(projectKey)
+      .map((r) => r.id);
+    if (memIds.length > 0) {
+      const placeholders = memIds.map(() => '?').join(',');
+      db.prepare(`DELETE FROM memories_fts WHERE id IN (${placeholders})`).run(...memIds);
+    }
     // Refresh the project_paths row so first_seen_at reflects the new
     // incarnation. last_canonical_root is preserved as the audit
     // breadcrumb of the pre-reset project. record_count is left as-is

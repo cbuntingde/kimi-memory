@@ -174,11 +174,18 @@ const MIGRATIONS = [
         -- Recreate every index the SCHEMA_SQL ships with. Indexes don't
         -- survive DROP TABLE, so we have to re-create them after the
         -- rename. These mirror SCHEMA_SQL exactly — keep them in sync.
+        -- (Audit fix L1: also re-create the v3
+        -- idx_memories_project_embedding_dim, which the previous
+        -- shape omitted. Without it, vector recall falls back to
+        -- a full table scan on the (project_key, embedding_dim)
+        -- predicate right after the rebuild — exactly the case the
+        -- index exists to avoid.)
         CREATE INDEX idx_memories_project_type   ON memories(project_key, type);
         CREATE INDEX idx_memories_project_status ON memories(project_key, status);
         CREATE INDEX idx_memories_expires        ON memories(expires_at);
         CREATE INDEX idx_memories_supersedes     ON memories(supersedes);
         CREATE INDEX idx_memories_embedded_at    ON memories(embedded_at);
+        CREATE INDEX idx_memories_project_embedding_dim ON memories(project_key, embedding_dim);
         -- FTS5 is a virtual table; rebuild from the canonical memories
         -- table so the search index stays consistent. The tags column
         -- is a JSON string ('["a","b"]'); FTS5 tokenizes it as text,
@@ -593,6 +600,10 @@ const MIGRATIONS = [
         CREATE INDEX idx_memories_expires        ON memories(expires_at);
         CREATE INDEX idx_memories_supersedes     ON memories(supersedes);
         CREATE INDEX idx_memories_embedded_at    ON memories(embedded_at);
+        -- (Audit fix L1: re-create the v3
+        -- idx_memories_project_embedding_dim index after the rebuild,
+        -- see comment in the v5 migration above.)
+        CREATE INDEX idx_memories_project_embedding_dim ON memories(project_key, embedding_dim);
         DELETE FROM memories_fts;
         INSERT INTO memories_fts (id, project_key, type, title, content, tags)
           SELECT id, project_key, type, title, content, tags FROM memories;
@@ -768,6 +779,25 @@ CREATE INDEX IF NOT EXISTS idx_events_role ON conversation_events(session_id, pr
 CREATE INDEX IF NOT EXISTS idx_events_project_kind_line
   ON conversation_events(project_key, kind, line_no);
 
+-- FTS5 mirror of conversation_events for conversation_search. The
+-- LIKE-on-summary / LIKE-on-payload path in project.js#searchConversationEvents
+-- was a full table scan on every call; a 50k-event archive per
+-- project pays that cost on every MCP invocation. The FTS5 mirror
+-- carries line_no + session_id + project_key as UNINDEXED columns so
+-- the read path can JOIN back to the source row on the composite PK.
+-- The mirror is populated lazily by mirrorConversationEventsFts;
+-- a freshly-ingested row may briefly live in the source table only
+-- and is covered by the LIKE fallback. (Audit fix H4.)
+CREATE VIRTUAL TABLE IF NOT EXISTS conversation_events_fts USING fts5(
+  session_id UNINDEXED,
+  project_key UNINDEXED,
+  line_no UNINDEXED,
+  role UNINDEXED,
+  summary,
+  payload,
+  tokenize = 'unicode61 remove_diacritics 2'
+);
+
 -- v6: per-DB project_paths registry. Each row pins a project_key to the
 -- canonical project root the DB was last opened with. Memory_prune uses
 -- this to find orphan DBs whose project no longer exists on disk. The
@@ -805,30 +835,46 @@ export function openDb(dbPath) {
   } catch {
     /* ignore */
   }
-  // Open read-write + create if missing.
-  const db = new DatabaseSync(dbPath, { readOnly: false, create: true });
-  db.exec('PRAGMA journal_mode = WAL;');
-  db.exec('PRAGMA foreign_keys = ON;');
-  db.exec('PRAGMA synchronous = NORMAL;');
-  // The hook runner and the MCP server are separate processes that
-  // both write to the same DB. WAL allows concurrent readers + a
-  // single writer, but a second writer must wait for the first to
-  // commit; without a busy_timeout SQLite returns SQLITE_BUSY
-  // immediately. Increase timeout from 5s to 30s for better reliability,
-  // and log long waits for observability.
-  db.exec('PRAGMA busy_timeout = 30000;');
-  db.exec(SCHEMA_SQL);
-  // Run every idempotent migration. Cost is one PRAGMA per migration;
-  // on a healthy DB each one short-circuits.
-  for (const migrate of MIGRATIONS) migrate(db);
-  db.prepare(
-    `
-    INSERT INTO schema_meta (key, value) VALUES ('schema_version', ?)
-    ON CONFLICT(key) DO UPDATE SET value=excluded.value
-  `,
-  ).run(String(SCHEMA_VERSION));
-  cachedDbs.set(dbPath, db);
-  return db;
+  // Open read-write + create if missing. If any of the PRAGMA calls,
+  // SCHEMA_SQL execution, the migration loop, or the schema_meta
+  // upsert throws, close the native handle before propagating so the
+  // process does not leak it on every failed open. node:sqlite does
+  // not finalize dropped JS references automatically — each leaked
+  // handle is a permanent file descriptor until the process exits.
+  // (Audit fix M4.)
+  let db;
+  try {
+    db = new DatabaseSync(dbPath, { readOnly: false, create: true });
+    db.exec('PRAGMA journal_mode = WAL;');
+    db.exec('PRAGMA foreign_keys = ON;');
+    db.exec('PRAGMA synchronous = NORMAL;');
+    // The hook runner and the MCP server are separate processes that
+    // both write to the same DB. WAL allows concurrent readers + a
+    // single writer, but a second writer must wait for the first to
+    // commit; without a busy_timeout SQLite returns SQLITE_BUSY
+    // immediately. Increase timeout from 5s to 30s for better reliability,
+    // and log long waits for observability.
+    db.exec('PRAGMA busy_timeout = 30000;');
+    db.exec(SCHEMA_SQL);
+    // Run every idempotent migration. Cost is one PRAGMA per migration;
+    // on a healthy DB each one short-circuits.
+    for (const migrate of MIGRATIONS) migrate(db);
+    db.prepare(
+      `
+      INSERT INTO schema_meta (key, value) VALUES ('schema_version', ?)
+      ON CONFLICT(key) DO UPDATE SET value=excluded.value
+    `,
+    ).run(String(SCHEMA_VERSION));
+    cachedDbs.set(dbPath, db);
+    return db;
+  } catch (err) {
+    try {
+      if (db) db.close();
+    } catch {
+      /* ignore */
+    }
+    throw err;
+  }
 }
 
 export function closeDb(dbPath) {

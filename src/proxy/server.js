@@ -188,7 +188,19 @@ export async function startProxy({
     const srv = mcp.server;
     const registry = srv && (srv._registeredTools || srv._tools);
     if (!registry) {
-      throw new Error('MCP server registry not accessible in this SDK version');
+      // Defensive: the SDK does not expose a public "call by name" API,
+      // so the proxy relies on a private field whose name has shifted
+      // across SDK releases. When the SDK drifts again, surface a
+      // typed error so the operator can pin the SDK or upgrade the
+      // proxy, rather than silently returning 500 on every request.
+      // (Audit fix M11.)
+      const err = new Error(
+        'MCP server tool registry is not accessible in this @modelcontextprotocol/sdk version; ' +
+          'proxy is pinned to an SDK release that exposed `_registeredTools` or `_tools` on `McpServer`. ' +
+          'Either pin the SDK or update src/proxy/server.js to match the new shape.',
+      );
+      err.code = 'sdk_drift';
+      throw err;
     }
     const entry = registry.get(toolName) || registry[toolName];
     if (!entry) {
@@ -270,6 +282,16 @@ export async function startProxy({
       // not expose this directly; we walk the registry.
       try {
         const registry = mcp.server && (mcp.server._registeredTools || mcp.server._tools);
+        if (!registry) {
+          // Same defensive surface as dispatchTool — if the SDK
+          // shape drifts, the operator sees a typed error instead
+          // of a silent empty list. (Audit fix M11.)
+          const err = new Error(
+            'MCP server tool registry is not accessible in this SDK version; see /tools/POST error for the same code.',
+          );
+          err.code = 'sdk_drift';
+          throw err;
+        }
         const names = registry
           ? [...(registry.keys ? registry.keys() : Object.keys(registry))]
           : [];
@@ -277,7 +299,7 @@ export async function startProxy({
         res.end(JSON.stringify({ tools: names, count: names.length }));
       } catch (e) {
         res.writeHead(500, { 'content-type': 'application/json' });
-        res.end(JSON.stringify({ error: e.message }));
+        res.end(JSON.stringify({ error: e.message, code: e.code || 'internal' }));
       }
       return;
     }

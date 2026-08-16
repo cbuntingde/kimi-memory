@@ -31,6 +31,7 @@ import {
   openDb,
   closeDb,
   listMemories,
+  listProjectPaths,
   getMemory,
   memoryCounts,
   searchMemories,
@@ -508,14 +509,46 @@ function cmdImport(args) {
   // otherwise land a secret in the DB. Refuse up-front with the same
   // `secret_detected:` shape used elsewhere. opt-out via
   // KIMI_MEMORY_SECRET_SCAN=off for fixture-import workflows.
+  //
+  // The shape mirrors `assertNoSecret` in persist/memories.js so the
+  // save-side and import-side filters cannot drift apart: title,
+  // content, every tags entry, and every string value in metadata
+  // + provenance (recursively) are scanned individually. The
+  // previous version only checked title and content, leaving a
+  // credential hidden in tags / metadata / provenance to slip past.
   if (process.env.KIMI_MEMORY_SECRET_SCAN !== 'off') {
+    const scanValue = (value, path) => {
+      if (typeof value === 'string') {
+        return looksLikeSecret(value) ? path : null;
+      }
+      if (Array.isArray(value)) {
+        for (let i = 0; i < value.length; i++) {
+          const hit = scanValue(value[i], `${path}[${i}]`);
+          if (hit) return hit;
+        }
+        return null;
+      }
+      if (value && typeof value === 'object') {
+        for (const k of Object.keys(value)) {
+          const hit = scanValue(value[k], `${path}.${k}`);
+          if (hit) return hit;
+        }
+      }
+      return null;
+    };
     const all = [];
     if (doc.scopes.project?.memories) all.push(...doc.scopes.project.memories);
     if (doc.scopes.global?.memories) all.push(...doc.scopes.global.memories);
     for (const m of all) {
-      if (looksLikeSecret(m.title || '') || looksLikeSecret(m.content || '')) {
+      const hit =
+        scanValue(m.title || '', 'title') ||
+        scanValue(m.content || '', 'content') ||
+        scanValue(m.tags || [], 'tags') ||
+        scanValue(m.metadata || {}, 'metadata') ||
+        scanValue(m.provenance || {}, 'provenance');
+      if (hit) {
         process.stderr.write(
-          `error: refusing to import — memory ${m.id} matches a known credential shape. ` +
+          `error: refusing to import — memory ${m.id}.${hit} matches a known credential shape. ` +
             `Set KIMI_MEMORY_SECRET_SCAN=off to bypass for fixture imports.\n`,
         );
         process.exit(1);
@@ -819,6 +852,11 @@ function cmdAcl(args) {
     process.stderr.write(`error: unknown acl subcommand: ${sub}\n`);
     process.exit(1);
   } catch (e) {
+    // Ensure the cached SQLite handle is released before the throw
+    // bubbles to main(). The outer catch in main() also closes every
+    // handle, but closing here keeps the throw path narrow so a
+    // caller that catches at this layer doesn't leak the handle.
+    // (Audit fix M12.)
     try {
       closeDb();
     } catch {

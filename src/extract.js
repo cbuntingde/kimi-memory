@@ -52,6 +52,32 @@ const SECRET_PATTERNS = [
   /Authorization\s*:\s*Bearer\s+[A-Za-z0-9_.-]{20,}/i,
 ];
 
+// Build the regex source for the provider-key patterns out of the
+// shared `SECRET_PATTERNS` constant. The previous shape redeclared
+// the same alternation inline — a new cloud-provider token added to
+// `SECRET_PATTERNS` was silently missed by `redactSecrets`, so a
+// credential of that shape was scrubbed from saves via
+// `looksLikeSecret` but still shipped to the LLM in the auto-
+// extract prompt. (Server audit finding #6.)
+function providerKeyAlternation() {
+  const list = [];
+  for (const p of SECRET_PATTERNS) {
+    const src = p.source;
+    // Skip the provider-key patterns we want to merge. Detect by
+    // opening character of the regex source: every provider-key
+    // pattern starts with `\b` followed by an alphanumeric token
+    // shape (sk-, sk-ant-, xox…-, AKIA…, ghp_…, github_pat_…,
+    // glpat-…, eyJ…). Patterns that begin with `-----BEGIN` or the
+    // generic key= / Authorization header are kept separately
+    // because their match semantics differ (block vs substring).
+    if (src.startsWith('\\b') && /\\b[A-Za-z0-9]+/.test(src)) list.push(src);
+  }
+  // Deduplicate while keeping insertion order.
+  return [...new Set(list)].join('|');
+}
+const PROVIDER_KEY_RE_SOURCE = providerKeyAlternation();
+const REDACTED_PROVIDER_KEY_RE = new RegExp(`\\b(?:${PROVIDER_KEY_RE_SOURCE})\\b`, 'g');
+
 // Returns true if the given text appears to contain a secret. Used
 // to filter auto-extracted candidate memories so a misbehaving model
 // reply does not persist a credential into the durable store.
@@ -74,10 +100,7 @@ export function redactSecrets(text) {
   if (typeof text !== 'string') return '';
   if (!text) return '';
   let out = text;
-  out = out.replace(
-    /\b(?:sk-[A-Za-z0-9]{20,}|sk-ant-[A-Za-z0-9-]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|AKIA[0-9A-Z]{16}|ghp_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{40,}|glpat-[A-Za-z0-9_-]{20,}|eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]{10,})\b/g,
-    '[REDACTED_PROVIDER_KEY]',
-  );
+  out = out.replace(REDACTED_PROVIDER_KEY_RE, '[REDACTED_PROVIDER_KEY]');
   out = out.replace(
     /-----BEGIN [A-Z ]*?(?:PRIVATE|OPENSSH PRIVATE) KEY-----[\s\S]*?-----END [A-Z ]*?PRIVATE KEY-----/g,
     '[REDACTED_PEM_BLOCK]',
@@ -121,7 +144,8 @@ async function detectProjectMetadata(cwd) {
   try {
     const pkgPath = path.join(cwd, 'package.json');
     const pkgText = await fs.readFile(pkgPath, 'utf8');
-    const pkg = safeJsonParse(pkgText).ok ? safeJsonParse(pkgText).value : null;
+    const pkgParsed = safeJsonParse(pkgText);
+    const pkg = pkgParsed.ok ? pkgParsed.value : null;
     if (!pkg || typeof pkg !== 'object') return null;
     const scripts = pkg.scripts && typeof pkg.scripts === 'object' ? pkg.scripts : {};
     out.buildCommand = asString(scripts.build) || null;
@@ -147,7 +171,8 @@ async function detectProjectMetadata(cwd) {
   try {
     const tsPath = path.join(cwd, 'tsconfig.json');
     const tsText = await fs.readFile(tsPath, 'utf8');
-    const ts = safeJsonParse(tsText).ok ? safeJsonParse(tsText).value : null;
+    const tsParsed = safeJsonParse(tsText);
+    const ts = tsParsed.ok ? tsParsed.value : null;
     if (
       ts &&
       typeof ts === 'object' &&
@@ -245,12 +270,27 @@ function buildExtractionPrompt(transcript, existingTitles, projectMeta) {
     existingTitles && existingTitles.length
       ? `\nFor dedup, here are titles already in this project's memory (avoid repeating these):\n- ${existingTitles.slice(0, 50).join('\n- ')}\n`
       : '';
+  // Defensive JSON.stringify for project metadata: a caller that
+  // passes a projectMeta with a circular reference or a BigInt would
+  // otherwise throw out of `buildExtractionPrompt` and turn the
+  // auto-extract path into a hard error. `detectProjectMetadata`
+  // only produces primitive data, so today this is latent — but
+  // the prompt shape is part of the contract and `JSON.stringify`
+  // failures should fall back to a safe-default literal rather
+  // than crashing the Stop hook. (Audit fix BUG-15.)
+  const safeStringify = (v) => {
+    try {
+      return JSON.stringify(v, null, 2);
+    } catch {
+      return '{}';
+    }
+  };
   // Project metadata is serialised JSON pulled from manifest files in
   // the active project. Redact it too — a secret-bearing build script
   // would otherwise leave the machine unchanged while a credential
   // copy ships to the LLM. (Audit finding F-003.)
   const metaLine = projectMeta
-    ? `\nProject metadata (from manifest files):\n${redactSecrets(JSON.stringify(projectMeta, null, 2)).slice(0, MAX_INPUT_CHARS)}\n`
+    ? `\nProject metadata (from manifest files):\n${redactSecrets(safeStringify(projectMeta)).slice(0, MAX_INPUT_CHARS)}\n`
     : '';
   return {
     system: EXTRACT_SYSTEM_PROMPT,

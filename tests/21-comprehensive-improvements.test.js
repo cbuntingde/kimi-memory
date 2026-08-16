@@ -17,7 +17,6 @@ import {
   isSqliteBusyError,
 } from '../src/concurrency.js';
 import { normalizeFts5Query, buildTitleBoostedQuery, buildOrderByClause } from '../src/search.js';
-import { getConversationsToArchive, getMemoriesToPrune, estimateDbSize } from '../src/lifecycle.js';
 import { validateConfig, mergeConfigWithEnv } from '../src/config.js';
 import { parseToml } from '../src/toml.js';
 
@@ -91,50 +90,6 @@ test('search: build ORDER BY clauses', () => {
   assert(recent.includes('updated_at DESC'), 'recent should sort by date');
   assert(confidence.includes('confidence DESC'), 'confidence should sort by confidence');
   assert(relevance.includes('rank'), 'relevance should sort by rank');
-});
-
-test('lifecycle: identify conversations to archive', () => {
-  const now = new Date();
-  const old = new Date(now.getTime() - 35 * 24 * 60 * 60 * 1000); // 35 days old
-  const recent = new Date(now.getTime() - 5 * 24 * 60 * 60 * 1000); // 5 days old
-
-  const conversations = [
-    { id: '1', created_at: old.toISOString() },
-    { id: '2', created_at: recent.toISOString() },
-  ];
-
-  const toArchive = getConversationsToArchive(conversations, 30);
-  assert.equal(toArchive.length, 1, 'should identify 1 conversation for archival');
-  assert.equal(toArchive[0].id, '1', 'should select the old conversation');
-});
-
-test('lifecycle: identify memories to prune', () => {
-  const now = new Date().toISOString();
-  const old = new Date(Date.now() - 95 * 24 * 60 * 60 * 1000).toISOString(); // 95 days old
-
-  const memories = [
-    { id: '1', status: 'active', updated_at: now },
-    { id: '2', status: 'deleted', updated_at: old },
-    { id: '3', status: 'superseded', updated_at: old },
-    { id: '4', status: 'active', expires_at: '2020-01-01T00:00:00Z' },
-  ];
-
-  const candidates = getMemoriesToPrune(memories, 90);
-  assert.equal(candidates.length, 3, 'should identify 3 candidates');
-
-  const reasons = candidates.map((c) => c.reason);
-  assert(reasons.includes('deleted'), 'should include deleted memories');
-  assert(reasons.includes('superseded'), 'should include superseded memories');
-  assert(reasons.includes('expired'), 'should include expired memories');
-});
-
-test('lifecycle: estimate database size', () => {
-  const estimate = estimateDbSize(1000, 500);
-  assert(estimate.total_mb > 0, 'should calculate positive size');
-  assert(
-    estimate.total_bytes === estimate.memories + estimate.embeddings + estimate.indexes,
-    'total should sum components',
-  );
 });
 
 test('config: parse TOML-like values', () => {

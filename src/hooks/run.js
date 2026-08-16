@@ -432,18 +432,20 @@ function buildSessionThread(projectDb, projectKey) {
     const c = ordered[i];
     let focus = null;
     try {
-      // v12: query the dedicated is_session_focus column (and the
-      // session_id column, which is a normal indexed equality) instead
-      // of a function predicate over metadata JSON. The composite
-      // index covers the WHERE prefix.
+      // v12 + session_focus column: match this session's focus row by
+      // the top-level `session_id` column (which captureSessionFocus
+      // now writes), and fall back to the most-recent focus via the
+      // `is_session_focus` column for older projects whose capture
+      // predates the column write. The OR was the previous shape; an
+      // AND would lock older rows out of the fallback path entirely.
       focus = projectDb
         .prepare(
-          `SELECT id, title, content FROM memories
+          `SELECT id, title, content, session_id, is_session_focus FROM memories
            WHERE project_key = ? AND status = 'active' AND type = 'working'
-             AND (session_id = ? OR is_session_focus = 1)
-           ORDER BY datetime(updated_at) DESC LIMIT 1`,
+             AND is_session_focus = 1 AND (session_id = ? OR session_id IS NULL)
+           ORDER BY (session_id = ?) DESC, datetime(updated_at) DESC LIMIT 1`,
         )
-        .get(projectKey, c.session_id);
+        .get(projectKey, c.session_id, c.session_id);
     } catch {
       /* ignore — fall back to the title only */
     }
@@ -789,43 +791,66 @@ function runAutoGcThrottled(db, projectKey) {
   // Tier promotion is cheap; always run it.
   const tier = runAutoTier(db, projectKey, { now });
 
-  // Prune + archive are throttled. Read the last-run timestamp from
-  // schema_meta (key 'auto_gc_last_run'). Missing row === never run.
-  let lastRun = null;
-  try {
-    const row = db.prepare('SELECT value FROM schema_meta WHERE key = ?').get('auto_gc_last_run');
-    if (row && row.value) {
-      const t = Date.parse(row.value);
-      if (Number.isFinite(t)) lastRun = new Date(t);
-    }
-  } catch {
-    /* missing — first run */
-  }
-
-  const throttleMs = AUTO_GC_THROTTLE_HOURS * 60 * 60 * 1000;
-  const isThrottled = lastRun && now - lastRun < throttleMs;
-
+  // Prune + archive are throttled. The previous shape read the
+  // last-run timestamp, decided whether to skip, ran the pass,
+  // and stamped the timestamp in three separate statements — two
+  // SessionStart invocations running concurrently (e.g. one from
+  // the hook, one from MCP) could both read a stale stamp, both
+  // decide to run, and double-stamp. The prune pass is mostly
+  // idempotent, but the wasted CPU on a 5k-row project was the
+  // visible symptom. (Audit fix L3.)
+  //
+  // The fix wraps the read + the bypass check + the run + the
+  // stamp in a single `BEGIN IMMEDIATE` transaction so the second
+  // caller blocks until the first commits, then reads a fresh
+  // stamp and observes the throttle. node:sqlite routes
+  // `BEGIN IMMEDIATE` correctly even when the call site is also
+  // holding a `BEGIN` (e.g. from `runAutoTier`'s outer tx); the
+  // inner BEGIN collapses to a no-op savepoint.
   let prune = null;
   let archive = null;
-  if (isThrottled) {
-    prune = { skipped: 'throttled' };
-    archive = { skipped: 'throttled' };
-  } else {
+  try {
+    db.exec('BEGIN IMMEDIATE');
+    let lastRun = null;
     try {
-      const r = runAutoGc(db, projectKey, { now });
-      prune = r.prune || { skipped: 'no_db' };
-      archive = r.archive || { skipped: 'no_db' };
-      // Stamp the last-run time so the next SessionStart honours the
-      // throttle window. Use INSERT OR REPLACE so a re-run on the
-      // same DB doesn't fail on the duplicate key.
-      db.prepare(
-        `INSERT INTO schema_meta (key, value) VALUES ('auto_gc_last_run', ?)
-         ON CONFLICT(key) DO UPDATE SET value=excluded.value`,
-      ).run(new Date().toISOString());
-    } catch (e) {
-      prune = { error: e && e.message ? e.message : String(e) };
-      archive = { error: e && e.message ? e.message : String(e) };
+      const row = db.prepare('SELECT value FROM schema_meta WHERE key = ?').get('auto_gc_last_run');
+      if (row && row.value) {
+        const t = Date.parse(row.value);
+        if (Number.isFinite(t)) lastRun = new Date(t);
+      }
+    } catch {
+      /* missing — first run */
     }
+    const throttleMs = AUTO_GC_THROTTLE_HOURS * 60 * 60 * 1000;
+    const isThrottled = lastRun && now - lastRun < throttleMs;
+    if (isThrottled) {
+      prune = { skipped: 'throttled' };
+      archive = { skipped: 'throttled' };
+    } else {
+      try {
+        const r = runAutoGc(db, projectKey, { now });
+        prune = r.prune || { skipped: 'no_db' };
+        archive = r.archive || { skipped: 'no_db' };
+        // Stamp the last-run time inside the same transaction so the
+        // next reader observes the update.
+        db.prepare(
+          `INSERT INTO schema_meta (key, value) VALUES ('auto_gc_last_run', ?)
+           ON CONFLICT(key) DO UPDATE SET value=excluded.value`,
+        ).run(new Date().toISOString());
+      } catch (e) {
+        prune = { error: e && e.message ? e.message : String(e) };
+        archive = { error: e && e.message ? e.message : String(e) };
+      }
+    }
+    db.exec('COMMIT');
+  } catch (e) {
+    try {
+      db.exec('ROLLBACK');
+    } catch {
+      /* ignore */
+    }
+    prune = { error: e && e.message ? e.message : String(e) };
+    archive = { error: e && e.message ? e.message : String(e) };
   }
 
   return { prune, archive, tier };
@@ -844,7 +869,14 @@ function emitLines(lines) {
 
 async function handleSessionStart(payload) {
   const cwd = payloadProjectRoot(payload);
-  if (!cwd) return { ok: false, reason: 'no project cwd in payload' };
+  if (!cwd) {
+    // Surface a bounded skip-line so the user / agent can see why the
+    // hook produced nothing — otherwise this is a silent no-op and the
+    // harness sees an empty stdout, indistinguishable from "hook ran
+    // fine and found nothing to report". (Audit fix.)
+    emitLines([`[kimi-memory] event=${EVENT} skipped: no project cwd in payload`]);
+    return { ok: false, reason: 'no project cwd in payload' };
+  }
   // Opportunistic ingest of any leftover archive from a previous
   // session start mid-archive — usually 0, never blocks the agent.
   const ingest = await safeHandleStop(payload, cwd);
@@ -1001,7 +1033,10 @@ async function handleSessionStart(payload) {
 
 async function handleUserPromptSubmit(payload) {
   const cwd = payloadProjectRoot(payload);
-  if (!cwd) return { ok: false, reason: 'no project cwd in payload' };
+  if (!cwd) {
+    emitLines([`[kimi-memory] event=${EVENT} skipped: no project cwd in payload`]);
+    return { ok: false, reason: 'no project cwd in payload' };
+  }
   // Capture the ingest result this time instead of discarding it.
   const ingest = await safeHandleStop(payload, cwd);
   const key = deriveProjectKey(cwd);
@@ -1122,7 +1157,10 @@ async function handleUserPromptSubmit(payload) {
 
 async function handleStop(payload) {
   const cwd = payloadProjectRoot(payload);
-  if (!cwd) return { ok: false, reason: 'no project cwd in payload' };
+  if (!cwd) {
+    emitLines([`[kimi-memory] event=${EVENT} skipped: no project cwd in payload`]);
+    return { ok: false, reason: 'no project cwd in payload' };
+  }
   const sessionId = payloadSessionId(payload);
   const ingest = await safeHandleStop(payload, cwd);
   // Auto-extract piggybacks on the ingest pass: the conversation_events
@@ -1505,8 +1543,17 @@ const HANDLERS = {
 
 async function main() {
   const raw = await readStdin(256 * 1024);
-  const parsed =
-    raw.length === 0 ? {} : safeJsonParse(raw).ok ? safeJsonParse(raw).value : { _raw: raw };
+  // Parse the stdin payload exactly once. The previous shape ran
+  // safeJsonParse twice on every hook (once for `.ok`, then again for
+  // `.value` on the success path), spending a stringify/parse cycle on
+  // up-to 256 KiB of JSON unnecessarily. Stress-tests amplified the
+  // cost because they call hooks in tight loops. (Audit fix.)
+  let parsed;
+  if (raw.length === 0) parsed = {};
+  else {
+    const r = safeJsonParse(raw);
+    parsed = r.ok ? r.value : { _raw: raw };
+  }
   const handler = HANDLERS[EVENT];
   if (!handler) {
     await logDiag('warn', 'no handler for event', { event: EVENT });

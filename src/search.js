@@ -68,12 +68,17 @@ export function normalizeFts5Query(input) {
     .split(/\s+/)
     .filter(Boolean);
 
+  // Quoted-phrase helper: doubled `"` to escape internal quotes; the
+  // resulting fragment is safe to drop into an FTS5 MATCH expression.
+  // (Audit fix M1 — the same one-liner appeared twice in this file.)
+  const q = (s) => `"${String(s).replace(/"/g, '""')}"`;
+
   const parts = [];
-  for (const t of stripped) parts.push(`"${t.replace(/"/g, '""')}"`);
-  for (const q of quoted) parts.push(q);
+  for (const t of stripped) parts.push(q(t));
+  for (const quotedPhrase of quoted) parts.push(quotedPhrase);
 
   const positive = parts.join(' OR ');
-  const negative = negated.map((n) => `"${n.replace(/"/g, '""')}"`).join(' NOT ');
+  const negative = negated.map((n) => q(n)).join(' NOT ');
   if (negative) {
     return positive ? `${positive} NOT ${negative}` : `"*" NOT ${negative}`;
   }
@@ -113,7 +118,7 @@ export function buildTitleBoostedQuery(input) {
 export function buildOrderByClause(sort) {
   switch (sort) {
     case 'recent':
-      return 'rank ASC, priority DESC, updated_at DESC';
+      return 'updated_at DESC';
     case 'oldest':
       return 'updated_at ASC';
     case 'confidence':

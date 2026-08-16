@@ -23,6 +23,15 @@ function ensureLogDir() {
 }
 
 // Append a JSON-line record. Asynchronous but fail-safe.
+//
+// Rotation: when the log file is near MAX_LOG_SIZE the current file
+// is renamed to a backup. The backup name mixes the ISO timestamp
+// (millisecond precision is not unique under burst writes) with a
+// process-local monotonic counter and a random suffix so two rotations
+// inside the same millisecond on Windows (where `fs.rename` to an
+// existing target throws `EEXIST`) cannot collide. (Audit fix
+// BUG-9.)
+let rotationCounter = 0;
 async function appendLog(record) {
   ensureLogDir();
   try {
@@ -32,7 +41,15 @@ async function appendLog(record) {
       const stat = await fs.stat(HOOKS_LOG);
       if (stat.size + line.length > MAX_LOG_SIZE) {
         const timestamp = nowIso().replace(/[:.]/g, '-');
-        const backup = path.join(LOG_DIR, `hooks-${timestamp}.log`);
+        const seq = (++rotationCounter).toString(36);
+        // Append a per-call random suffix so simultaneous rotations
+        // from concurrent hook invocations / MCP handlers never
+        // target the same backup path. process is cached in the
+        // require cache; importing it lazily keeps the diagnostics
+        // module zero-deps at module-load time.
+        const { randomBytes } = await import('node:crypto');
+        const suffix = randomBytes(3).toString('hex');
+        const backup = path.join(LOG_DIR, `hooks-${timestamp}-${seq}-${suffix}.log`);
         await fs.rename(HOOKS_LOG, backup);
       }
     } catch (err) {

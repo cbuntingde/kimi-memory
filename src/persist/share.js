@@ -119,6 +119,13 @@ export function shareMemory(db, projectKey, ids, opts = {}) {
           .prepare('SELECT * FROM memories WHERE id=? AND project_key=?')
           .get(id, projectKey);
         if (!row) continue;
+        // Bound either to the freshly-inserted source row (when the
+        // INSERT actually wrote) or to a re-read of the existing
+        // shared row (when INSERT OR IGNORE no-op'd because the id
+        // was already there). Used by the FTS5 re-stamp below to
+        // keep the FTS index aligned with the durable row.
+        // (Audit fix M1.)
+        let rowAfterMove = row;
         // Insert into shared DB with project_key='_shared', preserving
         // every column the schema knows about. Idempotent via the row
         // PRIMARY KEY (id); if a row with the same id is already in
@@ -126,7 +133,7 @@ export function shareMemory(db, projectKey, ids, opts = {}) {
         // so the caller observes a "move" — the target stays at the
         // version it already had, which is the safer failure mode.
         try {
-          sharedDb
+          const ins = sharedDb
             .prepare(
               `INSERT OR IGNORE INTO memories (
                 id, project_key, type, title, content, tags, metadata, provenance,
@@ -176,6 +183,30 @@ export function shareMemory(db, projectKey, ids, opts = {}) {
               row.tier,
               row.persona_id,
             );
+          // INSERT OR IGNORE on a UNIQUE (PRIMARY KEY) id no-ops when
+          // the shared row already exists; that "the target stays at
+          // the version it already had" contract is documented above.
+          // The previous shape unconditionally re-stamped the FTS5
+          // row from the *source* row's content, even on a no-op
+          // INSERT — which left the FTS index pointing at content
+          // that no longer exists in `memories`. Audit fix M1.
+          // Re-read the row we actually landed so the FTS index
+          // matches the durable row.
+          if (ins.changes === 0) {
+            const existing = sharedDb
+              .prepare(
+                "SELECT type, title, content, tags FROM memories WHERE id=? AND project_key='_shared'",
+              )
+              .get(id);
+            if (!existing) {
+              throw new Error(
+                `shareMemory: insert OR IGNORE produced no row and no existing row for ${id}`,
+              );
+            }
+            rowAfterMove = existing;
+          } else {
+            rowAfterMove = row;
+          }
         } catch (e) {
           // Surface as a per-id error so the caller can decide; the
           // shared DB write should not silently disappear.
@@ -184,13 +215,26 @@ export function shareMemory(db, projectKey, ids, opts = {}) {
           );
         }
         // Re-stamp FTS in the shared DB so the move is visible to
-        // recall. memories_fts mirrors memories 1:1 by id.
+        // recall. The FTS columns mirror the durable row's columns
+        // — when the INSERT was a no-op, we use the existing
+        // row's content above so the index never points at content
+        // the row no longer carries. (Audit fix L2: write the tags
+        // column as space-joined tokens, not the JSON literal, to
+        // match what `saveMemory` writes for the project DB.)
+        const ftsSrc = rowAfterMove;
+        let tagTokens = '';
+        try {
+          const tagArr = JSON.parse(ftsSrc.tags || '[]');
+          tagTokens = Array.isArray(tagArr) ? tagArr.join(' ') : '';
+        } catch {
+          /* ignore — keep the empty token string */
+        }
         sharedDb.prepare('DELETE FROM memories_fts WHERE id=?').run(id);
         sharedDb
           .prepare(
             'INSERT INTO memories_fts (id, project_key, type, title, content, tags) VALUES (?, ?, ?, ?, ?, ?)',
           )
-          .run(id, '_shared', row.type, row.title || '', row.content || '', row.tags || '[]');
+          .run(id, '_shared', ftsSrc.type, ftsSrc.title || '', ftsSrc.content || '', tagTokens);
         // Remove from the source DB (memories + FTS). The source
         // DELETE is the point of the move — keep the shared row even
         // if the FTS delete errors, since the row itself is the

@@ -141,16 +141,31 @@ function cosine(a, b) {
 // overkill for the working set sizes we target (≤200 memories per
 // project). Single-link with a hard cap on cluster size avoids the
 // "everything is one cluster" failure mode of pure transitive closure.
+//
+// Cost: the candidate list is bounded by CONSOLIDATE_INPUT_CAP (=640),
+// so the O(N²) cosine loop is bounded. We pre-decode every embedding
+// once before the loop — the previous shape re-decoded the same BLOB
+// for every (i, j) pair, ~200k decodes for N=640 vs the 640 a single
+// pass requires. (Audit fix.)
 function clusterMemories(memories, { decodeEmbedding }) {
   const clusters = [];
   const visited = new Set();
+
+  // Pre-decode each BLOB into a Float32Array once. Skips BLOBs that
+  // decode to nothing (corrupt size, NaN/Inf) so the inner loops only
+  // see valid vectors.
+  const decoded = new Map();
+  for (const m of memories) {
+    const v = decodeEmbedding(m.embedding);
+    if (v) decoded.set(m.id, v);
+  }
 
   for (let i = 0; i < memories.length; i++) {
     if (visited.has(memories[i].id)) continue;
     if (clusters.length >= CONSOLIDATE_MAX_CLUSTERS) break;
 
     const seed = memories[i];
-    const seedVec = decodeEmbedding(seed.embedding);
+    const seedVec = decoded.get(seed.id);
     if (!seedVec) continue;
 
     // Single-link expand: every other memory that is cosine ≥
@@ -160,7 +175,7 @@ function clusterMemories(memories, { decodeEmbedding }) {
     for (let j = i + 1; j < memories.length; j++) {
       if (visited.has(memories[j].id)) continue;
       const other = memories[j];
-      const otherVec = decodeEmbedding(other.embedding);
+      const otherVec = decoded.get(other.id);
       if (!otherVec) continue;
       if (cosine(seedVec, otherVec) < CONSOLIDATE_THRESHOLD) continue;
       if (tagOverlap(seed.tagTokens, other.tagTokens) < MIN_TAG_OVERLAP) continue;
@@ -189,10 +204,23 @@ function buildConclusionBody(cluster) {
       .split(/\r?\n/)
       .map((line) => line.replace(/\s+/g, ' ').trim())
       .find((line) => line.length > 0);
-    const snippet = first ? ` — ${first.length > 100 ? first.slice(0, 100) + '…' : first}` : '';
+    // (Audit fix BUG-12) — slice the snippet on a code-point boundary.
+    const snippet = first
+      ? ` — ${first.length > 100 ? sliceCodePointSafe(first, 100) + '…' : first}`
+      : '';
     lines.push(`- ${title}${snippet}`);
   }
   return lines.join('\n');
+}
+
+// Slice a string on a code-point boundary so a surrogate pair is
+// never split mid-emoji. Mirrors `search.js#truncate` and the helper
+// in session-focus.js#sliceCodePointSafe. (Audit fix BUG-12.)
+function sliceCodePointSafe(s, n) {
+  if (!s || s.length <= n) return s;
+  let cut = n;
+  while (cut > 0 && (s.charCodeAt(cut - 1) & 0xfc00) === 0xdc00) cut -= 1;
+  return s.slice(0, cut);
 }
 
 // Build the conclusion title. Length-capped so it stays under the
@@ -201,7 +229,7 @@ function buildConclusionBody(cluster) {
 function buildConclusionTitle(cluster) {
   const titles = cluster.map((m) => m.title || '(untitled)').slice(0, 3);
   const head = titles.join(' / ');
-  return head.length > 80 ? head.slice(0, 80) + '…' : `Synthesis: ${head}`;
+  return head.length > 80 ? `Synthesis: ${sliceCodePointSafe(head, 80)}…` : `Synthesis: ${head}`;
 }
 
 // Determine the union of tags from a cluster. Used as the conclusion
@@ -372,8 +400,17 @@ export async function runConsolidate({
       if (!tightVec) {
         isTight = false;
       } else {
+        // Reuse the pre-decoded vectors where possible. The first
+        // sibling's blob is decoded here (the cluster loop above
+        // discards them); siblings 1..N reach for the freshly-decoded
+        // vector first and fall back to a single decode if the
+        // earlier pass skipped it (corrupt BLOB).
+        const tight = cluster[0];
         for (let i = 1; i < cluster.length; i++) {
-          const otherVec = decodeEmbeddingImpl(cluster[i].embedding);
+          const sibling = cluster[i];
+          const otherVec =
+            (tight.embedding === sibling.embedding && tight.embedding ? tightVec : null) ||
+            decodeEmbeddingImpl(sibling.embedding);
           if (!otherVec) {
             isTight = false;
             break;

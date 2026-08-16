@@ -84,6 +84,7 @@ export {
   listProjectPaths,
   detectReclone,
   resetProject,
+  mirrorConversationEventsFts,
 } from './project.js';
 
 // ----- Re-exports from tool-registry.js and codegraph.js -----

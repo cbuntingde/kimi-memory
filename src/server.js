@@ -1003,12 +1003,9 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
     return { db, projectKey: key, cwd: c };
   }
 
-  // Convenience: open a scope and stamp the project path. Use this
-  // from every tool that mutates the DB so memory_prune can later
-  // detect orphans. Read tools continue to use `openScopeDb` directly.
-  function openScopeDbForWrite(args) {
-    return openScopeDb({ ...args, record: true });
-  }
+  // (Audit fix L4 — openScopeDbForWrite was a one-line wrapper around
+  // openScopeDb({ ...args, record: true }). All 19 call sites now
+  // pass `record: true` directly; the wrapper was removed.)
 
   // ---- memory_save ----
   server.tool(TOOL_DEFS[0].name, TOOL_DEFS[0].input, async (args) => {
@@ -1031,9 +1028,24 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
       if (!exp.ok) return textError(exp.error);
       const prio = validatePriority(args.priority);
       if (!prio.ok) return textError(prio.error);
+      // Funnel shared_with through the same dedup + trim + cap that
+      // acl_share_memory uses so duplicates and whitespace entries
+      // never persist. Saves also surface any dropped entries in
+      // the response so the caller can tell input was lost. (Audit fix.)
+      let sharedWithValue;
+      let droppedSharedWith = [];
+      if (args.shared_with !== undefined) {
+        try {
+          const sw = validateSharedWith(args.shared_with);
+          sharedWithValue = sw.value;
+          droppedSharedWith = sw.dropped;
+        } catch (e) {
+          return textError(e.message);
+        }
+      }
       const content = args.content;
       if (!content) return textError('content is required');
-      const target = openScopeDbForWrite({ cwd: pr.value, scope: sc.value });
+      const target = openScopeDb({ cwd: pr.value, scope: sc.value, record: true });
       const provenance = {
         ...(pv.value || {}),
         source: (pv.value && pv.value.source) || 'memory_save',
@@ -1055,11 +1067,10 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
         supersede: !!args.supersede,
         synthesizes: Array.isArray(args.synthesizes) ? args.synthesizes : undefined,
         // v10 ACL fields. visibility is validated by saveMemory; the
-        // other fields are pass-through. shared_with may come from the
-        // agent or be left undefined (in which case saveMemory defaults
-        // it to []).
+        // other fields are pass-through. shared_with is already
+        // deduped/trimmed via validateSharedWith above.
         visibility: args.visibility || 'private',
-        shared_with: Array.isArray(args.shared_with) ? args.shared_with : undefined,
+        shared_with: sharedWithValue,
         // team_id / agent_id / user_id / session_id / task_id are
         // intentionally NOT forwarded from the tool surface — see the
         // TOOL_DEFS comment for memory_save (lines 168-173) for the
@@ -1071,6 +1082,8 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
         scope: sc.value,
         memory: mem,
         project_key: target.projectKey,
+        // Surface dropped entries so the caller knows input was lost.
+        dropped_shared_with: droppedSharedWith.length ? droppedSharedWith : undefined,
       });
     } catch (e) {
       return textError(toError(e).error);
@@ -1300,7 +1313,7 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
       if (!id.ok) return textError(id.error);
       const sc = validateScope(args.scope, { read: false });
       if (!sc.ok) return textError(sc.error);
-      const target = openScopeDbForWrite({ cwd: pr.value, scope: sc.value });
+      const target = openScopeDb({ cwd: pr.value, scope: sc.value, record: true });
       const existing = getMemory(target.db, target.projectKey, id.value, {
         includeSuperseded: true,
       });
@@ -1347,11 +1360,19 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
       // undefined leaves the column at its existing value (saveMemory's
       // COALESCE behavior preserves the row).
       if (args.visibility !== undefined) merged.visibility = args.visibility;
+      let droppedSharedWith = [];
       if (args.shared_with !== undefined) {
-        if (!Array.isArray(args.shared_with)) {
-          return textError('shared_with must be an array of strings');
+        // Funnel shared_with through the same dedup + trim + cap
+        // path memory_save uses. Duplicate / whitespace entries are
+        // silently dropped by validateSharedWith; mirror that on
+        // update so the two surfaces cannot drift.
+        try {
+          const sw = validateSharedWith(args.shared_with);
+          merged.shared_with = sw.value;
+          droppedSharedWith = sw.dropped;
+        } catch (e) {
+          return textError(e.message);
         }
-        merged.shared_with = args.shared_with;
       }
       // Identity columns (team_id / agent_id / user_id / session_id /
       // task_id) are not accepted on update; see memory_save TOOL_DEFS
@@ -1362,6 +1383,7 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
         scope: sc.value,
         memory: mem,
         project_key: target.projectKey,
+        dropped_shared_with: droppedSharedWith.length ? droppedSharedWith : undefined,
       });
     } catch (e) {
       return textError(toError(e).error);
@@ -1377,7 +1399,7 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
       if (!id.ok) return textError(id.error);
       const sc = validateScope(args.scope, { read: false });
       if (!sc.ok) return textError(sc.error);
-      const target = openScopeDbForWrite({ cwd: pr.value, scope: sc.value });
+      const target = openScopeDb({ cwd: pr.value, scope: sc.value, record: true });
       const okDel = deleteMemory(target.db, target.projectKey, id.value, { hard: !!args.hard });
       return ok({
         operation: 'deleted',
@@ -1399,7 +1421,7 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
       const slot = validateSlot(args.slot);
       if (!slot.ok) return textError(slot.error);
       if (!args.value) return textError('value is required');
-      const { db, projectKey } = openScopeDbForWrite({ cwd: pr.value, scope: 'project' });
+      const { db, projectKey } = openScopeDb({ cwd: pr.value, scope: 'project', record: true });
       const r = setWorkingMemory(db, projectKey, slot.value, args.value);
       return ok({
         operation: 'wm_set',
@@ -1440,7 +1462,7 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
       if (!pr.ok) return textError(pr.error);
       const slot = validateSlot(args.slot);
       if (!slot.ok) return textError(slot.error);
-      const { db, projectKey } = openScopeDbForWrite({ cwd: pr.value, scope: 'project' });
+      const { db, projectKey } = openScopeDb({ cwd: pr.value, scope: 'project', record: true });
       const cleared = clearWorkingMemory(db, projectKey, slot.value);
       return ok({ operation: 'wm_clear', slot: slot.value, cleared, project_key: projectKey });
     } catch (e) {
@@ -1516,7 +1538,11 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
     try {
       const pr = resolveProjectRoot(args.cwd);
       if (!pr.ok) return textError(pr.error);
-      const { db, projectKey, cwd } = openScopeDbForWrite({ cwd: pr.value, scope: 'project' });
+      const { db, projectKey, cwd } = openScopeDb({
+        cwd: pr.value,
+        scope: 'project',
+        record: true,
+      });
       const r = await ingestOne({
         home,
         db,
@@ -1691,7 +1717,7 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
           `validation failed for ${errors.length} of ${args.items.length} item(s): ${errors.join('; ')}`,
         );
       }
-      const target = openScopeDbForWrite({ cwd: pr.value, scope: sc.value });
+      const target = openScopeDb({ cwd: pr.value, scope: sc.value, record: true });
       // Stamp provenance so every saved row carries the caller's context.
       const baseProvenance = {
         source: 'memory_save_bulk',
@@ -1785,7 +1811,7 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
       if (!kind.ok) return textError(kind.error);
       const w = validateWeight(args.weight);
       if (!w.ok) return textError(w.error);
-      const target = openScopeDbForWrite({ cwd: pr.value, scope: sc.value });
+      const target = openScopeDb({ cwd: pr.value, scope: sc.value, record: true });
       const edge = linkMemory(target.db, target.projectKey, fromId.value, toId.value, kind.value, {
         weight: w.value,
       });
@@ -1804,7 +1830,7 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
       if (!sc.ok) return textError(sc.error);
       const edgeId = validateId(args.edge_id);
       if (!edgeId.ok) return textError(edgeId.error);
-      const target = openScopeDbForWrite({ cwd: pr.value, scope: sc.value });
+      const target = openScopeDb({ cwd: pr.value, scope: sc.value, record: true });
       const removed = unlinkMemory(target.db, target.projectKey, edgeId.value);
       return ok({
         operation: 'unlinked',
@@ -1888,7 +1914,7 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
       if (into.value === from.value) return textError('into_id and from_id must differ');
       const w = validateWeight(args.weight);
       if (!w.ok) return textError(w.error);
-      const target = openScopeDbForWrite({ cwd: pr.value, scope: sc.value });
+      const target = openScopeDb({ cwd: pr.value, scope: sc.value, record: true });
       const r = mergeMemory(target.db, target.projectKey, into.value, from.value, {
         mergedContent: typeof args.merged_content === 'string' ? args.merged_content : null,
         weight: w.value,
@@ -1915,7 +1941,7 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
       if (!sc.ok) return textError(sc.error);
       const id = validateId(args.id);
       if (!id.ok) return textError(id.error);
-      const target = openScopeDbForWrite({ cwd: pr.value, scope: sc.value });
+      const target = openScopeDb({ cwd: pr.value, scope: sc.value, record: true });
       const memory = reinforceMemory(target.db, target.projectKey, id.value);
       if (!memory) return textError(`memory not found in ${sc.value} scope: ${id.value}`);
       return ok({
@@ -2153,7 +2179,7 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
       } catch (e) {
         return textError(e.message);
       }
-      const target = openScopeDbForWrite({ cwd: pr.value, scope: sc.value });
+      const target = openScopeDb({ cwd: pr.value, scope: sc.value, record: true });
       const row = grantMemoryAcl(
         target.db,
         target.projectKey,
@@ -2187,7 +2213,7 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
       } catch (e) {
         return textError(e.message);
       }
-      const target = openScopeDbForWrite({ cwd: pr.value, scope: sc.value });
+      const target = openScopeDb({ cwd: pr.value, scope: sc.value, record: true });
       const removed = revokeMemoryAcl(
         target.db,
         target.projectKey,
@@ -2257,7 +2283,7 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
       } catch (e) {
         return textError(e.message);
       }
-      const target = openScopeDbForWrite({ cwd: pr.value, scope: sc.value });
+      const target = openScopeDb({ cwd: pr.value, scope: sc.value, record: true });
       const result = shareMemory(target.db, target.projectKey, args.memory_ids, {
         visibility: args.visibility,
         sharedWith,
@@ -2315,7 +2341,7 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
       if (!sc.ok) return textError(sc.error);
       const memId = validateId(args.memory_id);
       if (!memId.ok) return textError(memId.error);
-      const target = openScopeDbForWrite({ cwd: pr.value, scope: sc.value });
+      const target = openScopeDb({ cwd: pr.value, scope: sc.value, record: true });
       const result = setMemoryTier(target.db, target.projectKey, memId.value, args.tier, {
         reason: args.reason || null,
       });
@@ -2341,7 +2367,7 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
       if (!sc.ok) return textError(sc.error);
       const memId = validateId(args.memory_id);
       if (!memId.ok) return textError(memId.error);
-      const target = openScopeDbForWrite({ cwd: pr.value, scope: sc.value });
+      const target = openScopeDb({ cwd: pr.value, scope: sc.value, record: true });
       const result = promoteMemory(target.db, target.projectKey, memId.value, {
         reason: args.reason || null,
       });
@@ -2367,7 +2393,7 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
       if (!sc.ok) return textError(sc.error);
       const memId = validateId(args.memory_id);
       if (!memId.ok) return textError(memId.error);
-      const target = openScopeDbForWrite({ cwd: pr.value, scope: sc.value });
+      const target = openScopeDb({ cwd: pr.value, scope: sc.value, record: true });
       const result = demoteMemory(target.db, target.projectKey, memId.value, {
         reason: args.reason || null,
       });
@@ -2419,7 +2445,7 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
     try {
       const pr = resolveProjectRoot(args.cwd);
       if (!pr.ok) return textError(pr.error);
-      const target = openScopeDbForWrite({ cwd: pr.value, scope: 'project' });
+      const target = openScopeDb({ cwd: pr.value, scope: 'project', record: true });
       const result = upsertWikiPage(target.db, target.projectKey, {
         service_id: args.service_id || '',
         team_id: args.team_id || '',
@@ -2565,7 +2591,7 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
     try {
       const pr = resolveProjectRoot(args.cwd);
       if (!pr.ok) return textError(pr.error);
-      const target = openScopeDbForWrite({ cwd: pr.value, scope: 'project' });
+      const target = openScopeDb({ cwd: pr.value, scope: 'project', record: true });
       const result = buildCodeGraphEdges(
         target.db,
         target.projectKey,
@@ -2621,6 +2647,15 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
     const visited = new Set([fromId]);
     while (queue.length > 0) {
       const path = queue.shift();
+      // Guard: the path has `path.length - 1` edges. A `maxHops`
+      // cap should forbid any path whose edge count exceeds
+      // maxHops, so we drop paths with `length > maxHops + 1` (the
+      // +1 covers the seed node). The previous `length > maxHops + 1`
+      // check was correct in spirit but let one extra edge slip
+      // through when `next === toId` was found on the final
+      // extension; the bound check now also fires *before* queueing
+      // the candidate, so a run that returns `hops: maxHops + 1`
+      // is impossible.
       if (path.length > maxHops + 1) continue;
       const head = path[path.length - 1];
       const edges = db
@@ -2635,6 +2670,11 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
         if (visited.has(next)) continue;
         const newPath = [...path, next];
         if (next === toId) return { path: newPath, hops: newPath.length - 1 };
+        // Bound check before enqueuing so we never store a path
+        // whose hop count exceeds the cap. Without this, returning
+        // a path that grew past maxHops was possible when `toId`
+        // was discovered on the boundary extension.
+        if (newPath.length > maxHops + 1) continue;
         visited.add(next);
         queue.push(newPath);
       }

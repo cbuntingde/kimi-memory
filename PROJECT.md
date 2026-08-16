@@ -134,7 +134,7 @@ answers here first.
 ## 5. Test and quality gate
 
 - **Test framework**: `node --test` (built-in Node test runner),
-  `--test-reporter=spec`. 34 numbered test files plus `_helpers.js`.
+  `--test-reporter=spec`. 38 numbered test files plus `_helpers.js`.
 - **Syntax check**: `scripts/check-syntax.js` walks `src/`, `hooks/`, and
   `tests/`, runs `node --check` on every `.js` file, reports failures
   file-by-file. Replaces the previous hand-maintained `&&`-chained list in

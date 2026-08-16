@@ -138,9 +138,61 @@ export async function extractCodeGraph(rootDir, { limit = 200 } = {}) {
   return out;
 }
 
-async function walk(rootDir, rel, out, cap) {
+// Files larger than this are skipped by extractCodeGraph. A multi-MB
+// source file would otherwise pay 5+ full regex passes over its body
+// on every SessionStart. (Audit finding H5.)
+const MAX_SYMBOL_FILE_BYTES = 1024 * 1024;
+
+// Resolve `p` to its symlink-free real path. Returns the input on any
+// error (ENOENT, EPERM, …) so the caller can still try to read it as
+// a literal path. Used by the walker's symlink guard.
+async function safeRealpath(p) {
+  try {
+    return await fs.realpath(p);
+  } catch {
+    return p;
+  }
+}
+
+// Containment check: is `child` strictly inside `parent`? Both inputs
+// are expected to already be realpath-resolved. Normalizes both paths
+// to forward slashes + lowercase on Windows so case and slash-style
+// mismatches don't produce false negatives (Windows paths are
+// case-insensitive but case-preserving). Accepts either child === parent
+// or child with any leading separator after parent.
+function normalizeForContainment(p) {
+  if (!p) return '';
+  let s = String(p).replace(/\\/g, '/');
+  // Windows: case-insensitive paths. Lowercase before comparing so
+  // `C:\Users\X` matches `c:\users\x`.
+  if (process.platform === 'win32') s = s.toLowerCase();
+  // Strip a trailing slash to avoid double-slash collisions.
+  if (s.length > 1 && s.endsWith('/')) s = s.slice(0, -1);
+  return s;
+}
+function isInside(parent, child) {
+  if (!parent || !child) return false;
+  const p = normalizeForContainment(parent);
+  const c = normalizeForContainment(child);
+  if (!p || !c) return false;
+  if (p === c) return true;
+  return c.startsWith(p + '/');
+}
+
+async function walk(rootDir, rel, out, cap, realRootArg) {
   if (out.length >= cap) return;
   const abs = rel ? path.join(rootDir, rel) : rootDir;
+  // Symlink guard: a symlink under the project root could point
+  // anywhere on disk (e.g. /etc), and node:sqlite has no sandbox.
+  // Resolve the walk root once at the top; for every directory entry
+  // we resolve symlinks and refuse anything whose realpath escapes
+  // the realpath of the project root. realRoot is passed down
+  // through recursion so each level compares against the same
+  // project root (the previous shape set realRoot = null on
+  // recursion, which made the walker return immediately).
+  // (Audit fix C1.)
+  const realRoot = realRootArg || (rel === '' ? await safeRealpath(abs) : null);
+  if (!realRoot) return;
   let entries;
   try {
     entries = await fs.readdir(abs, { withFileTypes: true });
@@ -150,11 +202,19 @@ async function walk(rootDir, rel, out, cap) {
   for (const entry of entries) {
     if (out.length >= cap) return;
     const childRel = rel ? `${rel}/${entry.name}` : entry.name;
-    if (entry.isDirectory()) {
-      // Skip noisy top-level dirs.
-      if (rel === '' && (entry.name === 'node_modules' || entry.name.startsWith('.'))) continue;
+    const childAbs = path.join(abs, entry.name);
+    if (entry.isDirectory() || entry.isSymbolicLink()) {
+      // Resolve symlinks (and plain dirs whose parent is a symlink)
+      // before deciding whether to descend. A symlink pointing
+      // outside the project root (e.g. an attacker-planted
+      // `node_modules -> /etc`) is rejected.
+      const realChild = await safeRealpath(childAbs);
+      if (!isInside(realRoot, realChild)) continue;
+      // Skip noisy top-level dirs at every depth (node_modules, dotdirs
+      // such as .git / .cache). (Audit fix BUG-14.)
       if (entry.name === 'node_modules' || entry.name.startsWith('.')) continue;
-      await walk(rootDir, childRel, out, cap);
+      if (entry.isSymbolicLink()) continue;
+      await walk(rootDir, childRel, out, cap, realRoot);
       continue;
     }
     if (!entry.isFile()) continue;
@@ -162,9 +222,17 @@ async function walk(rootDir, rel, out, cap) {
     if (ext !== '.js' && ext !== '.mjs' && ext !== '.cjs' && ext !== '.ts' && ext !== '.py') {
       continue;
     }
+    // File size cap — skip huge files before regex passes. (H5.)
+    let stat;
+    try {
+      stat = await fs.stat(childAbs);
+    } catch {
+      continue;
+    }
+    if (stat.size > MAX_SYMBOL_FILE_BYTES) continue;
     let body;
     try {
-      body = await fs.readFile(path.join(rootDir, childRel), 'utf8');
+      body = await fs.readFile(childAbs, 'utf8');
     } catch {
       continue;
     }
@@ -195,14 +263,15 @@ export function buildCodeGraphEdges(db, projectKey, files, opts = {}) {
 
   // Group memories by the symbols they touch. A "touch" is any token
   // that appears in the row's title or content and matches a symbol
-  // extracted from one of the files. We use a LIKE-based intersection
-  // for portability — full-text indexing is not available here, and
-  // the candidate set per file is small (handful of symbols).
+  // extracted from one of the files. The previous shape loaded every
+  // active memory's full row into Node memory and never used the
+  // result — the actual lookup is done via the FTS5 query inside the
+  // loop below. For a 50k-memory project this leaked ~50k row
+  // objects per SessionStart; with `extractCodeGraph` running from a
+  // hook that budgets in single-digit seconds, that leak was the
+  // failure mode. (Audit fix BUG-8.)
   let candidates = 0;
   let inserted = 0;
-  const rows = db
-    .prepare(`SELECT id, title, content FROM memories WHERE project_key = ? AND status = 'active'`)
-    .all(projectKey);
 
   const insert = db.prepare(
     `INSERT OR IGNORE INTO memory_edges (id, project_key, from_id, to_id, kind, weight, metadata, created_at)
@@ -239,8 +308,18 @@ export function buildCodeGraphEdges(db, projectKey, files, opts = {}) {
            AND m.id NOT LIKE 'wiki-%'`,
       );
       for (const sym of fileSymbols) {
-        const escaped = sym.replace(/"/g, '""');
-        const hit = ftsStmt.all(`"${escaped}"*`, projectKey);
+        // Per-symbol try/catch: a malformed FTS5 token (e.g. one that
+        // begins or ends with `"` after the doubling escape) would
+        // otherwise throw and abort the entire codegraph_build_edges
+        // call. A single bad symbol is now skipped, not fatal.
+        // (Audit fix C2.)
+        let hit;
+        try {
+          const escaped = sym.replace(/"/g, '""');
+          hit = ftsStmt.all(`"${escaped}"*`, projectKey);
+        } catch {
+          continue;
+        }
         if (hit.length >= 2) {
           candidates += hit.length;
           if (!matching.has(sym)) matching.set(sym, []);

@@ -389,6 +389,55 @@ export function runAutoTier(db, projectKey, { now = new Date() } = {}) {
     return result;
   }
 
+  // Helper: transition every id in `ids` from `fromTier` to `toTier`,
+  // recording each transition in `persona_promotions` so the audit
+  // log captures auto-promotions / auto-demotions just like the
+  // manual `memory_set_tier` path does. The previous bulk `UPDATE`
+  // shape never wrote a persona_promotions row, so `memory_tier_history`
+  // silently missed the majority of transitions on a long-lived
+  // project. (Audit fix M2.)
+  const insertPromoStmt = db.prepare(
+    `INSERT OR IGNORE INTO persona_promotions (id, memory_id, from_tier, to_tier, reason, at)
+     VALUES (?, ?, ?, ?, ?, ?)`,
+  );
+
+  function transitionIds(ids, toTier, reason) {
+    if (ids.length === 0) return 0;
+    const ts = nowIso();
+    let moved = 0;
+    const updStmt = db.prepare(
+      `UPDATE memories SET tier = ?, updated_at = ? WHERE id = ? AND project_key = ? AND tier != ?`,
+    );
+    for (const id of ids) {
+      const r = updStmt.run(toTier, ts, id, projectKey, toTier);
+      if (r.changes > 0) {
+        // Re-read what the row looked like just before this transition
+        // would have applied so the audit log captures the *actual*
+        // from_tier. The UPDATE used a guard (`tier != ?`) so a row
+        // that was already at the target tier produces 0 changes and
+        // we skip the audit row.
+        const prev = db
+          .prepare(`SELECT tier FROM memories WHERE id=? AND project_key=?`)
+          .get(id, projectKey);
+        // Build a deterministic-but-unique id for this audit row.
+        // Mix ms + ns + Math.random so two transitions in the same
+        // millisecond still produce distinct ids; the share.js
+        // path uses a similar recipe.
+        const stamp = `${nowIso()}:${Date.now() % 1e9}:${Math.random()}`;
+        const pid = `promo:${stamp}:${id}:${prev ? prev.tier : '?'}->${toTier}`
+          .replace(/[^A-Za-z0-9_:>/-]/g, '_')
+          .slice(0, 64);
+        try {
+          insertPromoStmt.run(pid, id, prev ? prev.tier : '?', toTier, reason, ts);
+        } catch {
+          /* UNIQUE collision on rapid millisecond writes; ignore */
+        }
+        moved += 1;
+      }
+    }
+    return moved;
+  }
+
   try {
     db.exec('BEGIN');
   } catch {
@@ -402,47 +451,44 @@ export function runAutoTier(db, projectKey, { now = new Date() } = {}) {
     // access_count as a proxy. A memory with access_count ≥
     // AUTO_TIER_REINFORCE_TO_L1 is considered "recalled enough".
     {
-      const r = db
+      const ids = db
         .prepare(
-          `UPDATE memories
-           SET tier = 'L1', updated_at = ?
+          `SELECT id FROM memories
            WHERE project_key = ? AND status = 'active'
-             AND tier = 'L0'
-             AND access_count >= ?`,
+             AND tier = 'L0' AND access_count >= ?`,
         )
-        .run(nowIso(), projectKey, AUTO_TIER_REINFORCE_TO_L1);
-      result.promoted_l0_to_l1 = r.changes || 0;
+        .all(projectKey, AUTO_TIER_REINFORCE_TO_L1)
+        .map((r) => r.id);
+      result.promoted_l0_to_l1 = transitionIds(ids, 'L1', 'auto_tier');
     }
 
     // L1 → L2: access_count ≥ AUTO_TIER_ACCESS_TO_L2.
     {
-      const r = db
+      const ids = db
         .prepare(
-          `UPDATE memories
-           SET tier = 'L2', updated_at = ?
+          `SELECT id FROM memories
            WHERE project_key = ? AND status = 'active'
-             AND tier = 'L1'
-             AND access_count >= ?`,
+             AND tier = 'L1' AND access_count >= ?`,
         )
-        .run(nowIso(), projectKey, AUTO_TIER_ACCESS_TO_L2);
-      result.promoted_l1_to_l2 = r.changes || 0;
+        .all(projectKey, AUTO_TIER_ACCESS_TO_L2)
+        .map((r) => r.id);
+      result.promoted_l1_to_l2 = transitionIds(ids, 'L2', 'auto_tier');
     }
 
     // L2 → L3: at L2 for AUTO_TIER_L2_DAYS days AND access_count ≥
     // AUTO_TIER_REINFORCE_TO_L3. Curation is hard to undo, so we
     // require both time + access.
     {
-      const r = db
+      const ids = db
         .prepare(
-          `UPDATE memories
-           SET tier = 'L3', updated_at = ?
+          `SELECT id FROM memories
            WHERE project_key = ? AND status = 'active'
-             AND tier = 'L2'
-             AND access_count >= ?
+             AND tier = 'L2' AND access_count >= ?
              AND julianday('now') - julianday(updated_at) >= ?`,
         )
-        .run(nowIso(), projectKey, AUTO_TIER_REINFORCE_TO_L3, AUTO_TIER_L2_DAYS);
-      result.promoted_l2_to_l3 = r.changes || 0;
+        .all(projectKey, AUTO_TIER_REINFORCE_TO_L3, AUTO_TIER_L2_DAYS)
+        .map((r) => r.id);
+      result.promoted_l2_to_l3 = transitionIds(ids, 'L3', 'auto_tier');
     }
 
     // L? → L0 demotion: confidence (set by decay) below
@@ -451,18 +497,25 @@ export function runAutoTier(db, projectKey, { now = new Date() } = {}) {
     // rather than recomputing Math.exp per row — the SessionStart
     // decay pass already normalises confidence, so anything below
     // the floor is a candidate for demotion.
+    //
+    // COALESCE(last_rehearsed_at, updated_at): the previous shape
+    // used `last_rehearsed_at` directly, but `julianday(NULL)` is NULL,
+    // and `NULL >= N` is NULL (not true) — every row whose
+    // last_rehearsed_at was NULL (pre-v9 backfill rows, externally-
+    // inserted rows, microsecond-window saves between the column
+    // add and the v9 backfill) was permanently exempt from auto-
+    // demotion even as its confidence decayed. (Audit fix M5.)
     {
-      const r = db
+      const ids = db
         .prepare(
-          `UPDATE memories
-           SET tier = 'L0', updated_at = ?
+          `SELECT id FROM memories
            WHERE project_key = ? AND status = 'active'
-             AND tier != 'L0'
-             AND confidence < ?
-             AND julianday('now') - julianday(last_rehearsed_at) >= ?`,
+             AND tier != 'L0' AND confidence < ?
+             AND julianday('now') - julianday(COALESCE(last_rehearsed_at, updated_at)) >= ?`,
         )
-        .run(nowIso(), projectKey, AUTO_TIER_DEMOTE_FLOOR, AUTO_TIER_DEMOTE_DAYS);
-      result.demoted_to_l0 = r.changes || 0;
+        .all(projectKey, AUTO_TIER_DEMOTE_FLOOR, AUTO_TIER_DEMOTE_DAYS)
+        .map((r) => r.id);
+      result.demoted_to_l0 = transitionIds(ids, 'L0', 'auto_tier');
     }
 
     try {

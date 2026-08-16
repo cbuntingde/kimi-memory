@@ -123,6 +123,17 @@ export function grantMemoryAcl(db, projectKey, memoryId, principalKind, principa
  * Revoke an ACL entry. Returns true if a row was deleted.
  */
 export function revokeMemoryAcl(db, projectKey, memoryId, principalKind, principalId) {
+  // Defence-in-depth: the MCP surface validates principal_kind upstream
+  // via validatePrincipalKind, but a stray call site passing a
+  // malformed kind would no-op (the WHERE never matches) and return
+  // false — the caller would interpret that as "grant didn't exist"
+  // when in reality the input was bogus. Validate up-front so the
+  // error matches the grant path. (Audit fix M3.)
+  if (!PRINCIPAL_KIND_SET.has(principalKind)) {
+    throw new Error(
+      `invalid principal_kind: ${principalKind} (must be one of: ${PRINCIPAL_KINDS.join(', ')})`,
+    );
+  }
   const r = db
     .prepare(
       `DELETE FROM memories_acl

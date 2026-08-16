@@ -10,6 +10,12 @@
 //
 // On first run the embedding model (~25 MB) downloads from
 // Hugging Face. Set KIMI_MEMORY_EMBEDDINGS=off to skip entirely.
+//
+// Concurrency: the loop is intentionally serial. The embedding
+// pipeline is a single shared transformer handle; parallel
+// embeddings against the same handle can corrupt ONNX Runtime
+// state. For projects with 100+ DBs the wall-clock cost is
+// bounded by the encoder latency × total rows. (Audit fix M10.)
 import path from 'node:path';
 import { readdirSync, statSync } from 'node:fs';
 import { kimiHome } from './util.js';

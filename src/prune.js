@@ -11,10 +11,11 @@
 // controls destructive deletion — when false, the action is reported as
 // 'would-remove' for orphans. The active project is never removed and
 // is always reported so the user sees the check ran for it.
-import { readdirSync, existsSync, rmSync } from 'node:fs';
+import { readdirSync, existsSync, rmSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { GLOBAL_PROJECT_KEY } from './project-key.js';
 import { openDb, closeDb, listProjectPaths } from './persist.js';
+import { nowIso } from './util.js';
 
 export function enumeratePruneCandidates({ home, activeKey, scope, apply }) {
   const memDir = path.join(home, 'kimi-memory');
@@ -92,6 +93,33 @@ export function enumeratePruneCandidates({ home, activeKey, scope, apply }) {
         try {
           // Drop the cached handle before deleting the file.
           closeDb(p.db);
+          // Audit breadcrumb: write a tiny JSON marker into the
+          // project directory *before* rmSync. If the process crashes
+          // mid-delete, this file is the forensic trail the operator
+          // reads to know which project was being pruned. The marker
+          // is written even on the rmSync error path so the failure
+          // mode is also attributable. (Audit fix C3.)
+          try {
+            writeFileSync(
+              path.join(p.dir, 'pruned-at.json'),
+              JSON.stringify(
+                {
+                  project_key: p.key,
+                  canonical_root: recordedRoot,
+                  pruned_at: nowIso(),
+                  first_seen_at: firstSeenAt,
+                  last_seen_at: lastSeenAt,
+                  reason: 'memory_prune',
+                },
+                null,
+                2,
+              ),
+            );
+          } catch {
+            /* ignore — rmSync may still succeed even if the marker
+               write fails (read-only FS, etc.). The next prune run
+               will re-stamp the marker. */
+          }
           rmSync(p.dir, { recursive: true, force: true });
           action = 'removed';
         } catch (e) {

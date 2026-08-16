@@ -86,18 +86,36 @@ export async function* readJsonl(filePath, { startByte = 0, signal } = {}) {
     if (startByte >= stat.size) return;
     const stream = fh.createReadStream({ start: startByte, end: stat.size - 1, encoding: 'utf8' });
     let buf = '';
+    // Strip a leading UTF-8 BOM only on the very first byte of the
+    // file. PowerShell `Set-Content -Encoding utf8` (and a number of
+    // Windows editors) prepend `\uFEFF`; without the strip, the very
+    // first event — usually the initial user prompt, the highest-
+    // signal line for the agent — is parsed as malformed and the
+    // JSON content is silently lost. (Audit fix BUG-5.)
+    let bomStripped = startByte === 0;
     let lineNo = 0;
     let offset = startByte;
     for await (const chunk of stream) {
       if (signal && signal.aborted) break;
       buf += chunk;
+      if (!bomStripped && buf.length > 0 && buf.charCodeAt(0) === 0xfeff) {
+        buf = buf.slice(1);
+        // The BOM occupies 3 bytes on disk but only 1 code unit in the
+        // decoded UTF-8 stream; advance the offset so nextByteOffset
+        // arithmetic still aligns to physical bytes.
+        offset += 3;
+        bomStripped = true;
+      }
       let nl;
       while ((nl = buf.indexOf('\n')) !== -1) {
         const line = buf.slice(0, nl);
         buf = buf.slice(nl + 1);
         lineNo += 1;
-        const stripped = line.endsWith('\r') ? line.slice(0, -1) : line;
+        const isCrlf = line.endsWith('\r');
+        const stripped = isCrlf ? line.slice(0, -1) : line;
         const parsed = stripped.length === 0 ? null : safeJsonParse(stripped);
+        const lineBytes = Buffer.byteLength(line, 'utf8'); // includes the '\r' on CRLF
+        const nlBytes = isCrlf ? 2 : 1;
         yield {
           line: stripped,
           n: lineNo,
@@ -105,15 +123,25 @@ export async function* readJsonl(filePath, { startByte = 0, signal } = {}) {
           parsed: parsed && parsed.ok ? parsed.value : null,
           error: parsed && !parsed.ok ? parsed.error : null,
           byteOffset: offset,
-          nextByteOffset: offset + Buffer.byteLength(line, 'utf8') + 1,
+          // nextByteOffset was previous shape `+ 1` only, which left
+          // a CRLF cursor pointing at the trailing `\r` of the just-
+          // emitted line. Count the line bytes + terminator bytes so
+          // the next read resumes at the start of the next line
+          // regardless of which line ending the file uses. (Audit
+          // fix BUG-6.)
+          nextByteOffset: offset + lineBytes + nlBytes - (isCrlf ? 1 : 0),
         };
-        offset += Buffer.byteLength(line, 'utf8') + 1;
+        offset += lineBytes + nlBytes;
       }
     }
     if (buf.length > 0) {
+      // Honor a lone trailing `\r` at the very end of the file too.
+      const trailingCr = buf.endsWith('\r');
       lineNo += 1;
-      const stripped = buf.endsWith('\r') ? buf.slice(0, -1) : buf;
+      const stripped = trailingCr ? buf.slice(0, -1) : buf;
       const parsed = stripped.length === 0 ? null : safeJsonParse(stripped);
+      const lineBytes = Buffer.byteLength(buf, 'utf8');
+      const nlBytes = trailingCr ? 2 : 1;
       yield {
         line: stripped,
         n: lineNo,
@@ -121,7 +149,7 @@ export async function* readJsonl(filePath, { startByte = 0, signal } = {}) {
         parsed: parsed && parsed.ok ? parsed.value : null,
         error: parsed && !parsed.ok ? parsed.error : null,
         byteOffset: offset,
-        nextByteOffset: offset + Buffer.byteLength(buf, 'utf8'),
+        nextByteOffset: offset + lineBytes + nlBytes - (trailingCr ? 1 : 0),
       };
     }
   } finally {

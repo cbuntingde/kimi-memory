@@ -133,11 +133,24 @@ function safeStringify(o) {
 export function extractCreatedAt(parsed) {
   if (!parsed || typeof parsed !== 'object') return null;
   const value = parsed.created_at ?? parsed.timestamp ?? parsed.time ?? parsed.ts;
-  if (typeof value === 'string' && value) return value;
+  if (typeof value === 'string' && value) {
+    const t = Date.parse(value);
+    // Reject future-dated and absurd timestamps. A JSONL row with a
+    // bogus "timestamp" used to leak into last_event_at and corrupt
+    // the recall surface. (Audit fix H6.)
+    if (!Number.isFinite(t)) return null;
+    if (t > Date.now() + 60 * 1000) return null;
+    return value;
+  }
   if (typeof value === 'number' && Number.isFinite(value)) {
     const milliseconds = value < 10_000_000_000 ? value * 1000 : value;
     const date = new Date(milliseconds);
-    if (!Number.isNaN(date.getTime())) return date.toISOString();
+    if (!Number.isNaN(date.getTime())) {
+      const t = date.getTime();
+      // Same future-dated guard for numeric timestamps.
+      if (t > Date.now() + 60 * 1000) return null;
+      return date.toISOString();
+    }
   }
   return null;
 }

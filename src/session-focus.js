@@ -33,6 +33,19 @@
 
 import { nowIso } from './util.js';
 
+// Slice a string on a UTF-16 code-point boundary so a surrogate pair
+// is never split in half. The previous shape used `s.slice(0, N)`
+// directly, which can leave a lone high surrogate at the boundary
+// and produce an invalid UTF-16 sequence on the next character —
+// the agent's terminal renders the result as a `?` replacement on
+// recall. (Audit fix BUG-10.)
+function sliceCodePointSafe(s, n) {
+  if (!s || s.length <= n) return s;
+  let cut = n;
+  while (cut > 0 && (s.charCodeAt(cut - 1) & 0xfc00) === 0xdc00) cut -= 1;
+  return s.slice(0, cut);
+}
+
 export const SESSION_FOCUS_MIN_PROMPTS = 1;
 export const SESSION_FOCUS_TAKE_PROMPTS = 3; // how many to surface in body
 export const SESSION_FOCUS_TITLE_MAX = 100; // truncated for title
@@ -46,7 +59,9 @@ export function sessionFocusTitle(firstPrompt) {
   const clean = (firstPrompt || '').replace(/\s+/g, ' ').trim();
   if (!clean) return 'Last focus: (no prompt summary)';
   const truncated =
-    clean.length > SESSION_FOCUS_TITLE_MAX ? clean.slice(0, SESSION_FOCUS_TITLE_MAX) + '…' : clean;
+    clean.length > SESSION_FOCUS_TITLE_MAX
+      ? sliceCodePointSafe(clean, SESSION_FOCUS_TITLE_MAX) + '…'
+      : clean;
   return `Last focus: ${truncated}`;
 }
 
@@ -162,6 +177,13 @@ export async function captureSessionFocus({
         session_focus: true,
         session_id: sessionId,
       },
+      // Top-level session_id column: buildSessionThread uses this to
+      // match a focus row to its session without falling back to
+      // `is_session_focus = 1` (which would surface the project's
+      // most-recent focus for every historical session). Without
+      // this, `[thread: N/3]` lines echoed the same title for every
+      // session in the project. (Audit fix.)
+      session_id: sessionId,
       confidence: 0.7,
       priority: 1,
       expires_at: expiresAt,
@@ -262,7 +284,7 @@ export function readLatestSessionFocus(db, projectKey) {
 // there is no focus to surface, so the caller can omit the line.
 export function buildSessionFocusLine(focus, { snippetChars = 120 } = {}) {
   if (!focus || !focus.title) return null;
-  const t = focus.title.length > 80 ? focus.title.slice(0, 80) + '…' : focus.title;
+  const t = focus.title.length > 80 ? sliceCodePointSafe(focus.title, 80) + '…' : focus.title;
   // First non-empty line of the body, condensed.
   const first = (focus.content || '')
     .split(/\r?\n/)
@@ -270,7 +292,7 @@ export function buildSessionFocusLine(focus, { snippetChars = 120 } = {}) {
     .find((line) => line.length > 0);
   const snippet = first
     ? first.length > snippetChars
-      ? first.slice(0, snippetChars) + '…'
+      ? sliceCodePointSafe(first, snippetChars) + '…'
       : first
     : '';
   const tail = snippet ? ` — ${snippet}` : '';

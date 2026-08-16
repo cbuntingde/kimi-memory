@@ -251,43 +251,63 @@ export function saveMemory(db, projectKey, input) {
   // created as active. This is intentional — callers that want a
   // pure "replace me" should pair supersede=true with an existing
   // title they intend to replace.
+  //
+  // The supersede UPDATE + the row write below are wrapped in a
+  // SAVEPOINT so a transient INSERT failure (UNIQUE collision, FK
+  // violation, SQLITE_BUSY) cannot leave the prior row marked
+  // superseded pointing at a non-existent id. The previous shape
+  // issued the supersede UPDATE before the INSERT without any
+  // transactional safety, so every auto-extract `supersede: true`
+  // save (session-focus, work-log, the deterministic stack summary)
+  // was exposed to that corruption window. (Audit fix BUG-7.)
   let supersedesId = input.supersedes || null;
-  if (input.supersede) {
-    const existing = db
-      .prepare(
-        "SELECT id FROM memories WHERE project_key = ? AND type = ? AND COALESCE(title,'') = ? AND status = 'active' AND id != ? ORDER BY updated_at DESC",
-      )
-      .all(projectKey, input.type, input.title || '', id);
-    if (existing.length > 0) {
-      // Replace only the most-recent prior row. The plural form
-      // (marking every match superseded) silently retired distinct
-      // memories that happened to share a title — a docstring
-      // contract violation. (Audit finding F-002.)
-      supersedesId = existing[0].id;
-      db.prepare(
-        "UPDATE memories SET status='superseded', superseded_by=?, updated_at=? WHERE id=?",
-      ).run(id, now, existing[0].id);
-      // Record a typed supersedes edge in memory_edges so the new
-      // graph primitive stays the canonical source going forward.
-      // Deduped via UNIQUE(project_key, from_id, to_id, kind); the
-      // edge primitive is idempotent.
-      try {
+  db.exec('SAVEPOINT save_memory_supersede');
+  try {
+    if (input.supersede) {
+      const existing = db
+        .prepare(
+          "SELECT id FROM memories WHERE project_key = ? AND type = ? AND COALESCE(title,'') = ? AND status = 'active' AND id != ? ORDER BY updated_at DESC",
+        )
+        .all(projectKey, input.type, input.title || '', id);
+      if (existing.length > 0) {
+        // Replace only the most-recent prior row. The plural form
+        // (marking every match superseded) silently retired distinct
+        // memories that happened to share a title — a docstring
+        // contract violation. (Audit finding F-002.)
+        supersedesId = existing[0].id;
         db.prepare(
-          `
-          INSERT OR IGNORE INTO memory_edges (id, project_key, from_id, to_id, kind, weight, created_at)
-          VALUES (?, ?, ?, ?, 'supersedes', 1.0, ?)
-        `,
-        ).run(
-          shortId(hashId('edge', projectKey, existing[0].id, id, 'supersedes'), 16),
-          projectKey,
-          existing[0].id,
-          id,
-          now,
-        );
-      } catch {
-        /* memory_edges may not exist on a pre-v4 DB; ignore */
+          "UPDATE memories SET status='superseded', superseded_by=?, updated_at=? WHERE id=?",
+        ).run(id, now, existing[0].id);
+        // Record a typed supersedes edge in memory_edges so the new
+        // graph primitive stays the canonical source going forward.
+        // Deduped via UNIQUE(project_key, from_id, to_id, kind); the
+        // edge primitive is idempotent.
+        try {
+          db.prepare(
+            `
+            INSERT OR IGNORE INTO memory_edges (id, project_key, from_id, to_id, kind, weight, created_at)
+            VALUES (?, ?, ?, ?, 'supersedes', 1.0, ?)
+          `,
+          ).run(
+            shortId(hashId('edge', projectKey, existing[0].id, id, 'supersedes'), 16),
+            projectKey,
+            existing[0].id,
+            id,
+            now,
+          );
+        } catch {
+          /* memory_edges may not exist on a pre-v4 DB; ignore */
+        }
       }
     }
+    db.exec('RELEASE SAVEPOINT save_memory_supersede');
+  } catch (e) {
+    try {
+      db.exec('ROLLBACK TO SAVEPOINT save_memory_supersede');
+    } catch {
+      /* ignore */
+    }
+    throw e;
   }
 
   const row = db.prepare('SELECT id, created_at FROM memories WHERE id=?').get(id);
@@ -298,104 +318,112 @@ export function saveMemory(db, projectKey, input) {
   // scanning every working row. (Audit flag — session-focus
   // indexability.)
   const isSessionFocus = metadata && /"session_focus":true/.test(metadata) ? 1 : 0;
-  if (row) {
-    db.prepare(
-      `
-      UPDATE memories SET
-        title = COALESCE(?, title),
-        content = COALESCE(?, content),
-        tags = COALESCE(?, tags),
-        metadata = COALESCE(?, metadata),
-        provenance = COALESCE(?, provenance),
-        confidence = COALESCE(?, confidence),
-        status = COALESCE(?, status),
-        priority = COALESCE(?, priority),
-        supersedes = COALESCE(?, supersedes),
-        expires_at = COALESCE(?, expires_at),
-        visibility = COALESCE(?, visibility),
-        shared_with = COALESCE(?, shared_with),
-        team_id = COALESCE(?, team_id),
-        agent_id = COALESCE(?, agent_id),
-        user_id = COALESCE(?, user_id),
-        session_id = COALESCE(?, session_id),
-        task_id = COALESCE(?, task_id),
-        tier = COALESCE(?, tier),
-        persona_id = COALESCE(?, persona_id),
-        is_session_focus = ?,
-        updated_at = ?,
-        last_rehearsed_at = ?
-      WHERE id = ?
-    `,
-    ).run(
-      input.title ?? null,
-      input.content ?? null,
-      input.tags !== undefined ? JSON.stringify(input.tags) : null,
-      input.metadata !== undefined ? JSON.stringify(input.metadata) : null,
-      input.provenance !== undefined ? JSON.stringify(input.provenance) : null,
-      input.confidence != null ? confidence : null,
-      input.status ?? null,
-      input.priority != null ? priority : null,
-      supersedesId ?? null,
-      expires,
-      input.visibility ?? null,
-      input.shared_with !== undefined ? JSON.stringify(input.shared_with) : null,
-      input.team_id ?? null,
-      input.agent_id ?? null,
-      input.user_id ?? null,
-      input.session_id ?? null,
-      input.task_id ?? null,
-      input.tier ?? null,
-      input.persona_id ?? null,
-      isSessionFocus,
-      now,
-      now,
-      id,
-    );
-  } else {
-    db.prepare(
-      `
-      INSERT INTO memories (id, project_key, type, title, content, tags, metadata, provenance, confidence, status, priority, supersedes, created_at, updated_at, expires_at, last_rehearsed_at, visibility, shared_with, team_id, agent_id, user_id, session_id, task_id, tier, persona_id, is_session_focus)
-      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    `,
-    ).run(
-      id,
-      projectKey,
-      input.type,
-      input.title || '',
-      input.content || '',
-      tags,
-      metadata,
-      provenance,
-      confidence,
-      status,
-      priority,
-      supersedesId,
-      now,
-      now,
-      expires,
-      now,
-      visibility,
-      sharedWith,
-      teamId,
-      agentId,
-      userId,
-      sessionId,
-      taskId,
-      tier,
-      personaId,
-      isSessionFocus,
-    );
-  }
-
-  // FTS upsert — wrapped in BEGIN/COMMIT with the row write above so a
-  // crash or SQLITE_BUSY between the row INSERT/UPDATE and the FTS
-  // write cannot leave a row visible but not FTS-indexed.
-  //
-  // SAVEPOINT (not BEGIN) so saveMemory is safe to call from inside
-  // another transaction (e.g. saveMemoryBulk's outer BEGIN/COMMIT).
-  // SAVEPOINT is a no-op when no outer transaction is in flight.
+  // Wrap the row write + FTS reseed + synthesizes edge insert in a
+  // single SAVEPOINT opened *above* the row write. The previous shape
+  // opened the SAVEPOINT between the row write and the FTS insert,
+  // so a throw inside the FTS path could roll back the FTS / synth
+  // side while leaving a `memories` row visible to listMemories but
+  // invisible to searchMemories (recall depends on the FTS row).
+  // (Audit fix H3.)
   db.exec('SAVEPOINT save_memory_upsert');
   try {
+    if (row) {
+      db.prepare(
+        `
+        UPDATE memories SET
+          title = COALESCE(?, title),
+          content = COALESCE(?, content),
+          tags = COALESCE(?, tags),
+          metadata = COALESCE(?, metadata),
+          provenance = COALESCE(?, provenance),
+          confidence = COALESCE(?, confidence),
+          status = COALESCE(?, status),
+          priority = COALESCE(?, priority),
+          supersedes = COALESCE(?, supersedes),
+          expires_at = COALESCE(?, expires_at),
+          visibility = COALESCE(?, visibility),
+          shared_with = COALESCE(?, shared_with),
+          team_id = COALESCE(?, team_id),
+          agent_id = COALESCE(?, agent_id),
+          user_id = COALESCE(?, user_id),
+          session_id = COALESCE(?, session_id),
+          task_id = COALESCE(?, task_id),
+          tier = COALESCE(?, tier),
+          persona_id = COALESCE(?, persona_id),
+          is_session_focus = ?,
+          updated_at = ?,
+          last_rehearsed_at = ?
+        WHERE id = ?
+      `,
+      ).run(
+        input.title ?? null,
+        input.content ?? null,
+        // `!= null` (not `!== undefined`) — JSON.stringify(null) is
+        // the 4-char string "null", which corrupts the column on
+        // round-trip. Skip the JSON.stringify entirely for null and
+        // fall through to COALESCE so the existing value is
+        // preserved. (Audit fix H1.)
+        input.tags != null ? JSON.stringify(input.tags) : null,
+        input.metadata != null ? JSON.stringify(input.metadata) : null,
+        input.provenance != null ? JSON.stringify(input.provenance) : null,
+        input.confidence != null ? confidence : null,
+        input.status ?? null,
+        input.priority != null ? priority : null,
+        supersedesId ?? null,
+        expires,
+        input.visibility ?? null,
+        input.shared_with != null ? JSON.stringify(input.shared_with) : null,
+        input.team_id ?? null,
+        input.agent_id ?? null,
+        input.user_id ?? null,
+        input.session_id ?? null,
+        input.task_id ?? null,
+        input.tier ?? null,
+        input.persona_id ?? null,
+        isSessionFocus,
+        now,
+        now,
+        id,
+      );
+    } else {
+      db.prepare(
+        `
+        INSERT INTO memories (id, project_key, type, title, content, tags, metadata, provenance, confidence, status, priority, supersedes, created_at, updated_at, expires_at, last_rehearsed_at, visibility, shared_with, team_id, agent_id, user_id, session_id, task_id, tier, persona_id, is_session_focus)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+      `,
+      ).run(
+        id,
+        projectKey,
+        input.type,
+        input.title || '',
+        input.content || '',
+        tags,
+        metadata,
+        provenance,
+        confidence,
+        status,
+        priority,
+        supersedesId,
+        now,
+        now,
+        expires,
+        now,
+        visibility,
+        sharedWith,
+        teamId,
+        agentId,
+        userId,
+        sessionId,
+        taskId,
+        tier,
+        personaId,
+        isSessionFocus,
+      );
+    }
+
+    // FTS upsert — wrapped in SAVEPOINT above so a failure rolls the
+    // memories row back too, keeping search Memoriestable consistent
+    // with the FTS index.
     db.prepare('DELETE FROM memories_fts WHERE id=?').run(id);
     db.prepare(
       'INSERT INTO memories_fts (id, project_key, type, title, content, tags) VALUES (?, ?, ?, ?, ?, ?)',
@@ -437,7 +465,6 @@ export function saveMemory(db, projectKey, input) {
     }
     throw e;
   }
-
   const saved = getMemory(db, projectKey, id);
 
   // Fire-and-forget embedding update. Runs as a microtask so saveMemory
@@ -724,28 +751,55 @@ export function mergeMemory(
     kind: 'memory_merge',
   });
 
-  // Persist the merged into-memory. We call saveMemory directly so we
-  // bypass its supersede-on-same-title logic (we already have a
-  // supersedes relationship from -> into).
-  const merged = {
-    id: into.id,
-    type: into.type,
-    title: into.title,
-    content:
-      typeof mergedContent === 'string' && mergedContent.length > 0 ? mergedContent : into.content,
-    tags,
-    metadata: into.metadata || {},
-    provenance,
-    confidence: into.confidence,
-    status: 'active',
-    priority: into.priority || 0,
-    expires_at: into.expires_at || null,
-    // _embed:false keeps saveMemory sync and skips the embedding
-    // microtask — the merged content already has the same or similar
-    // embedding as before; the next backfill will refresh if needed.
-    _embed: false,
-  };
-  const updated = saveMemory(db, projectKey, merged);
+  // Persist the merged into-memory via a direct UPDATE so the
+  // title-based supersede logic in saveMemory does not fire (we
+  // already have a supersedes relationship from -> into; re-firing it
+  // would chain a fresh supersede against any other active row that
+  // shares the merged into-title, silently retiring unrelated rows).
+  // The previous shape called saveMemory here despite the docstring
+  // claim that it "bypasses" the supersede logic — it did not.
+  // (Audit fix M2.)
+  const now1 = nowIso();
+  const mergedContentFinal =
+    typeof mergedContent === 'string' && mergedContent.length > 0 ? mergedContent : into.content;
+  const isSessionFocus = /"session_focus":true/.test(JSON.stringify(into.metadata || {}));
+  db.prepare(
+    `UPDATE memories SET
+       title = ?,
+       content = ?,
+       tags = ?,
+       metadata = ?,
+       provenance = ?,
+       confidence = ?,
+       status = 'active',
+       priority = ?,
+       expires_at = ?,
+       is_session_focus = ?,
+       updated_at = ?
+     WHERE id = ? AND project_key = ?`,
+  ).run(
+    into.title,
+    mergedContentFinal,
+    JSON.stringify(tags),
+    JSON.stringify(into.metadata || {}),
+    JSON.stringify(provenance),
+    typeof into.confidence === 'number' ? into.confidence : 0.8,
+    Number.isFinite(into.priority) ? Math.trunc(into.priority) : 0,
+    into.expires_at || null,
+    isSessionFocus ? 1 : 0,
+    now1,
+    into.id,
+    projectKey,
+  );
+  // Re-seed the FTS index so the merged row is searchable by its new
+  // content. The DELETE-then-INSERT pair mirrors what saveMemory does
+  // and is safe because the FTS5 row is keyed on id only.
+  db.prepare('DELETE FROM memories_fts WHERE id=?').run(into.id);
+  db.prepare(
+    'INSERT INTO memories_fts (id, project_key, type, title, content, tags) VALUES (?, ?, ?, ?, ?, ?)',
+  ).run(into.id, projectKey, into.type, into.title, mergedContentFinal, tags.join(' '));
+  // Reload so the caller sees the post-merge shape.
+  const updated = getMemory(db, projectKey, into.id);
 
   // Soft-supersede the from-memory and stamp a back-link. Use raw SQL
   // so we don't re-fire saveMemory's title-based supersede logic (which
