@@ -105,33 +105,35 @@ export function shareMemory(db, projectKey, ids, opts = {}) {
     }
 
     const sharedDb = openSharedDb(kimiHomeDir);
-    // We move rows one at a time inside a single transaction on the
-    // source DB. The shared DB's writes piggy-back on the same call
-    // site; node:sqlite uses a single connection per dbPath so the
-    // target handle is on its own connection and does not need its own
-    // transaction wrapper for atomicity from the caller's view.
+    // Two-phase commit with compensation: the shared-DB writes run
+    // inside their own transaction *first*, then the source-DB
+    // deletes run inside a second transaction. If the source-DB
+    // transaction fails after the shared writes committed, we undo
+    // the shared writes in a third compensation pass so the
+    // operation is effectively atomic from the caller's view.
+    //
+    // node:sqlite uses one native connection per dbPath, so the two
+    // databases cannot share a transaction; explicit compensation
+    // is the only way to keep both stores consistent on the failure
+    // path. The compensating delete is idempotent (memories_acl on
+    // the shared DB has no FK to memories, so an interrupted undo
+    // leaves the shared DB rows orphaned but harmless — the next
+    // shareMemory call for the same id no-ops via INSERT OR IGNORE).
+    // (Audit fix — the previous shape interleaved shared + source
+    // writes inside a single source transaction with no
+    // compensation; a mid-loop failure left the shared DB with
+    // rows whose source rows still existed.)
     const now = nowIso();
     let moved = 0;
-    db.exec('BEGIN');
+    const sharedWrittenIds = [];
+    sharedDb.exec('BEGIN');
     try {
       for (const id of ids) {
         const row = db
           .prepare('SELECT * FROM memories WHERE id=? AND project_key=?')
           .get(id, projectKey);
         if (!row) continue;
-        // Bound either to the freshly-inserted source row (when the
-        // INSERT actually wrote) or to a re-read of the existing
-        // shared row (when INSERT OR IGNORE no-op'd because the id
-        // was already there). Used by the FTS5 re-stamp below to
-        // keep the FTS index aligned with the durable row.
-        // (Audit fix M1.)
         let rowAfterMove = row;
-        // Insert into shared DB with project_key='_shared', preserving
-        // every column the schema knows about. Idempotent via the row
-        // PRIMARY KEY (id); if a row with the same id is already in
-        // the shared DB we leave it and still remove from the source
-        // so the caller observes a "move" — the target stays at the
-        // version it already had, which is the safer failure mode.
         try {
           const ins = sharedDb
             .prepare(
@@ -183,15 +185,6 @@ export function shareMemory(db, projectKey, ids, opts = {}) {
               row.tier,
               row.persona_id,
             );
-          // INSERT OR IGNORE on a UNIQUE (PRIMARY KEY) id no-ops when
-          // the shared row already exists; that "the target stays at
-          // the version it already had" contract is documented above.
-          // The previous shape unconditionally re-stamped the FTS5
-          // row from the *source* row's content, even on a no-op
-          // INSERT — which left the FTS index pointing at content
-          // that no longer exists in `memories`. Audit fix M1.
-          // Re-read the row we actually landed so the FTS index
-          // matches the durable row.
           if (ins.changes === 0) {
             const existing = sharedDb
               .prepare(
@@ -208,26 +201,17 @@ export function shareMemory(db, projectKey, ids, opts = {}) {
             rowAfterMove = row;
           }
         } catch (e) {
-          // Surface as a per-id error so the caller can decide; the
-          // shared DB write should not silently disappear.
           throw new Error(
             `shareMemory: failed to insert into shared DB for ${id}: ${e && e.message}`,
           );
         }
-        // Re-stamp FTS in the shared DB so the move is visible to
-        // recall. The FTS columns mirror the durable row's columns
-        // — when the INSERT was a no-op, we use the existing
-        // row's content above so the index never points at content
-        // the row no longer carries. (Audit fix L2: write the tags
-        // column as space-joined tokens, not the JSON literal, to
-        // match what `saveMemory` writes for the project DB.)
         const ftsSrc = rowAfterMove;
         let tagTokens = '';
         try {
           const tagArr = JSON.parse(ftsSrc.tags || '[]');
           tagTokens = Array.isArray(tagArr) ? tagArr.join(' ') : '';
         } catch {
-          /* ignore — keep the empty token string */
+          /* ignore */
         }
         sharedDb.prepare('DELETE FROM memories_fts WHERE id=?').run(id);
         sharedDb
@@ -235,10 +219,22 @@ export function shareMemory(db, projectKey, ids, opts = {}) {
             'INSERT INTO memories_fts (id, project_key, type, title, content, tags) VALUES (?, ?, ?, ?, ?, ?)',
           )
           .run(id, '_shared', ftsSrc.type, ftsSrc.title || '', ftsSrc.content || '', tagTokens);
-        // Remove from the source DB (memories + FTS). The source
-        // DELETE is the point of the move — keep the shared row even
-        // if the FTS delete errors, since the row itself is the
-        // primary deliverable.
+        sharedWrittenIds.push(id);
+      }
+      sharedDb.exec('COMMIT');
+    } catch (e) {
+      try {
+        sharedDb.exec('ROLLBACK');
+      } catch {
+        /* ignore */
+      }
+      throw e;
+    }
+    // Phase 2: source-DB deletes. On COMMIT failure, compensate by
+    // undoing the shared writes so the caller observes atomicity.
+    db.exec('BEGIN');
+    try {
+      for (const id of sharedWrittenIds) {
         db.prepare('DELETE FROM memories WHERE id=? AND project_key=?').run(id, projectKey);
         db.prepare('DELETE FROM memories_fts WHERE id=?').run(id);
         moved += 1;
@@ -249,6 +245,21 @@ export function shareMemory(db, projectKey, ids, opts = {}) {
         db.exec('ROLLBACK');
       } catch {
         /* ignore */
+      }
+      // Compensate the shared DB writes.
+      try {
+        sharedDb.exec('BEGIN');
+        for (const id of sharedWrittenIds) {
+          sharedDb.prepare("DELETE FROM memories WHERE id=? AND project_key='_shared'").run(id);
+          sharedDb.prepare('DELETE FROM memories_fts WHERE id=?').run(id);
+        }
+        sharedDb.exec('COMMIT');
+      } catch {
+        try {
+          sharedDb.exec('ROLLBACK');
+        } catch {
+          /* ignore */
+        }
       }
       throw e;
     }

@@ -8,7 +8,7 @@ import { mkdirSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { logPersistError } from '../diagnostics.js';
 
-const SCHEMA_VERSION = 12;
+const SCHEMA_VERSION = 13;
 
 // Schema migrations. Each entry is idempotent: it inspects the live
 // schema, no-ops when its target shape is already in place, and
@@ -680,6 +680,106 @@ const MIGRATIONS = [
         'CREATE INDEX idx_memories_session_focus ' +
           'ON memories(project_key, is_session_focus, updated_at)',
       );
+  },
+
+  // v13: Phase-1 staged Dream consolidation. Two durable tables:
+  //
+  //   dream_jobs       — one row per scheduled Dream pass.
+  //                      Status moves through queued → running → ready
+  //                      → applied (or failed / stale / cancelled).
+  //                      A partial unique index on
+  //                      (project_key) WHERE status='running' is the
+  //                      "single in-flight job per project" guard.
+  //
+  //   dream_proposals  — proposed operations for a given job:
+  //                      conclusion, merge, supersede, link.
+  //                      Stores source / target ids, proposed content,
+  //                      confidence, provenance, and per-row status.
+  //
+  // Both tables are project-scoped (per-project DBs only — the global
+  // DB never receives dream traffic). The unique-active-job index is
+  // the single concurrency primitive; re-enqueue is idempotent at the
+  // SQL layer. Every column / index probe is idempotent so a re-run is
+  // a no-op once a DB is fully migrated.
+  function migrateAddDreamTables(db) {
+    // dream_jobs: lifecycle + scheduling metadata. Input snapshot is
+    // stored as a small JSON blob (memory_count + sessions list) so
+    // apply-time can validate "sources unchanged" without re-walking
+    // the whole DB.
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS dream_jobs (
+        id              TEXT PRIMARY KEY,
+        project_key     TEXT NOT NULL,
+        status          TEXT NOT NULL DEFAULT 'queued'
+                          CHECK (status IN ('queued','running','ready','applied','stale','failed','cancelled')),
+        triggered_by    TEXT NOT NULL DEFAULT 'lifecycle',
+        input_snapshot  TEXT NOT NULL DEFAULT '{}',
+        result_counts   TEXT NOT NULL DEFAULT '{}',
+        error           TEXT,
+        enqueued_at     TEXT NOT NULL,
+        started_at      TEXT,
+        ready_at        TEXT,
+        applied_at      TEXT,
+        updated_at      TEXT NOT NULL
+      )
+    `);
+    const idxDreamProj = db
+      .prepare(
+        "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_dream_jobs_project'",
+      )
+      .get();
+    if (!idxDreamProj)
+      db.exec('CREATE INDEX idx_dream_jobs_project ON dream_jobs(project_key, updated_at)');
+    // Partial unique index — the only invariant we need for the
+    // "one running job per project" guard. A second concurrent enqueue
+    // trips this constraint, which the application layer catches and
+    // turns into a no-op. Skipped on tables that already have the index.
+    const idxActive = db
+      .prepare("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_dream_jobs_active'")
+      .get();
+    if (!idxActive) {
+      db.exec(
+        "CREATE UNIQUE INDEX idx_dream_jobs_active ON dream_jobs(project_key) WHERE status = 'running'",
+      );
+    }
+
+    // dream_proposals: staged operations. source_ids + target_ids are
+    // JSON arrays; confidence + provenance make the proposal
+    // self-describing so review/apply never has to reconstruct meaning.
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS dream_proposals (
+        id              TEXT PRIMARY KEY,
+        job_id          TEXT NOT NULL,
+        project_key     TEXT NOT NULL,
+        kind            TEXT NOT NULL
+                          CHECK (kind IN ('conclusion','merge','supersede','link')),
+        source_ids      TEXT NOT NULL DEFAULT '[]',
+        target_ids      TEXT NOT NULL DEFAULT '[]',
+        proposed_content TEXT NOT NULL DEFAULT '',
+        confidence      REAL NOT NULL DEFAULT 0.7,
+        provenance      TEXT NOT NULL DEFAULT '{}',
+        source_checksum TEXT NOT NULL DEFAULT '',
+        status          TEXT NOT NULL DEFAULT 'pending'
+                          CHECK (status IN ('pending','stale','approved','applied','rejected')),
+        created_at      TEXT NOT NULL,
+        updated_at      TEXT NOT NULL,
+        FOREIGN KEY (job_id) REFERENCES dream_jobs(id)
+      )
+    `);
+    const idxPropJob = db
+      .prepare(
+        "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_dream_proposals_job'",
+      )
+      .get();
+    if (!idxPropJob)
+      db.exec('CREATE INDEX idx_dream_proposals_job ON dream_proposals(job_id, status)');
+    const idxPropProj = db
+      .prepare(
+        "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_dream_proposals_project'",
+      )
+      .get();
+    if (!idxPropProj)
+      db.exec('CREATE INDEX idx_dream_proposals_project ON dream_proposals(project_key, status)');
   },
 ];
 

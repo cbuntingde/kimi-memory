@@ -22,7 +22,7 @@ import { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
 import { mkdirSync, existsSync } from 'node:fs';
 import path from 'node:path';
-import { kimiHome, nowIso, asString } from './util.js';
+import { kimiHome, nowIso, asString, safeErrorMessage } from './util.js';
 import {
   canonicalizeRoot,
   deriveProjectKey,
@@ -76,6 +76,17 @@ import {
 } from './persist.js';
 import { locateSessionArchive, walkWire, readSessionIndex } from './wire.js';
 import { enumeratePruneCandidates } from './prune.js';
+import {
+  enqueueDreamJob,
+  generateProposalsForJob,
+  applyDreamJob,
+  discardDreamJob,
+  listJobs as listDreamJobs,
+  listProposals as listDreamProposals,
+  readJob as readDreamJob,
+  readProposal as readDreamProposal,
+  buildDreamStatus,
+} from './dream.js';
 import {
   grantMemoryAcl,
   revokeMemoryAcl,
@@ -244,14 +255,19 @@ const TOOL_DEFS = [
         .optional()
         .describe('v10: truncate individual row content to this many chars.'),
       // v10: cumulative character cap. Drops tail rows once the running
-      // sum exceeds the budget.
+      // sum exceeds the budget. The first (highest-scoring) row is
+      // always kept so callers always get at least one result; a row
+      // whose own length exceeds the budget still fits (no per-row
+      // truncation, that's `max_chars_per_memory`'s job).
       max_total_recall_chars: z
         .number()
         .int()
         .min(20)
         .max(2000000)
         .optional()
-        .describe('v10: drop tail rows once cumulative content length exceeds this.'),
+        .describe(
+          'v10: drop tail rows once cumulative content length exceeds this. First row is always kept.',
+        ),
     },
   },
   {
@@ -923,6 +939,94 @@ const TOOL_DEFS = [
       memory_id: z.string().min(4).max(64).describe('Source memory id.'),
       kind: z.enum(['imports', 'calls', 'defines']).optional(),
       depth: z.number().int().min(1).max(20).optional().describe('BFS depth. Default 1.'),
+    },
+  },
+  // ----- Phase-1 Dream consolidation -----
+  // Project-scoped review / apply surface for staged dream jobs.
+  // Lists, status snapshots, and the three lifecycle operations
+  // (enqueue, apply, discard). Global DB is intentionally absent —
+  // Phase-1 dreams never touch the cross-project store.
+  {
+    name: 'dream_list_jobs',
+    desc: 'List Phase-1 Dream jobs for a project, ordered newest-first. status filter optional.',
+    input: {
+      cwd: z.string().describe('Project root (absolute path). Required.'),
+      status: z
+        .enum(['queued', 'running', 'ready', 'applied', 'stale', 'failed', 'cancelled'])
+        .optional(),
+      limit: z.number().int().min(1).max(100).optional(),
+    },
+  },
+  {
+    name: 'dream_get_job',
+    desc: 'Fetch one Phase-1 Dream job by id with its proposal list.',
+    input: {
+      cwd: z.string().describe('Project root (absolute path). Required.'),
+      job_id: z.string().min(4).max(64).describe('Dream job id.'),
+    },
+  },
+  {
+    name: 'dream_list_proposals',
+    desc: 'List the proposals for a Phase-1 Dream job. status filter optional (pending|stale|approved|applied|rejected).',
+    input: {
+      cwd: z.string().describe('Project root (absolute path). Required.'),
+      job_id: z.string().min(4).max(64).describe('Dream job id.'),
+      status: z.enum(['pending', 'stale', 'approved', 'applied', 'rejected']).optional(),
+    },
+  },
+  {
+    name: 'dream_get_proposal',
+    desc: 'Fetch a single Phase-1 Dream proposal by id.',
+    input: {
+      cwd: z.string().describe('Project root (absolute path). Required.'),
+      proposal_id: z.string().min(4).max(64).describe('Dream proposal id.'),
+    },
+  },
+  {
+    name: 'dream_status',
+    desc: 'Compact Dream status snapshot for the project: counts per status + a short label. Never echoes memory ids or bodies.',
+    input: {
+      cwd: z.string().describe('Project root (absolute path). Required.'),
+    },
+  },
+  {
+    name: 'dream_enqueue',
+    desc: 'Enqueue a Phase-1 Dream job for the project. Idempotent: a concurrent or already-queued job is a no-op.',
+    input: {
+      cwd: z.string().describe('Project root (absolute path). Required.'),
+    },
+  },
+  {
+    name: 'dream_generate_proposals',
+    desc: 'Run the deterministic consolidate pass against a queued dream job and persist the resulting proposals. Marks the job `ready`. Live memories are untouched.',
+    input: {
+      cwd: z.string().describe('Project root (absolute path). Required.'),
+      job_id: z.string().min(4).max(64).describe('Dream job id.'),
+    },
+  },
+  {
+    name: 'dream_apply_job',
+    desc: 'Apply a ready Dream job in one transaction. Validates each proposal against the live rows (status, checksum), soft-supersedes unchanged sources, and marks stale proposals instead of applying them.',
+    input: {
+      cwd: z.string().describe('Project root (absolute path). Required.'),
+      job_id: z.string().min(4).max(64).describe('Dream job id.'),
+      auto_apply_confidence: z
+        .number()
+        .min(0)
+        .max(1)
+        .optional()
+        .describe(
+          'Skip proposals whose confidence is below this floor. Default applies all proposals.',
+        ),
+    },
+  },
+  {
+    name: 'dream_discard_job',
+    desc: 'Cancel a queued or ready Dream job. Pending proposals are marked rejected; live memories are untouched.',
+    input: {
+      cwd: z.string().describe('Project root (absolute path). Required.'),
+      job_id: z.string().min(4).max(64).describe('Dream job id.'),
+      reason: z.string().max(500).optional().describe('Optional discard reason.'),
     },
   },
 ];
@@ -1598,7 +1702,7 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
       try {
         reclone = detectReclone(project.db, project.projectKey, pr.value);
       } catch (e) {
-        reclone = { isReclone: false, reason: 'detect failed: ' + (e && e.message) };
+        reclone = { isReclone: false, reason: 'detect failed (see diagnostics)' };
       }
       return ok({
         project_key: project.projectKey,
@@ -2122,7 +2226,7 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
       try {
         reclone = detectReclone(handle, key, pr.value);
       } catch (e) {
-        reclone = { isReclone: false, reason: 'detect failed: ' + (e && e.message) };
+        reclone = { isReclone: false, reason: 'detect failed (see diagnostics)' };
       }
       // Always run the dry-run counter first so we can echo what would
       // be deleted. The destructive path uses a transaction, so a
@@ -2827,6 +2931,203 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
       last_error: walkerFailed || undefined,
     };
   }
+
+  // ---- Phase-1 Dream consolidation -----
+  // All Dream MCP tools operate strictly on the project DB. Global
+  // memories are never read or written. Each handler validates cwd
+  // through the same resolveProjectRoot path as the rest of the
+  // server so secret-scan / authorization conventions stay
+  // consistent.
+
+  server.tool(TOOL_DEFS[46].name, TOOL_DEFS[46].input, async (args) => {
+    try {
+      const pr = resolveProjectRoot(args.cwd);
+      if (!pr.ok) return textError(pr.error);
+      const target = openScopeDb({ cwd: pr.value, scope: 'project' });
+      const lim = validateLimit(args.limit, 1, 100, 20);
+      if (!lim.ok) return textError(lim.error);
+      const items = listDreamJobs(target.db, target.projectKey, {
+        status: args.status || null,
+        limit: lim.value,
+      });
+      return ok({
+        operation: 'dream_list_jobs',
+        status: args.status || null,
+        items,
+        count: items.length,
+        project_key: target.projectKey,
+      });
+    } catch (e) {
+      return textError(toError(e).error);
+    }
+  });
+
+  server.tool(TOOL_DEFS[47].name, TOOL_DEFS[47].input, async (args) => {
+    try {
+      const pr = resolveProjectRoot(args.cwd);
+      if (!pr.ok) return textError(pr.error);
+      const jobId = validateId(args.job_id);
+      if (!jobId.ok) return textError(jobId.error);
+      const target = openScopeDb({ cwd: pr.value, scope: 'project' });
+      const job = readDreamJob(target.db, target.projectKey, jobId.value);
+      if (!job) return textError(`dream job not found: ${jobId.value}`);
+      const proposals = listDreamProposals(target.db, target.projectKey, jobId.value);
+      return ok({
+        operation: 'dream_get_job',
+        job,
+        proposals,
+        proposals_count: proposals.length,
+        project_key: target.projectKey,
+      });
+    } catch (e) {
+      return textError(toError(e).error);
+    }
+  });
+
+  server.tool(TOOL_DEFS[48].name, TOOL_DEFS[48].input, async (args) => {
+    try {
+      const pr = resolveProjectRoot(args.cwd);
+      if (!pr.ok) return textError(pr.error);
+      const jobId = validateId(args.job_id);
+      if (!jobId.ok) return textError(jobId.error);
+      const target = openScopeDb({ cwd: pr.value, scope: 'project' });
+      const items = listDreamProposals(target.db, target.projectKey, jobId.value, {
+        status: args.status || null,
+      });
+      return ok({
+        operation: 'dream_list_proposals',
+        job_id: jobId.value,
+        status: args.status || null,
+        items,
+        count: items.length,
+        project_key: target.projectKey,
+      });
+    } catch (e) {
+      return textError(toError(e).error);
+    }
+  });
+
+  server.tool(TOOL_DEFS[49].name, TOOL_DEFS[49].input, async (args) => {
+    try {
+      const pr = resolveProjectRoot(args.cwd);
+      if (!pr.ok) return textError(pr.error);
+      const propId = validateId(args.proposal_id);
+      if (!propId.ok) return textError(propId.error);
+      const target = openScopeDb({ cwd: pr.value, scope: 'project' });
+      const proposal = readDreamProposal(target.db, target.projectKey, propId.value);
+      if (!proposal) return textError(`dream proposal not found: ${propId.value}`);
+      return ok({
+        operation: 'dream_get_proposal',
+        proposal,
+        project_key: target.projectKey,
+      });
+    } catch (e) {
+      return textError(toError(e).error);
+    }
+  });
+
+  server.tool(TOOL_DEFS[50].name, TOOL_DEFS[50].input, async (args) => {
+    try {
+      const pr = resolveProjectRoot(args.cwd);
+      if (!pr.ok) return textError(pr.error);
+      const target = openScopeDb({ cwd: pr.value, scope: 'project' });
+      const status = buildDreamStatus(target.db, target.projectKey);
+      return ok({
+        operation: 'dream_status',
+        status,
+        project_key: target.projectKey,
+      });
+    } catch (e) {
+      return textError(toError(e).error);
+    }
+  });
+
+  server.tool(TOOL_DEFS[51].name, TOOL_DEFS[51].input, async (args) => {
+    try {
+      const pr = resolveProjectRoot(args.cwd);
+      if (!pr.ok) return textError(pr.error);
+      const target = openScopeDb({ cwd: pr.value, scope: 'project', record: true });
+      const result = enqueueDreamJob(target.db, target.projectKey, {
+        triggered_by: 'mcp_tool',
+      });
+      return ok({
+        operation: 'dream_enqueue',
+        result,
+        project_key: target.projectKey,
+      });
+    } catch (e) {
+      return textError(toError(e).error);
+    }
+  });
+
+  server.tool(TOOL_DEFS[52].name, TOOL_DEFS[52].input, async (args) => {
+    try {
+      const pr = resolveProjectRoot(args.cwd);
+      if (!pr.ok) return textError(pr.error);
+      const jobId = validateId(args.job_id);
+      if (!jobId.ok) return textError(jobId.error);
+      const target = openScopeDb({ cwd: pr.value, scope: 'project', record: true });
+      const result = await generateProposalsForJob(target.db, target.projectKey, jobId.value, {
+        saveMemory,
+        memoryLink: linkMemory,
+        mergeMemory,
+      });
+      return ok({
+        operation: 'dream_generate_proposals',
+        job_id: jobId.value,
+        result,
+        project_key: target.projectKey,
+      });
+    } catch (e) {
+      return textError(toError(e).error);
+    }
+  });
+
+  server.tool(TOOL_DEFS[53].name, TOOL_DEFS[53].input, async (args) => {
+    try {
+      const pr = resolveProjectRoot(args.cwd);
+      if (!pr.ok) return textError(pr.error);
+      const jobId = validateId(args.job_id);
+      if (!jobId.ok) return textError(jobId.error);
+      const target = openScopeDb({ cwd: pr.value, scope: 'project', record: true });
+      const result = applyDreamJob(target.db, target.projectKey, jobId.value, {
+        saveMemory,
+        memoryLink: linkMemory,
+        mergeMemory,
+        autoApplyConfidence:
+          typeof args.auto_apply_confidence === 'number' ? args.auto_apply_confidence : null,
+      });
+      return ok({
+        operation: 'dream_apply_job',
+        job_id: jobId.value,
+        result,
+        project_key: target.projectKey,
+      });
+    } catch (e) {
+      return textError(toError(e).error);
+    }
+  });
+
+  server.tool(TOOL_DEFS[54].name, TOOL_DEFS[54].input, async (args) => {
+    try {
+      const pr = resolveProjectRoot(args.cwd);
+      if (!pr.ok) return textError(pr.error);
+      const jobId = validateId(args.job_id);
+      if (!jobId.ok) return textError(jobId.error);
+      const target = openScopeDb({ cwd: pr.value, scope: 'project', record: true });
+      const result = discardDreamJob(target.db, target.projectKey, jobId.value, {
+        reason: args.reason || 'cancelled',
+      });
+      return ok({
+        operation: 'dream_discard_job',
+        job_id: jobId.value,
+        result,
+        project_key: target.projectKey,
+      });
+    } catch (e) {
+      return textError(toError(e).error);
+    }
+  });
 
   function ok(payload) {
     return { content: [{ type: 'text', text: JSON.stringify(payload, null, 2) }] };

@@ -57,6 +57,16 @@ import { matchAdvisor, logAdvisorDiag } from '../advisor/detect.js';
 import { runConsolidate } from '../consolidate.js';
 import { runAutoGc } from '../auto-gc.js';
 import { runToolRecall, formatToolRecallLines } from './tool-recall.js';
+import {
+  enqueueDreamJob,
+  generateProposalsForJob,
+  applyDreamJob,
+  findReadyJob,
+  buildDreamStatus,
+  shouldEnqueue as shouldEnqueueDream,
+  lastDreamEnqueuedAt,
+  getAutoApplyConfidence,
+} from '../dream.js';
 import { logHookDiag } from '../diagnostics.js';
 
 const EVENT = asString(process.env.KM_HOOK_EVENT) || 'unknown';
@@ -466,6 +476,15 @@ function formatIngestSegment(ingest) {
   return 'skipped';
 }
 
+// Format the Dream segment for the status line. Mirrors the other
+// segment shapes: short token like "dream=ready:2" or "dream=applied:3".
+// The status object comes from buildDreamStatus() below; falls back
+// to "none" when the project DB is unavailable.
+function formatDreamSegment(status) {
+  if (!status) return 'none';
+  return status.label || 'none';
+}
+
 // Format the auto-extract result for the status line. Keeps it terse —
 // the agent gets the same shape from `memory_recall` if it wants
 // details. Distinguishes "LLM had no candidates" (clean skip) from
@@ -537,6 +556,7 @@ function buildStatusLine({
   focus,
   consolidate,
   autoGc,
+  dream,
 }) {
   const ingestSeg = formatIngestSegment(ingest);
   const recallSeg = recall ? ` recall project:${recall.project} global:${recall.global}` : '';
@@ -549,6 +569,7 @@ function buildStatusLine({
   const focusSeg = focus ? ` focus=${formatFocusSegment(focus)}` : '';
   const consolidateSeg = consolidate ? ` consolidate=${formatConsolidateSegment(consolidate)}` : '';
   const autoGcSeg = autoGc ? ` auto_gc=${formatAutoGcSegment(autoGc)}` : '';
+  const dreamSeg = dream ? ` dream=${formatDreamSegment(dream)}` : '';
   return [
     `[kimi-memory] event=${event}`,
     `project_key=${key}`,
@@ -557,7 +578,7 @@ function buildStatusLine({
     `wm=${counts.wm.length}`,
     `conv=${counts.conv}`,
     `events=${counts.events}`,
-    `ingest=${ingestSeg}${extractSeg}${workLogSeg}${focusSeg}${consolidateSeg}${autoGcSeg}${recallSeg}`,
+    `ingest=${ingestSeg}${extractSeg}${workLogSeg}${focusSeg}${consolidateSeg}${autoGcSeg}${dreamSeg}${recallSeg}`,
     `cwd=${cwd}`,
   ].join(' ');
 }
@@ -952,6 +973,25 @@ async function handleSessionStart(payload) {
       autoGc = { error: e && e.message };
     }
   }
+
+  // Phase-1 Dream: opportunistically apply one ready job. Never
+  // blocks the hook — the apply is bounded by CONSOLIDATE_BOUNDS so
+  // it cannot overrun the 8s timeout. Surface a compact status
+  // segment so the agent sees the count of applied / pending dreams.
+  let dream = null;
+  if (projectDb) {
+    try {
+      const applyResult = await maybeApplyReadyDream(projectDb, key);
+      const status = buildDreamStatus(projectDb, key);
+      dream = { ...status, apply: applyResult };
+      if (applyResult && applyResult.apply && applyResult.apply.ok) {
+        await logDiag('info', 'dream apply result', { key, apply: applyResult.apply });
+      }
+    } catch (e) {
+      dream = { label: 'err:' + (e && e.message), error: e && e.message };
+    }
+  }
+
   const lines = [];
   lines.push(
     buildStatusLine({
@@ -965,6 +1005,7 @@ async function handleSessionStart(payload) {
       focus: latestFocus,
       consolidate,
       autoGc,
+      dream,
     }),
   );
   lines.push(recentSummary);
@@ -1028,6 +1069,7 @@ async function handleSessionStart(payload) {
     extract: latestExtract,
     workLog: latestWorkLog,
     stale_memory: staleMemoryLine ? true : false,
+    dream,
   };
 }
 
@@ -1083,6 +1125,7 @@ async function handleUserPromptSubmit(payload) {
         project: recall.projectHits.length,
         global: recall.globalHits.length,
       },
+      dream: projectDb ? buildDreamStatus(projectDb, key) : null,
     }),
   );
   if (recall.summary) lines.push(recall.summary);
@@ -1153,6 +1196,90 @@ async function handleUserPromptSubmit(payload) {
     stale_memory: staleMemoryLine ? true : false,
     additional_context: additionalContext,
   };
+}
+
+// Phase-1 Dream enqueue. Called from Stop / SessionEnd after the
+// extract + work-log + session-focus steps have completed. The hook
+// must stay fail-open: every error is swallowed + logged. Heavy work
+// (proposal generation, apply) happens on the next SessionStart or
+// via the explicit MCP tools — this function only enqueues and
+// returns a short status segment.
+async function maybeEnqueueDream(projectDb, projectKey, cwd) {
+  if (!projectDb || !projectKey) return { skipped: 'no_inputs' };
+  if (process.env.KIMI_MEMORY_DREAM === 'off') return { skipped: 'env_opt_out' };
+  if (!cwd) return { skipped: 'no_cwd' };
+  let eventCount = 0;
+  try {
+    eventCount = projectDb
+      .prepare('SELECT COUNT(*) AS n FROM conversation_events WHERE project_key=?')
+      .get(projectKey).n;
+  } catch {
+    return { skipped: 'snapshot_threw' };
+  }
+  let last;
+  try {
+    last = lastDreamEnqueuedAt(projectDb, projectKey);
+  } catch {
+    last = null;
+  }
+  const gate = shouldEnqueueDream(projectDb, projectKey, {
+    lastEnqueuedAt: last,
+    eventCount,
+  });
+  if (!gate.enqueue) {
+    return { skipped: gate.reason };
+  }
+  let enqueue;
+  try {
+    enqueue = enqueueDreamJob(projectDb, projectKey, { triggered_by: 'lifecycle' });
+  } catch (e) {
+    return { skipped: 'enqueue_threw', error: e && e.message };
+  }
+  if (enqueue && enqueue.status === 'enqueued' && enqueue.job_id) {
+    // Opportunistically generate proposals in the same hook budget.
+    // The proposal pass is bounded by CONSOLIDATE_BOUNDS so it cannot
+    // pin the SessionEnd timeout. Failures flip the job to `failed`
+    // inside generateProposalsForJob so the lifecycle can re-enqueue
+    // on the next pass without operator action.
+    try {
+      const r = await generateProposalsForJob(projectDb, projectKey, enqueue.job_id, {
+        saveMemory,
+        memoryLink: linkMemory,
+        mergeMemory,
+      });
+      return { ...enqueue, generate: r };
+    } catch (e) {
+      return { ...enqueue, generate: { ok: false, reason: 'threw', error: e && e.message } };
+    }
+  }
+  return enqueue;
+}
+
+// Phase-1 Dream apply. Called from SessionStart. We only ever apply
+// one job per SessionStart so the 8s hook budget is never overrun.
+// Stale or failed jobs are left alone — the next enqueue will start
+// fresh.
+async function maybeApplyReadyDream(projectDb, projectKey) {
+  if (!projectDb || !projectKey) return { skipped: 'no_inputs' };
+  if (process.env.KIMI_MEMORY_DREAM === 'off') return { skipped: 'env_opt_out' };
+  let readyId;
+  try {
+    readyId = findReadyJob(projectDb, projectKey);
+  } catch {
+    return { skipped: 'lookup_threw' };
+  }
+  if (!readyId) return { skipped: 'no_ready' };
+  try {
+    const r = applyDreamJob(projectDb, projectKey, readyId, {
+      saveMemory,
+      memoryLink: linkMemory,
+      mergeMemory,
+      autoApplyConfidence: getAutoApplyConfidence(),
+    });
+    return { applied_job_id: readyId, apply: r };
+  } catch (e) {
+    return { applied_job_id: readyId, skipped: 'apply_threw', error: e && e.message };
+  }
 }
 
 async function handleStop(payload) {
@@ -1254,7 +1381,26 @@ async function handleStop(payload) {
     }
   }
 
-  return { ok: true, ingest, extract, workLog, focus };
+  // Phase-1 Dream enqueue. Runs after every other write so the
+  // activity threshold reflects the just-ingested session. Failures
+  // here never throw out of the hook.
+  let dream = null;
+  if (cwd) {
+    try {
+      const key = deriveProjectKey(cwd);
+      const dbPath = path.join(HOME, 'kimi-memory', key, 'memory.sqlite');
+      const db = safeOpenDb(dbPath);
+      if (db) {
+        dream = await maybeEnqueueDream(db, key, cwd);
+        if (dream) await logDiag('info', 'dream enqueue result', { key, dream });
+      }
+    } catch (e) {
+      dream = { skipped: 'dream_threw', error: e && e.message };
+      await logDiag('warn', 'dream enqueue threw', { error: e && e.message });
+    }
+  }
+
+  return { ok: true, ingest, extract, workLog, focus, dream };
 }
 
 // Read the most recently persisted extract + work-log + session-focus

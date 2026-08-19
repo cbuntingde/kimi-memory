@@ -125,7 +125,7 @@ test('manifest tool count claim matches the registered tool count', () => {
   assert.ok(def, 'TOOL_DEFS not found in src/server.js');
   const toolNames =
     def[1].match(
-      /name: '(?:memory_|working_memory_|conversation_|acl_|wiki_|codegraph_)[a-z_]+'/g,
+      /name: '(?:memory_|working_memory_|conversation_|acl_|wiki_|codegraph_|dream_)[a-z_]+'/g,
     ) || [];
   const toolCount = toolNames.length;
   assert.ok(toolCount > 0, 'no tools registered in TOOL_DEFS');
@@ -219,7 +219,7 @@ test('memory_prune tool is registered, wired, and documented', () => {
   // The exact count is governed by the regex match above; this hardcode
   // exists to flag a description that claims a different number than the
   // TOOL_DEFS array. Bump this when a new tool is added.
-  assert.match(long, /Tools \(46\):/, 'longDescription must claim Tools (46)');
+  assert.match(long, /Tools \(55\):/, 'longDescription must claim Tools (55)');
   // The slash command exists and links to the tool.
   const pruneCmd = readFileSync(path.join(root, 'commands', 'prune.md'), 'utf8');
   assert.match(pruneCmd, /memory_prune\(/);

@@ -76,7 +76,16 @@ export function deriveProjectKey(canonicalRoot) {
   // the rest of the path. Funneling through canonicalizeRoot makes the
   // function self-correcting.
   const normalized = canonicalizeRoot(canonicalRoot) || canonicalRoot;
-  return createHash('sha256').update(normalized).digest('hex').slice(0, 16);
+  // Windows file paths are case-insensitive per the Win32 file APIs.
+  // canonicalizeRoot only normalises the drive letter (uppercased);
+  // the rest of the path is preserved verbatim, which would let
+  // `C:\Users\Foo\bar` and `c:\users\foo\Bar` hash to different
+  // project_keys on Windows despite pointing at the same directory.
+  // Lowercase the whole canonical path on win32 before hashing. (Audit
+  // fix — the previous comment claimed this was already handled via a
+  // "separate lowercase step" that did not actually exist.)
+  const hashable = process.platform === 'win32' ? normalized.toLowerCase() : normalized;
+  return createHash('sha256').update(hashable).digest('hex').slice(0, 16);
 }
 
 // Per-project data directory.

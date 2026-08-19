@@ -30,6 +30,21 @@ test('canonicalizeRoot accepts absolute paths and rejects the rest', () => {
   assert.equal(canonicalizeRoot('c:/foo/bar'), winFoo);
 });
 
+test('deriveProjectKey: Windows paths are case-insensitive on the whole path, not just the drive letter', () => {
+  // The previous shape normalised the drive letter but not the rest
+  // of the path, so `C:\Foo\bar` and `c:\foo\Bar` would hash to
+  // different project_keys on Windows despite pointing at the same
+  // directory. The fix lowercases the whole canonical path on win32
+  // before hashing. On non-Windows hosts the hash is verbatim, so the
+  // assertion is gated to win32.
+  if (process.platform !== 'win32') return;
+  const a = deriveProjectKey(canonicalizeRoot('C:\\Foo\\bar'));
+  const b = deriveProjectKey(canonicalizeRoot('c:\\foo\\Bar'));
+  const c = deriveProjectKey(canonicalizeRoot('C:\\foo\\bar'));
+  assert.equal(a, b, 'mixed-case Windows paths hash to the same key');
+  assert.equal(a, c, 'canonicalised Windows paths hash to the same key');
+});
+
 test('deriveProjectKey is deterministic and isolating', () => {
   const a = deriveProjectKey(canonicalizeRoot('C:/projects/alpha'));
   const b = deriveProjectKey(canonicalizeRoot('C:/projects/alpha'));

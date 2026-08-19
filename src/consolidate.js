@@ -257,6 +257,17 @@ function unionTags(cluster) {
 //
 //   saveMemory(db, projectKey, input)
 //   memoryLink(db, projectKey, fromId, toId, 'synthesizes', { weight })
+//
+// Two modes:
+//   - direct (default): write conclusions + soft-merge tight clusters
+//     into the live memories table. Used by SessionStart / direct
+//     tests. Behaviour identical to the pre-dream implementation.
+//   - proposal: walk the same clusters and emit a list of proposed
+//     operations (conclusion, merge, link) without mutating the live
+//     store. Used by the Phase-1 dream pipeline (src/dream.js) so a
+//     separate apply step can validate inputs and commit. Returning
+//     proposals is a pure function over the snapshot; it never
+//     touches the DB.
 export async function runConsolidate({
   db,
   projectKey,
@@ -265,6 +276,10 @@ export async function runConsolidate({
   mergeMemory,
   isDisabled = () => process.env.KIMI_MEMORY_CONSOLIDATE === 'off',
   decodeEmbeddingImpl = decodeEmbedding,
+  // 'proposal' returns the same shape as direct mode but the caller
+  // gets a `proposals` array and the live memories table is
+  // untouched. Anything else falls back to the legacy direct path.
+  mode = 'direct',
 }) {
   const result = {
     scanned: 0,
@@ -274,6 +289,7 @@ export async function runConsolidate({
     errors: 0,
     merged: 0,
     mergeSkipped: 0,
+    proposals: [],
   };
   if (isDisabled()) {
     result.skipped = 'env_opt_out';
@@ -281,10 +297,6 @@ export async function runConsolidate({
   }
   if (!db || !projectKey) {
     result.skipped = 'no_inputs';
-    return result;
-  }
-  if (!saveMemory || !memoryLink) {
-    result.skipped = 'no_persist';
     return result;
   }
 
@@ -335,6 +347,84 @@ export async function runConsolidate({
     const title = buildConclusionTitle(cluster);
     const content = buildConclusionBody(cluster);
     const tags = ['consolidation', 'auto', ...unionTags(cluster).slice(0, 6)];
+    const provenance = {
+      source: 'consolidation_pass',
+      child_ids: cluster.map((m) => m.id),
+      cluster_size: cluster.length,
+      recorded_at: nowIso(),
+    };
+
+    // Proposal mode: emit the conclusion + edge proposals into the
+    // collector and continue. The live memories table is untouched;
+    // apply is a separate transaction in src/dream.js.
+    if (mode === 'proposal') {
+      // source_checksum binds the proposal to the snapshot it was
+      // generated against; apply re-derives it and marks the proposal
+      // stale when any source row drifted.
+      const checksum = sourceChecksum(cluster);
+      result.proposals.push({
+        kind: 'conclusion',
+        source_ids: cluster.map((m) => m.id),
+        target_ids: [],
+        proposed_content: content,
+        proposed_title: title,
+        proposed_tags: tags,
+        confidence: 0.7,
+        provenance: { ...provenance, proposed_kind: 'conclusion' },
+        source_checksum: checksum,
+      });
+      // One link proposal per child → conclusion so the apply step
+      // can install typed `synthesizes` edges without re-walking the
+      // cluster. The target id is the conclusion id we just proposed;
+      // the apply step substitutes the persisted id after the
+      // conclusion insert.
+      for (const child of cluster) {
+        result.proposals.push({
+          kind: 'link',
+          source_ids: [child.id],
+          target_ids: [],
+          proposed_content: '',
+          proposed_title: '',
+          proposed_tags: [],
+          confidence: 0.7,
+          provenance: { ...provenance, proposed_kind: 'synthesizes_link' },
+          source_checksum: checksum,
+        });
+      }
+      // Tight clusters also propose merges. The merge target is the
+      // highest-confidence sibling; siblings are listed in source_ids.
+      if (autoMergeEnabled && cluster.length >= AUTO_MERGE_THRESHOLDS.clusterSize) {
+        const isTight = isClusterTight(cluster, decodeEmbeddingImpl);
+        if (isTight) {
+          const target = pickMergeTarget(cluster);
+          const siblings = cluster.filter((m) => m.id !== target.id);
+          if (siblings.length > 0) {
+            result.proposals.push({
+              kind: 'merge',
+              source_ids: [target.id, ...siblings.map((m) => m.id)],
+              target_ids: [target.id],
+              proposed_content: content,
+              proposed_title: '',
+              proposed_tags: [],
+              confidence: 0.85,
+              provenance: { ...provenance, proposed_kind: 'merge', merge_target: target.id },
+              source_checksum: checksum,
+            });
+          }
+        }
+      }
+      result.saved += 1;
+      for (const m of cluster) covered.add(m.id);
+      continue;
+    }
+
+    // Direct mode (legacy behaviour). saveMemory / memoryLink /
+    // mergeMemory are required; if any are missing we skip rather than
+    // crash (preserves the documented contract).
+    if (!saveMemory || !memoryLink) {
+      result.skipped = 'no_persist';
+      return result;
+    }
 
     let saved;
     try {
@@ -345,12 +435,7 @@ export async function runConsolidate({
         tags,
         confidence: 0.7,
         priority: 0,
-        provenance: {
-          source: 'consolidation_pass',
-          child_ids: cluster.map((m) => m.id),
-          cluster_size: cluster.length,
-          recorded_at: nowIso(),
-        },
+        provenance,
         synthesizes: cluster.map((m) => m.id),
         _embed: false,
       });
@@ -464,3 +549,67 @@ export async function runConsolidate({
 
   return result;
 }
+
+// Pick the highest-confidence sibling as the merge target. Ties broken
+// by updated_at DESC (most recent wins). Mirrors the direct-mode logic
+// above so proposal mode and direct mode pick the same target.
+function pickMergeTarget(cluster) {
+  return cluster.reduce((best, m) => {
+    const bestConf = best.confidence || 0;
+    const mConf = m.confidence || 0;
+    if (mConf > bestConf) return m;
+    if (mConf === bestConf && (m.updatedAt || '') > (best.updatedAt || '')) return m;
+    return best;
+  });
+}
+
+// Re-test a cluster against the auto-merge tightness thresholds. Same
+// math as the direct-mode branch above; isolated here so proposal mode
+// does not duplicate the cosine / tag-overlap loops.
+function isClusterTight(cluster, decodeEmbeddingImpl) {
+  if (!decodeEmbeddingImpl) return false;
+  const tightVec = decodeEmbeddingImpl(cluster[0].embedding);
+  if (!tightVec) return false;
+  const tight = cluster[0];
+  for (let i = 1; i < cluster.length; i++) {
+    const sibling = cluster[i];
+    const otherVec =
+      (tight.embedding === sibling.embedding && tight.embedding ? tightVec : null) ||
+      decodeEmbeddingImpl(sibling.embedding);
+    if (!otherVec) return false;
+    if (cosine(tightVec, otherVec) < AUTO_MERGE_THRESHOLDS.cosine) return false;
+    if (tagOverlap(cluster[0].tagTokens, cluster[i].tagTokens) < AUTO_MERGE_THRESHOLDS.tagOverlap)
+      return false;
+  }
+  return true;
+}
+
+// Stable checksum over the (id, updated_at) pairs of a cluster. The
+// apply step re-derives this; a mismatch means one of the source rows
+// drifted and the proposal is stale.
+function sourceChecksum(cluster) {
+  const parts = cluster
+    .map((m) => `${m.id}@${m.updatedAt || ''}`)
+    .sort()
+    .join('|');
+  return parts;
+}
+
+// Exported so src/dream.js#applyJob can validate a proposal against
+// the live rows before applying.
+export function proposalSourceChecksum(cluster) {
+  return sourceChecksum(cluster);
+}
+
+// Re-export the thresholds + caps so the dream layer can describe
+// proposals without re-deriving them. Mirrors the live direct-mode
+// shape — a change here is a change to both modes.
+export const CONSOLIDATE_BOUNDS = {
+  inputCap: CONSOLIDATE_INPUT_CAP,
+  maxClusters: CONSOLIDATE_MAX_CLUSTERS,
+  maxMembers: CONSOLIDATE_MAX_MEMBERS,
+  minClusterSize: MIN_CLUSTER_SIZE,
+  cosineThreshold: CONSOLIDATE_THRESHOLD,
+  minTagOverlap: MIN_TAG_OVERLAP,
+  coverageRatio: COVERAGE_RATIO,
+};

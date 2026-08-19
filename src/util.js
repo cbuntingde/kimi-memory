@@ -201,3 +201,32 @@ export function projectKeyFromCwd(cwd) {
   if (!cwd) return null;
   return createHash('sha256').update(path.resolve(cwd)).digest('hex').slice(0, 16);
 }
+
+// Sanitize an exception for return to a remote caller. Strips
+// absolute-path fragments, host:port fragments, and long stack dumps
+// that could leak filesystem layout, internal IPs, or library versions
+// to the agent context. Used by every code path that wraps a caught
+// error into an MCP tool response or a CLI line. (Audit fix.)
+//
+// The shape mirrors toError in src/validation.js but applies a stricter
+// regex so a caller who simply forwards `(e && e.message)` does not
+// accidentally expose internal strings. Anything we cannot classify
+// gets truncated to 200 chars so a verbose third-party exception cannot
+// flood the response.
+const PATH_FRAGMENT =
+  /(?:\/(?:[\w.\-]+\/)+[\w.\-]+)|(?:[A-Za-z]:[\\\/](?:[\w.\-]+[\\\/])+[\w.\-]+)/g;
+const HOST_PORT = /\b(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?\b/g;
+const SCHEME_URL = /\b[a-z][a-z0-9+.\-]*:\/\/[^\s)]+/gi;
+export function safeErrorMessage(e) {
+  if (!e) return 'unknown error';
+  const raw = typeof e === 'string' ? e : e && e.message ? String(e.message) : 'unknown error';
+  if (!raw) return 'unknown error';
+  let out = raw
+    .replace(SCHEME_URL, '<url>')
+    .replace(HOST_PORT, '<addr>')
+    .replace(PATH_FRAGMENT, '<path>');
+  // Collapse runs of whitespace introduced by the substitutions.
+  out = out.replace(/\s{2,}/g, ' ').trim();
+  if (out.length > 200) out = out.slice(0, 200) + '…';
+  return out || 'unknown error';
+}

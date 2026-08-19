@@ -5,13 +5,18 @@
 // All logging is fail-safe: errors writing to the log file do not propagate.
 // This module is designed to be called from hooks and MCP handlers.
 
-import { promises as fs, mkdirSync } from 'node:fs';
+import { promises as fs, mkdirSync, readdirSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { kimiHome, nowIso } from './util.js';
 
 const LOG_DIR = path.join(kimiHome(), 'kimi-memory', '_diagnostics');
 const HOOKS_LOG = path.join(LOG_DIR, 'hooks.log');
 const MAX_LOG_SIZE = 50 * 1024 * 1024; // 50 MB
+// Backups older than this are deleted on the next append. Mirrors the
+// `ARCHIVE_CONVERSATION_EVENTS_DAYS = 180` convention in auto-gc.js
+// (180 days for conversation events; 90 is enough for diagnostic
+// backups since they're rotated snapshots of the same content).
+const BACKUP_MAX_AGE_DAYS = 90;
 
 // Ensure log directory exists (synchronous for hook context).
 function ensureLogDir() {
@@ -31,7 +36,35 @@ function ensureLogDir() {
 // inside the same millisecond on Windows (where `fs.rename` to an
 // existing target throws `EEXIST`) cannot collide. (Audit fix
 // BUG-9.)
+//
+// Pruning: on every rotation we also sweep the LOG_DIR for backup
+// files older than BACKUP_MAX_AGE_DAYS. Bounded by a 1-hour cooldown
+// so the directory listing does not run on every append. (Audit fix.)
 let rotationCounter = 0;
+let lastPruneAt = 0;
+const PRUNE_COOLDOWN_MS = 60 * 60 * 1000;
+async function maybePruneOldBackups() {
+  const now = Date.now();
+  if (now - lastPruneAt < PRUNE_COOLDOWN_MS) return;
+  lastPruneAt = now;
+  const cutoffMs = now - BACKUP_MAX_AGE_DAYS * 24 * 60 * 60 * 1000;
+  let entries;
+  try {
+    entries = readdirSync(LOG_DIR);
+  } catch {
+    return;
+  }
+  for (const name of entries) {
+    if (!name.startsWith('hooks-') || !name.endsWith('.log')) continue;
+    const full = path.join(LOG_DIR, name);
+    try {
+      const st = statSync(full);
+      if (st.mtimeMs < cutoffMs) await fs.unlink(full);
+    } catch {
+      /* ignore — another process may have already pruned it */
+    }
+  }
+}
 async function appendLog(record) {
   ensureLogDir();
   try {
@@ -51,6 +84,8 @@ async function appendLog(record) {
         const suffix = randomBytes(3).toString('hex');
         const backup = path.join(LOG_DIR, `hooks-${timestamp}-${seq}-${suffix}.log`);
         await fs.rename(HOOKS_LOG, backup);
+        // Sweep stale backups out-of-band of the rotation write.
+        await maybePruneOldBackups();
       }
     } catch (err) {
       // ENOENT is normal (first write); other errors are silent.
@@ -62,6 +97,14 @@ async function appendLog(record) {
   } catch {
     // Silent failure: do not disrupt the hook or MCP handler.
   }
+}
+
+// Public entry point so auto-gc can drive the prune on its schedule
+// instead of waiting for a rotation. The internal cooldown in
+// `maybePruneOldBackups` keeps this cheap.
+export async function pruneOldLogBackups() {
+  ensureLogDir();
+  await maybePruneOldBackups();
 }
 
 // Structured record types for different failure modes.

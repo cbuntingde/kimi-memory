@@ -80,6 +80,8 @@ async function getPipeline() {
       const pipe = await pipeline('feature-extraction', EMBEDDING_MODEL, { quantized: true });
       pipelineLoaded = true;
       lastError = null;
+      // Tell the user the download happened on this first load.
+      noticeDownloadOnce(EMBEDDING_MODEL, env.cacheDir || null);
       return pipe;
     })();
   }
@@ -148,6 +150,24 @@ function warnOnce(msg) {
   warnedOnce = true;
   try {
     process.stderr.write(`[kimi-memory] ${msg}\n`);
+  } catch {
+    /* ignore */
+  }
+}
+
+// One-time notice on first successful model load. The README documents
+// this, but a user who never reads the README would otherwise be
+// surprised by an outbound HTTPS request to Hugging Face Hub the
+// moment they save their first memory. (Audit fix.)
+let downloadNoticed = false;
+function noticeDownloadOnce(modelId, cacheDir) {
+  if (downloadNoticed) return;
+  downloadNoticed = true;
+  try {
+    const cache = cacheDir ? ` (cache: ${cacheDir})` : '';
+    process.stderr.write(
+      `[kimi-memory] first call downloaded embedding model ${modelId} (~25 MB) from Hugging Face Hub${cache}; subsequent calls use the local cache.\n`,
+    );
   } catch {
     /* ignore */
   }

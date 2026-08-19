@@ -266,6 +266,31 @@ export async function startProxy({
       return;
     }
 
+    // Readiness — same shape as /healthz but a separate route so a
+    // k8s probe can distinguish "the process is alive" from "the
+    // process can actually serve tool calls". Right now the two are
+    // equivalent because the tool registry is loaded at startup; if
+    // we ever add a deferred bootstrap (e.g. lazy model download),
+    // /readyz will flip first. Open to anyone so the probe can hit
+    // it without a token.
+    if (path === '/readyz') {
+      let ready = true;
+      let reason = null;
+      try {
+        const registry = mcp.server && (mcp.server._registeredTools || mcp.server._tools);
+        if (!registry) {
+          ready = false;
+          reason = 'mcp tool registry not accessible';
+        }
+      } catch (e) {
+        ready = false;
+        reason = e && e.message ? e.message : String(e);
+      }
+      res.writeHead(ready ? 200 : 503, { 'content-type': 'application/json' });
+      res.end(JSON.stringify({ ok: ready, reason, startedAt: state.startedAt }));
+      return;
+    }
+
     // Auth gate for every other route, including /tools. Free tool
     // enumeration would let an unauthenticated probe catalogue the
     // proxy's attack surface; require the bearer for everything that

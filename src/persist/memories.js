@@ -3,7 +3,7 @@
 //
 // Core memory lifecycle lives here. Search, recall, reinforcement,
 // edges, sharing, and skills all sit in sibling modules.
-import { nowIso, hashId, shortId, safeJsonParse } from '../util.js';
+import { nowIso, hashId, shortId, safeJsonParse, safeErrorMessage } from '../util.js';
 import { looksLikeSecret } from '../extract.js';
 import {
   EMBEDDING_MODEL,
@@ -589,13 +589,18 @@ function scheduleEmbeddingUpdate(db, id, title, content) {
         // available — `lastEmbeddingError()` carries the timeout
         // message or the real error from the import / pipe — and
         // fall back to a generic one for the cold-cache case where
-        // we never reached the encoder at all.
-        const reason =
+        // we never reached the encoder at all. Sanitise via
+        // safeErrorMessage so a stack trace / file path / internal
+        // URL from the encoder never lands in a memory row visible
+        // to the agent through memory_recall / memory_get /
+        // memory_status.
+        const reason = safeErrorMessage(
           embedErr ||
-          lastEmbeddingError() ||
-          (process.env.KIMI_MEMORY_EMBEDDINGS === 'off'
-            ? 'embeddings disabled (KIMI_MEMORY_EMBEDDINGS=off)'
-            : 'embedding model unavailable');
+            lastEmbeddingError() ||
+            (process.env.KIMI_MEMORY_EMBEDDINGS === 'off'
+              ? 'embeddings disabled (KIMI_MEMORY_EMBEDDINGS=off)'
+              : 'embedding model unavailable'),
+        );
         db.prepare(
           `UPDATE memories
                     SET last_embed_error=?, embedded_at=?

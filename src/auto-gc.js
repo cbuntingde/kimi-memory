@@ -21,6 +21,7 @@
 // after counts so the operator can audit what changed.
 
 import { nowIso } from './util.js';
+import { pruneOldLogBackups } from './diagnostics.js';
 
 // ----- Auto-prune thresholds -----
 // All times are days. A row is "ripe" for pruning when it has been
@@ -81,6 +82,12 @@ const ARCHIVE_SKILL_INVOCATIONS_DAYS = 90;
 // Drop raw persona_promotions older than 365 days. Tier-transition
 // history is useful for audit but rarely a year old.
 const ARCHIVE_PERSONA_PROMOTIONS_DAYS = 365;
+
+// Drop rotated diagnostic backups older than 90 days. Mirrors the
+// per-row archive windows above. Lives in diagnostics.js for the
+// actual filesystem sweep; here we just trigger it on the same
+// 6-hour throttle as the other passes.
+const ARCHIVE_DIAGNOSTIC_BACKUPS_DAYS = 90;
 
 // ----- Auto-tier thresholds -----
 
@@ -282,6 +289,7 @@ export function runAutoArchive(db, projectKey, { now = new Date() } = {}) {
     archived_conversation_events: 0,
     archived_skill_invocations: 0,
     archived_persona_promotions: 0,
+    archived_log_backups: 0,
     skipped: null,
     error: null,
   };
@@ -354,6 +362,15 @@ export function runAutoArchive(db, projectKey, { now = new Date() } = {}) {
     projectKey,
     ARCHIVE_PERSONA_PROMOTIONS_DAYS,
   );
+
+  // Diagnostic log backups live on disk under _diagnostics/, not in
+  // the project DB, so they cannot be pruned by SQL. The sweep runs
+  // fire-and-forget so we don't have to make runAutoArchive async
+  // (every caller is sync — the run.js hook reads the return
+  // shape synchronously). pruneOldLogBackups is internally
+  // fail-open; the .catch() below keeps any rejection out of the
+  // unhandled-promise path.
+  pruneOldLogBackups().catch(() => {});
 
   return result;
 }

@@ -19,7 +19,7 @@ import {
   encodeVector,
   lastEmbeddingError,
 } from '../embedding.js';
-import { nowIso } from '../util.js';
+import { nowIso, safeErrorMessage } from '../util.js';
 
 // Tunables. Both are deliberately small — this is a hook, not a job.
 const RETRY_MIN_AGE_HOURS = 24;
@@ -66,13 +66,16 @@ export async function retryFailedEmbeddings(db, projectKey) {
         recovered += 1;
       } else {
         // Same shape as saveMemory's failure path: record the most
-        // specific reason we have. The 24h gate means we only see
-        // this every-so-often per row.
-        const reason =
+        // specific reason we have, sanitised so a stack trace / file
+        // path / internal URL from the encoder does not leak into the
+        // memory row's last_embed_error (which the agent can read via
+        // memory_status / memory_get / memory_recall).
+        const reason = safeErrorMessage(
           lastEmbeddingError() ||
-          (process.env.KIMI_MEMORY_EMBEDDINGS === 'off'
-            ? 'embeddings disabled (KIMI_MEMORY_EMBEDDINGS=off)'
-            : 'embedding model unavailable');
+            (process.env.KIMI_MEMORY_EMBEDDINGS === 'off'
+              ? 'embeddings disabled (KIMI_MEMORY_EMBEDDINGS=off)'
+              : 'embedding model unavailable'),
+        );
         db.prepare(
           `UPDATE memories
            SET last_embed_error=?, embedded_at=?

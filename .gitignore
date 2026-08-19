@@ -53,10 +53,7 @@ ships/
 *.tgz
 *.tar.gz
 
-# Internal planning / AI-shared docs.
-# The repo's public surface is README.md + CONTRIBUTING.md +
-# ARCHITECTURE.md + CONVENTIONS.md + PROJECT.md + CHANGELOG.md.
-# Internal notes stay on disk but out of the public tree.
+# Internal planning / AI-shared docs. The public surface is README.md.
 AGENTS.md
 plans/
 todo/
