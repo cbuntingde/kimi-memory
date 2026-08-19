@@ -1,6 +1,6 @@
 {
   "name": "kimi-memory",
-  "version": "0.5.1",
+  "version": "0.6.0",
   "description": "Three-layer local memory for Kimi Code (global user memory, per-project durable + working memory, per-project session archives) plus an integrated advisor subsystem for reflective prompts. Exposed via MCP tools, lifecycle hooks, and slash commands.",
   "skills": "./skills/",
   "sessionStart": {

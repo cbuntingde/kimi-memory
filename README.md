@@ -87,9 +87,9 @@ cross-project writes and supply provenance context.
 
 ## Tools
 
-The plugin exposes 46 MCP tools over the `kimi-memory` stdio server:
+The plugin exposes 55 MCP tools over the `kimi-memory` stdio server:
 
-- **Durable memory** — `memory_save`, `memory_recall`, `memory_list`, `memory_get`, `memory_update`, `memory_delete`, `memory_save_bulk`, `memory_status`
+- **Durable memory** — `memory_save`, `memory_recall`, `memory_list`, `memory_get`, `memory_update`, `memory_delete`, `memory_save_bulk`, `memory_status`, `memory_reinforce`
 - **Similarity + edges** — `memory_similar`, `memory_link`, `memory_unlink`, `memory_edges`, `memory_merge`
 - **Synthesis** — `memory_conclusions_for`, `memory_parents`
 - **Working memory** — `working_memory_set`, `working_memory_get`, `working_memory_clear`
@@ -99,6 +99,7 @@ The plugin exposes 46 MCP tools over the `kimi-memory` stdio server:
 - **Wiki** — `wiki_upsert_page`, `wiki_get_page`, `wiki_traverse`, `wiki_backlinks`, `wiki_resolve`
 - **Codegraph** — `codegraph_extract`, `codegraph_build_edges`, `codegraph_query_symbol`, `codegraph_impact_path`, `codegraph_callers`, `codegraph_callees`
 - **Maintenance** — `memory_prune`, `memory_reset_project`, `memory_diagnostics`
+- **Dream (staged consolidation)** — `dream_list_jobs`, `dream_get_job`, `dream_list_proposals`, `dream_get_proposal`, `dream_status`, `dream_enqueue`, `dream_generate_proposals`, `dream_apply_job`, `dream_discard_job`
 
 Defaults: `memory_save` / `memory_update` / `memory_delete` write to
 `scope: "project"`; `memory_recall` / `memory_list` / `memory_get` read
@@ -132,21 +133,22 @@ project. Both are dry runs by default.
 
 All optional; defaults are tuned for production.
 
-| Variable                            | Default | Effect                                                                                                |
-| ----------------------------------- | ------- | ----------------------------------------------------------------------------------------------------- |
-| `KIMI_MEMORY_EMBEDDINGS`            | `on`    | Set to `off` to skip the embedding encoder. Recall falls back to FTS5-only.                           |
-| `KIMI_MEMORY_EMBED_TIMEOUT_MS`      | `4000`  | Wall-clock cap on a single embedding call.                                                            |
-| `KIMI_MEMORY_AUTO_EXTRACT`          | `on`    | Set to `off` to disable the Stop-hook auto-extraction LLM call.                                       |
-| `KIMI_MEMORY_SECRET_SCAN`           | `on`    | Set to `off` to bypass the server-side secret pre-write check. Use only for legitimate test fixtures. |
-| `KIMI_MEMORY_PROXY_CORS_ORIGINS`    | unset   | Comma-separated origin allowlist for the HTTP proxy.                                                  |
-| `KIMI_MEMORY_CONSOLIDATE`           | `on`    | Set to `off` to skip the background "dream pass" (conclusion synthesis + auto-merge).                 |
-| `KIMI_MEMORY_AUTO_MERGE`            | `on`    | Set to `off` to disable auto-merge of tight sibling clusters (synthesis still runs).                  |
-| `KIMI_MEMORY_AUTO_GC`               | `on`    | Master switch for the auto-GC pipeline (prune + archive + tier).                                      |
-| `KIMI_MEMORY_AUTO_PRUNE`            | `on`    | Set to `off` to skip auto-prune of dead rows.                                                         |
-| `KIMI_MEMORY_AUTO_ARCHIVE`          | `on`    | Set to `off` to skip auto-archive of `conversation_events`.                                           |
-| `KIMI_MEMORY_AUTO_TIER`             | `on`    | Set to `off` to skip auto-tier promotion / demotion.                                                  |
-| `KIMI_MEMORY_DISABLE_SESSION_FOCUS` | `off`   | Set to `1` to skip the Stop-hook session-focus capture.                                               |
-| `KIMI_MEMORY_PERF`                  | `on`    | Set to `off` to skip the 5k-corpus perf benchmarks in `tests/16-perf.test.js`.                        |
+| Variable                            | Default | Effect                                                                                                                                                                                        |
+| ----------------------------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `KIMI_MEMORY_EMBEDDINGS`            | `on`    | Set to `off` to skip the embedding encoder. Recall falls back to FTS5-only.                                                                                                                   |
+| `KIMI_MEMORY_EMBED_TIMEOUT_MS`      | `4000`  | Wall-clock cap on a single embedding call.                                                                                                                                                    |
+| `KIMI_MEMORY_AUTO_EXTRACT`          | `on`    | Set to `off` to disable the Stop-hook auto-extraction LLM call.                                                                                                                               |
+| `KIMI_MEMORY_SECRET_SCAN`           | `on`    | Set to `off` to bypass the server-side secret pre-write check. Use only for legitimate test fixtures.                                                                                         |
+| `KIMI_MEMORY_PROXY_CORS_ORIGINS`    | unset   | Comma-separated origin allowlist for the HTTP proxy.                                                                                                                                          |
+| `KIMI_MEMORY_CONSOLIDATE`           | `on`    | Set to `off` to skip the FTS5 inline "conclusion + auto-merge" pass at SessionStart. Dream jobs are gated separately by `KIMI_MEMORY_DREAM`.                                                  |
+| `KIMI_MEMORY_DREAM`                 | `on`    | Set to `off` to skip both Dream enqueue (Stop/SessionEnd) and `dream_generate_proposals`. Existing `dream_jobs` rows stay queryable so the operator can still inspect / apply / discard them. |
+| `KIMI_MEMORY_AUTO_MERGE`            | `on`    | Set to `off` to disable the inline auto-merge of tight sibling clusters (conclusion synthesis still runs).                                                                                    |
+| `KIMI_MEMORY_AUTO_GC`               | `on`    | Master switch for the auto-GC pipeline (prune + archive + tier).                                                                                                                              |
+| `KIMI_MEMORY_AUTO_PRUNE`            | `on`    | Set to `off` to skip auto-prune of dead rows.                                                                                                                                                 |
+| `KIMI_MEMORY_AUTO_ARCHIVE`          | `on`    | Set to `off` to skip auto-archive of `conversation_events`.                                                                                                                                   |
+| `KIMI_MEMORY_AUTO_TIER`             | `on`    | Set to `off` to skip auto-tier promotion / demotion.                                                                                                                                          |
+| `KIMI_MEMORY_DISABLE_SESSION_FOCUS` | `off`   | Set to `1` to skip the Stop-hook session-focus capture.                                                                                                                                       |
+| `KIMI_MEMORY_PERF`                  | `on`    | Set to `off` to skip the 5k-corpus perf benchmarks in `tests/16-perf.test.js`.                                                                                                                |
 
 ## Storage and privacy
 
