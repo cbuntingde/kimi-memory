@@ -15,6 +15,11 @@
 //   KIMI_MEMORY_AUTO_PRUNE=off     disable auto-prune of dead rows
 //   KIMI_MEMORY_AUTO_ARCHIVE=off   disable auto-archive of audit tables
 //   KIMI_MEMORY_AUTO_TIER=off      disable auto-tier promotion/demotion
+//   KIMI_MEMORY_LEGACY_SUBSYSTEMS=off   also skip tier promotions and
+//     the persona_promotions sweep (the deprecated tier/persona
+//     subsystem has no agent-workflow consumer — see AGENTS.md §Subsystem
+//     deprecation). The schema tables remain so a future flip back on
+//     does not require data migration.
 //
 // Safety: all destructive operations are wrapped in transactions and
 // are individually logged to the diagnostics pipeline with before/
@@ -352,16 +357,20 @@ export function runAutoArchive(db, projectKey, { now = new Date() } = {}) {
   // project_key). We drop globally for memories whose own project
   // matches the ingest's projectKey — that keeps the archive
   // per-project so the operator can correlate against project state.
-  result.archived_persona_promotions = safeDelete(
-    'promo',
-    `DELETE FROM persona_promotions
-     WHERE memory_id IN (
-       SELECT id FROM memories WHERE project_key = ?
-     )
-     AND julianday('now') - julianday(at) >= ?`,
-    projectKey,
-    ARCHIVE_PERSONA_PROMOTIONS_DAYS,
-  );
+  // The sweep is skipped when the deprecated tier/persona subsystem
+  // is gated off so the audit table stays untouched.
+  if (process.env.KIMI_MEMORY_LEGACY_SUBSYSTEMS !== 'off') {
+    result.archived_persona_promotions = safeDelete(
+      'promo',
+      `DELETE FROM persona_promotions
+       WHERE memory_id IN (
+         SELECT id FROM memories WHERE project_key = ?
+       )
+       AND julianday('now') - julianday(at) >= ?`,
+      projectKey,
+      ARCHIVE_PERSONA_PROMOTIONS_DAYS,
+    );
+  }
 
   // Diagnostic log backups live on disk under _diagnostics/, not in
   // the project DB, so they cannot be pruned by SQL. The sweep runs
@@ -399,6 +408,15 @@ export function runAutoTier(db, projectKey, { now = new Date() } = {}) {
   }
   if (process.env.KIMI_MEMORY_AUTO_TIER === 'off') {
     result.skipped = 'tier_opt_out';
+    return result;
+  }
+  // Legacy subsystem gate: ACL/tier/wiki/codegraph are deprecated.
+  // When the user opts out, skip tier promotions entirely so the
+  // deprecated `tier` column + `persona_promotions` audit table stay
+  // untouched. The schema is preserved so a future flip back on does
+  // not require data migration.
+  if (process.env.KIMI_MEMORY_LEGACY_SUBSYSTEMS === 'off') {
+    result.skipped = 'legacy_subsystems_off';
     return result;
   }
   if (!db || !projectKey) {

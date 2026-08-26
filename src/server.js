@@ -2267,600 +2267,611 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
   });
 
   // ---- v10 ACL / visibility ----
+  //
+  // The four v10 deprecated groups (ACL/visibility, tier/persona, wiki,
+  // codegraph) are gated behind KIMI_MEMORY_LEGACY_SUBSYSTEMS=off.
+  // The 20 tools in TOOL_DEFS[26..45] stay registered when the gate is
+  // on (the default — backward compat) and are skipped entirely when
+  // off. Schema tables remain so a user can flip the env var back on
+  // without a migration. See AGENTS.md §Subsystem deprecation.
 
-  // acl_grant: insert a grant into memories_acl. Idempotent.
-  server.tool(TOOL_DEFS[26].name, TOOL_DEFS[26].input, async (args) => {
-    try {
-      const pr = resolveProjectRoot(args.cwd);
-      if (!pr.ok) return textError(pr.error);
-      const sc = validateScope(args.scope, { read: false });
-      if (!sc.ok) return textError(sc.error);
-      const memId = validateId(args.memory_id);
-      if (!memId.ok) return textError(memId.error);
-      let kind;
+  // ---- v10 ACL / visibility ----
+
+  if (process.env.KIMI_MEMORY_LEGACY_SUBSYSTEMS !== 'off') {
+    // acl_grant: insert a grant into memories_acl. Idempotent.
+    server.tool(TOOL_DEFS[26].name, TOOL_DEFS[26].input, async (args) => {
       try {
-        kind = validatePrincipalKind(args.principal_kind);
-      } catch (e) {
-        return textError(e.message);
-      }
-      const target = openScopeDb({ cwd: pr.value, scope: sc.value, record: true });
-      const row = grantMemoryAcl(
-        target.db,
-        target.projectKey,
-        memId.value,
-        kind,
-        args.principal_id,
-      );
-      return ok({
-        operation: 'acl_granted',
-        scope: sc.value,
-        grant: row,
-        project_key: target.projectKey,
-      });
-    } catch (e) {
-      return textError(toError(e).error);
-    }
-  });
-
-  // acl_revoke: delete a grant from memories_acl.
-  server.tool(TOOL_DEFS[27].name, TOOL_DEFS[27].input, async (args) => {
-    try {
-      const pr = resolveProjectRoot(args.cwd);
-      if (!pr.ok) return textError(pr.error);
-      const sc = validateScope(args.scope, { read: false });
-      if (!sc.ok) return textError(sc.error);
-      const memId = validateId(args.memory_id);
-      if (!memId.ok) return textError(memId.error);
-      let kind;
-      try {
-        kind = validatePrincipalKind(args.principal_kind);
-      } catch (e) {
-        return textError(e.message);
-      }
-      const target = openScopeDb({ cwd: pr.value, scope: sc.value, record: true });
-      const removed = revokeMemoryAcl(
-        target.db,
-        target.projectKey,
-        memId.value,
-        kind,
-        args.principal_id,
-      );
-      return ok({
-        operation: 'acl_revoked',
-        scope: sc.value,
-        memory_id: memId.value,
-        principal_kind: kind,
-        principal_id: args.principal_id,
-        removed,
-        project_key: target.projectKey,
-      });
-    } catch (e) {
-      return textError(toError(e).error);
-    }
-  });
-
-  // acl_list: enumerate grants for a memory.
-  server.tool(TOOL_DEFS[28].name, TOOL_DEFS[28].input, async (args) => {
-    try {
-      const pr = resolveProjectRoot(args.cwd);
-      if (!pr.ok) return textError(pr.error);
-      const sc = validateScope(args.scope, { read: true });
-      if (!sc.ok) return textError(sc.error);
-      const memId = validateId(args.memory_id);
-      if (!memId.ok) return textError(memId.error);
-      const target = openScopeDb({ cwd: pr.value, scope: sc.value });
-      const items = listMemoryAcls(target.db, target.projectKey, memId.value);
-      return ok({
-        operation: 'acl_list',
-        scope: sc.value,
-        memory_id: memId.value,
-        items,
-        count: items.length,
-        project_key: target.projectKey,
-      });
-    } catch (e) {
-      return textError(toError(e).error);
-    }
-  });
-
-  // acl_share_memory: promote memories to a new visibility level. May
-  // also move rows into the cross-project _shared DB when to_shared_pool
-  // is set. The shared DB lives at <kimiHome>/kimi-memory/_shared/.
-  server.tool(TOOL_DEFS[29].name, TOOL_DEFS[29].input, async (args) => {
-    try {
-      const pr = resolveProjectRoot(args.cwd);
-      if (!pr.ok) return textError(pr.error);
-      const sc = validateScope(args.scope, { read: false });
-      if (!sc.ok) return textError(sc.error);
-      if (!Array.isArray(args.memory_ids) || args.memory_ids.length === 0) {
-        return textError('memory_ids must be a non-empty array');
-      }
-      if (args.memory_ids.length > 500) {
-        return textError('memory_ids must contain at most 500 entries');
-      }
-      let sharedWith = [];
-      let droppedSharedWith = [];
-      try {
-        const swResult = validateSharedWith(args.shared_with);
-        sharedWith = swResult.value;
-        droppedSharedWith = swResult.dropped;
-      } catch (e) {
-        return textError(e.message);
-      }
-      const target = openScopeDb({ cwd: pr.value, scope: sc.value, record: true });
-      const result = shareMemory(target.db, target.projectKey, args.memory_ids, {
-        visibility: args.visibility,
-        sharedWith,
-        toSharedPool: !!args.to_shared_pool,
-        kimiHomeDir: home,
-      });
-      // Surface dropped entries so the caller knows input was lost.
-      // (Audit finding B4-10.)
-      return ok({
-        operation: 'acl_shared',
-        scope: sc.value,
-        visibility: args.visibility,
-        shared_with: sharedWith,
-        dropped_shared_with: droppedSharedWith.length ? droppedSharedWith : undefined,
-        to_shared_pool: !!args.to_shared_pool,
-        moved: result.moved,
-        updated: result.updated,
-        target_shared_db_path: args.to_shared_pool ? sharedDbPath(home) : null,
-        project_key: target.projectKey,
-      });
-    } catch (e) {
-      return textError(toError(e).error);
-    }
-  });
-
-  // acl_resolve_principal: parse a "kind:id" descriptor into parts.
-  // Pure / read-only — does not touch the DB. Useful for validating a
-  // shared_with entry before saving.
-  server.tool(TOOL_DEFS[30].name, TOOL_DEFS[30].input, async (args) => {
-    try {
-      const pr = resolveProjectRoot(args.cwd);
-      if (!pr.ok) return textError(pr.error);
-      if (!args.descriptor) return textError('descriptor is required');
-      const parsed = parsePrincipalDescriptor(args.descriptor);
-      return ok({
-        operation: 'acl_resolve_principal',
-        descriptor: args.descriptor,
-        kind: parsed ? parsed.kind : null,
-        id: parsed ? parsed.id : null,
-        valid: !!parsed,
-      });
-    } catch (e) {
-      return textError(toError(e).error);
-    }
-  });
-
-  // ---- v10 tier / persona ----
-
-  // memory_set_tier: explicit move to a target tier; writes audit row.
-  server.tool(TOOL_DEFS[31].name, TOOL_DEFS[31].input, async (args) => {
-    try {
-      const pr = resolveProjectRoot(args.cwd);
-      if (!pr.ok) return textError(pr.error);
-      const sc = validateScope(args.scope, { read: false });
-      if (!sc.ok) return textError(sc.error);
-      const memId = validateId(args.memory_id);
-      if (!memId.ok) return textError(memId.error);
-      const target = openScopeDb({ cwd: pr.value, scope: sc.value, record: true });
-      const result = setMemoryTier(target.db, target.projectKey, memId.value, args.tier, {
-        reason: args.reason || null,
-      });
-      if (!result.memory) return textError(`memory not found in ${sc.value}: ${memId.value}`);
-      return ok({
-        operation: 'set_tier',
-        scope: sc.value,
-        memory: result.memory,
-        transition: result.transition,
-        project_key: target.projectKey,
-      });
-    } catch (e) {
-      return textError(toError(e).error);
-    }
-  });
-
-  // memory_promote: tier up by one.
-  server.tool(TOOL_DEFS[32].name, TOOL_DEFS[32].input, async (args) => {
-    try {
-      const pr = resolveProjectRoot(args.cwd);
-      if (!pr.ok) return textError(pr.error);
-      const sc = validateScope(args.scope, { read: false });
-      if (!sc.ok) return textError(sc.error);
-      const memId = validateId(args.memory_id);
-      if (!memId.ok) return textError(memId.error);
-      const target = openScopeDb({ cwd: pr.value, scope: sc.value, record: true });
-      const result = promoteMemory(target.db, target.projectKey, memId.value, {
-        reason: args.reason || null,
-      });
-      if (!result.memory) return textError(`memory not found in ${sc.value}: ${memId.value}`);
-      return ok({
-        operation: 'promote',
-        scope: sc.value,
-        memory: result.memory,
-        transition: result.transition,
-        project_key: target.projectKey,
-      });
-    } catch (e) {
-      return textError(toError(e).error);
-    }
-  });
-
-  // memory_demote: tier down by one.
-  server.tool(TOOL_DEFS[33].name, TOOL_DEFS[33].input, async (args) => {
-    try {
-      const pr = resolveProjectRoot(args.cwd);
-      if (!pr.ok) return textError(pr.error);
-      const sc = validateScope(args.scope, { read: false });
-      if (!sc.ok) return textError(sc.error);
-      const memId = validateId(args.memory_id);
-      if (!memId.ok) return textError(memId.error);
-      const target = openScopeDb({ cwd: pr.value, scope: sc.value, record: true });
-      const result = demoteMemory(target.db, target.projectKey, memId.value, {
-        reason: args.reason || null,
-      });
-      if (!result.memory) return textError(`memory not found in ${sc.value}: ${memId.value}`);
-      return ok({
-        operation: 'demote',
-        scope: sc.value,
-        memory: result.memory,
-        transition: result.transition,
-        project_key: target.projectKey,
-      });
-    } catch (e) {
-      return textError(toError(e).error);
-    }
-  });
-
-  // memory_tier_history: audit log of tier transitions for a memory.
-  server.tool(TOOL_DEFS[34].name, TOOL_DEFS[34].input, async (args) => {
-    try {
-      const pr = resolveProjectRoot(args.cwd);
-      if (!pr.ok) return textError(pr.error);
-      const sc = validateScope(args.scope, { read: true });
-      if (!sc.ok) return textError(sc.error);
-      const memId = validateId(args.memory_id);
-      if (!memId.ok) return textError(memId.error);
-      const lim = validateLimit(args.limit, 1, 500, 200);
-      if (!lim.ok) return textError(lim.error);
-      const target = openScopeDb({ cwd: pr.value, scope: sc.value });
-      const items = listTierHistory(target.db, target.projectKey, memId.value, {
-        limit: lim.value,
-      });
-      return ok({
-        operation: 'tier_history',
-        scope: sc.value,
-        memory_id: memId.value,
-        items,
-        count: items.length,
-        project_key: target.projectKey,
-      });
-    } catch (e) {
-      return textError(toError(e).error);
-    }
-  });
-
-  // ---- v10 Wiki / LLM-Wiki ----
-
-  // wiki_upsert_page: create or update a page by name.
-  server.tool(TOOL_DEFS[35].name, TOOL_DEFS[35].input, async (args) => {
-    try {
-      const pr = resolveProjectRoot(args.cwd);
-      if (!pr.ok) return textError(pr.error);
-      const target = openScopeDb({ cwd: pr.value, scope: 'project', record: true });
-      const result = upsertWikiPage(target.db, target.projectKey, {
-        service_id: args.service_id || '',
-        team_id: args.team_id || '',
-        name: args.name,
-        body: args.body || '',
-        summary: args.summary || '',
-        links: Array.isArray(args.links) ? args.links : null,
-      });
-      return ok({
-        operation: 'wiki_upsert_page',
-        wiki_id: result.wiki_id,
-        name: result.name,
-        summary: result.summary,
-        updated_at: result.updated_at,
-        links: result.links,
-        project_key: target.projectKey,
-      });
-    } catch (e) {
-      return textError(toError(e).error);
-    }
-  });
-
-  // wiki_get_page: by id (preferred) or name.
-  server.tool(TOOL_DEFS[36].name, TOOL_DEFS[36].input, async (args) => {
-    try {
-      const pr = resolveProjectRoot(args.cwd);
-      if (!pr.ok) return textError(pr.error);
-      const target = openScopeDb({ cwd: pr.value, scope: 'project' });
-      const page = getWikiPage(target.db, target.projectKey, {
-        wikiId: args.wiki_id || null,
-        name: args.name || null,
-      });
-      if (!page) return textError('wiki page not found');
-      return ok({
-        operation: 'wiki_get_page',
-        page,
-        project_key: target.projectKey,
-      });
-    } catch (e) {
-      return textError(toError(e).error);
-    }
-  });
-
-  // wiki_traverse: BFS walk from a seed.
-  server.tool(TOOL_DEFS[37].name, TOOL_DEFS[37].input, async (args) => {
-    try {
-      const pr = resolveProjectRoot(args.cwd);
-      if (!pr.ok) return textError(pr.error);
-      const lim = validateLimit(args.max_hops, 0, 20, 2);
-      if (!lim.ok) return textError(lim.error);
-      const target = openScopeDb({ cwd: pr.value, scope: 'project' });
-      const out = traverseWiki(target.db, target.projectKey, args.wiki_id, {
-        max_hops: lim.value,
-        kinds: Array.isArray(args.kinds) ? args.kinds : null,
-      });
-      return ok({
-        operation: 'wiki_traverse',
-        wiki_id: args.wiki_id,
-        max_hops: lim.value,
-        nodes: out.nodes,
-        edges: out.edges,
-        project_key: target.projectKey,
-      });
-    } catch (e) {
-      return textError(toError(e).error);
-    }
-  });
-
-  // wiki_backlinks: incoming edges to a page.
-  server.tool(TOOL_DEFS[38].name, TOOL_DEFS[38].input, async (args) => {
-    try {
-      const pr = resolveProjectRoot(args.cwd);
-      if (!pr.ok) return textError(pr.error);
-      const target = openScopeDb({ cwd: pr.value, scope: 'project' });
-      const items = backlinksWiki(target.db, target.projectKey, args.wiki_id, {
-        kinds: Array.isArray(args.kinds) ? args.kinds : null,
-      });
-      return ok({
-        operation: 'wiki_backlinks',
-        wiki_id: args.wiki_id,
-        items,
-        count: items.length,
-        project_key: target.projectKey,
-      });
-    } catch (e) {
-      return textError(toError(e).error);
-    }
-  });
-
-  // wiki_resolve: name → page record.
-  server.tool(TOOL_DEFS[39].name, TOOL_DEFS[39].input, async (args) => {
-    try {
-      const pr = resolveProjectRoot(args.cwd);
-      if (!pr.ok) return textError(pr.error);
-      const target = openScopeDb({ cwd: pr.value, scope: 'project' });
-      const page = resolveWikiPage(target.db, target.projectKey, args.name);
-      return ok({
-        operation: 'wiki_resolve',
-        name: args.name,
-        page,
-        found: !!page,
-        project_key: target.projectKey,
-      });
-    } catch (e) {
-      return textError(toError(e).error);
-    }
-  });
-
-  // ---- v10 CodeGraph ----
-
-  // codegraph_extract: walk a directory and emit per-file symbol lists.
-  server.tool(TOOL_DEFS[40].name, TOOL_DEFS[40].input, async (args) => {
-    try {
-      const pr = resolveProjectRoot(args.cwd);
-      if (!pr.ok) return textError(pr.error);
-      const rawRoot = args.root && args.root.length > 0 ? args.root : pr.value;
-      // Refuse roots that escape the project boundary — otherwise a
-      // prompt-injection attack via a recalled memory could walk
-      // arbitrary directories. (Audit finding H1 / B1-2.)
-      const root = path.resolve(rawRoot);
-      const projectRoot = path.resolve(pr.value);
-      if (root !== projectRoot && !root.startsWith(projectRoot + path.sep)) {
-        return textError(
-          `codegraph_extract root must be within the project directory (${projectRoot}); got ${root}`,
+        const pr = resolveProjectRoot(args.cwd);
+        if (!pr.ok) return textError(pr.error);
+        const sc = validateScope(args.scope, { read: false });
+        if (!sc.ok) return textError(sc.error);
+        const memId = validateId(args.memory_id);
+        if (!memId.ok) return textError(memId.error);
+        let kind;
+        try {
+          kind = validatePrincipalKind(args.principal_kind);
+        } catch (e) {
+          return textError(e.message);
+        }
+        const target = openScopeDb({ cwd: pr.value, scope: sc.value, record: true });
+        const row = grantMemoryAcl(
+          target.db,
+          target.projectKey,
+          memId.value,
+          kind,
+          args.principal_id,
         );
+        return ok({
+          operation: 'acl_granted',
+          scope: sc.value,
+          grant: row,
+          project_key: target.projectKey,
+        });
+      } catch (e) {
+        return textError(toError(e).error);
       }
-      const lim = validateLimit(args.limit, 1, 5000, 200);
-      if (!lim.ok) return textError(lim.error);
-      const files = await extractCodeGraph(root, { limit: lim.value });
-      return ok({
-        operation: 'codegraph_extract',
-        root,
-        files,
-        count: files.length,
-      });
-    } catch (e) {
-      return textError(toError(e).error);
-    }
-  });
+    });
 
-  // codegraph_build_edges: form call-graph edges between memories.
-  server.tool(TOOL_DEFS[41].name, TOOL_DEFS[41].input, async (args) => {
-    try {
-      const pr = resolveProjectRoot(args.cwd);
-      if (!pr.ok) return textError(pr.error);
-      const target = openScopeDb({ cwd: pr.value, scope: 'project', record: true });
-      const result = buildCodeGraphEdges(
-        target.db,
-        target.projectKey,
-        Array.isArray(args.files) ? args.files : [],
-        { apply: !!args.apply, kind: args.kind || 'calls' },
-      );
-      return ok({
-        operation: 'codegraph_build_edges',
-        kind: args.kind || 'calls',
-        apply: !!args.apply,
-        inserted: result.inserted,
-        candidates: result.candidates,
-        project_key: target.projectKey,
-      });
-    } catch (e) {
-      return textError(toError(e).error);
-    }
-  });
+    // acl_revoke: delete a grant from memories_acl.
+    server.tool(TOOL_DEFS[27].name, TOOL_DEFS[27].input, async (args) => {
+      try {
+        const pr = resolveProjectRoot(args.cwd);
+        if (!pr.ok) return textError(pr.error);
+        const sc = validateScope(args.scope, { read: false });
+        if (!sc.ok) return textError(sc.error);
+        const memId = validateId(args.memory_id);
+        if (!memId.ok) return textError(memId.error);
+        let kind;
+        try {
+          kind = validatePrincipalKind(args.principal_kind);
+        } catch (e) {
+          return textError(e.message);
+        }
+        const target = openScopeDb({ cwd: pr.value, scope: sc.value, record: true });
+        const removed = revokeMemoryAcl(
+          target.db,
+          target.projectKey,
+          memId.value,
+          kind,
+          args.principal_id,
+        );
+        return ok({
+          operation: 'acl_revoked',
+          scope: sc.value,
+          memory_id: memId.value,
+          principal_kind: kind,
+          principal_id: args.principal_id,
+          removed,
+          project_key: target.projectKey,
+        });
+      } catch (e) {
+        return textError(toError(e).error);
+      }
+    });
 
-  // codegraph_query_symbol: BFS from a seed.
-  server.tool(TOOL_DEFS[42].name, TOOL_DEFS[42].input, async (args) => {
-    try {
-      const pr = resolveProjectRoot(args.cwd);
-      if (!pr.ok) return textError(pr.error);
-      const lim = validateLimit(args.max_depth, 0, 20, 5);
-      if (!lim.ok) return textError(lim.error);
-      const memId = validateId(args.memory_id);
-      if (!memId.ok) return textError(memId.error);
-      const target = openScopeDb({ cwd: pr.value, scope: 'project' });
-      const out = queryMemoryGraph(target.db, target.projectKey, memId.value, {
-        kind: args.kind || null,
-        max_depth: lim.value,
-      });
-      return ok({
-        operation: 'codegraph_query_symbol',
-        memory_id: memId.value,
-        kind: args.kind || null,
-        max_depth: lim.value,
-        nodes: out.nodes,
-        project_key: target.projectKey,
-      });
-    } catch (e) {
-      return textError(toError(e).error);
-    }
-  });
+    // acl_list: enumerate grants for a memory.
+    server.tool(TOOL_DEFS[28].name, TOOL_DEFS[28].input, async (args) => {
+      try {
+        const pr = resolveProjectRoot(args.cwd);
+        if (!pr.ok) return textError(pr.error);
+        const sc = validateScope(args.scope, { read: true });
+        if (!sc.ok) return textError(sc.error);
+        const memId = validateId(args.memory_id);
+        if (!memId.ok) return textError(memId.error);
+        const target = openScopeDb({ cwd: pr.value, scope: sc.value });
+        const items = listMemoryAcls(target.db, target.projectKey, memId.value);
+        return ok({
+          operation: 'acl_list',
+          scope: sc.value,
+          memory_id: memId.value,
+          items,
+          count: items.length,
+          project_key: target.projectKey,
+        });
+      } catch (e) {
+        return textError(toError(e).error);
+      }
+    });
 
-  // codegraph_impact_path: BFS shortest path.
-  function bfsPath(db, projectKey, fromId, toId, maxHops, kind) {
-    if (fromId === toId) return { path: [fromId], hops: 0 };
-    const kindList = kind ? [kind] : ['imports', 'calls', 'defines'];
-    const placeholders = kindList.map(() => '?').join(',');
-    const queue = [[fromId]];
-    const visited = new Set([fromId]);
-    while (queue.length > 0) {
-      const path = queue.shift();
-      // Guard: the path has `path.length - 1` edges. A `maxHops`
-      // cap should forbid any path whose edge count exceeds
-      // maxHops, so we drop paths with `length > maxHops + 1` (the
-      // +1 covers the seed node). The previous `length > maxHops + 1`
-      // check was correct in spirit but let one extra edge slip
-      // through when `next === toId` was found on the final
-      // extension; the bound check now also fires *before* queueing
-      // the candidate, so a run that returns `hops: maxHops + 1`
-      // is impossible.
-      if (path.length > maxHops + 1) continue;
-      const head = path[path.length - 1];
-      const edges = db
-        .prepare(
-          `SELECT from_id, to_id FROM memory_edges
+    // acl_share_memory: promote memories to a new visibility level. May
+    // also move rows into the cross-project _shared DB when to_shared_pool
+    // is set. The shared DB lives at <kimiHome>/kimi-memory/_shared/.
+    server.tool(TOOL_DEFS[29].name, TOOL_DEFS[29].input, async (args) => {
+      try {
+        const pr = resolveProjectRoot(args.cwd);
+        if (!pr.ok) return textError(pr.error);
+        const sc = validateScope(args.scope, { read: false });
+        if (!sc.ok) return textError(sc.error);
+        if (!Array.isArray(args.memory_ids) || args.memory_ids.length === 0) {
+          return textError('memory_ids must be a non-empty array');
+        }
+        if (args.memory_ids.length > 500) {
+          return textError('memory_ids must contain at most 500 entries');
+        }
+        let sharedWith = [];
+        let droppedSharedWith = [];
+        try {
+          const swResult = validateSharedWith(args.shared_with);
+          sharedWith = swResult.value;
+          droppedSharedWith = swResult.dropped;
+        } catch (e) {
+          return textError(e.message);
+        }
+        const target = openScopeDb({ cwd: pr.value, scope: sc.value, record: true });
+        const result = shareMemory(target.db, target.projectKey, args.memory_ids, {
+          visibility: args.visibility,
+          sharedWith,
+          toSharedPool: !!args.to_shared_pool,
+          kimiHomeDir: home,
+        });
+        // Surface dropped entries so the caller knows input was lost.
+        // (Audit finding B4-10.)
+        return ok({
+          operation: 'acl_shared',
+          scope: sc.value,
+          visibility: args.visibility,
+          shared_with: sharedWith,
+          dropped_shared_with: droppedSharedWith.length ? droppedSharedWith : undefined,
+          to_shared_pool: !!args.to_shared_pool,
+          moved: result.moved,
+          updated: result.updated,
+          target_shared_db_path: args.to_shared_pool ? sharedDbPath(home) : null,
+          project_key: target.projectKey,
+        });
+      } catch (e) {
+        return textError(toError(e).error);
+      }
+    });
+
+    // acl_resolve_principal: parse a "kind:id" descriptor into parts.
+    // Pure / read-only — does not touch the DB. Useful for validating a
+    // shared_with entry before saving.
+    server.tool(TOOL_DEFS[30].name, TOOL_DEFS[30].input, async (args) => {
+      try {
+        const pr = resolveProjectRoot(args.cwd);
+        if (!pr.ok) return textError(pr.error);
+        if (!args.descriptor) return textError('descriptor is required');
+        const parsed = parsePrincipalDescriptor(args.descriptor);
+        return ok({
+          operation: 'acl_resolve_principal',
+          descriptor: args.descriptor,
+          kind: parsed ? parsed.kind : null,
+          id: parsed ? parsed.id : null,
+          valid: !!parsed,
+        });
+      } catch (e) {
+        return textError(toError(e).error);
+      }
+    });
+
+    // ---- v10 tier / persona ----
+
+    // memory_set_tier: explicit move to a target tier; writes audit row.
+    server.tool(TOOL_DEFS[31].name, TOOL_DEFS[31].input, async (args) => {
+      try {
+        const pr = resolveProjectRoot(args.cwd);
+        if (!pr.ok) return textError(pr.error);
+        const sc = validateScope(args.scope, { read: false });
+        if (!sc.ok) return textError(sc.error);
+        const memId = validateId(args.memory_id);
+        if (!memId.ok) return textError(memId.error);
+        const target = openScopeDb({ cwd: pr.value, scope: sc.value, record: true });
+        const result = setMemoryTier(target.db, target.projectKey, memId.value, args.tier, {
+          reason: args.reason || null,
+        });
+        if (!result.memory) return textError(`memory not found in ${sc.value}: ${memId.value}`);
+        return ok({
+          operation: 'set_tier',
+          scope: sc.value,
+          memory: result.memory,
+          transition: result.transition,
+          project_key: target.projectKey,
+        });
+      } catch (e) {
+        return textError(toError(e).error);
+      }
+    });
+
+    // memory_promote: tier up by one.
+    server.tool(TOOL_DEFS[32].name, TOOL_DEFS[32].input, async (args) => {
+      try {
+        const pr = resolveProjectRoot(args.cwd);
+        if (!pr.ok) return textError(pr.error);
+        const sc = validateScope(args.scope, { read: false });
+        if (!sc.ok) return textError(sc.error);
+        const memId = validateId(args.memory_id);
+        if (!memId.ok) return textError(memId.error);
+        const target = openScopeDb({ cwd: pr.value, scope: sc.value, record: true });
+        const result = promoteMemory(target.db, target.projectKey, memId.value, {
+          reason: args.reason || null,
+        });
+        if (!result.memory) return textError(`memory not found in ${sc.value}: ${memId.value}`);
+        return ok({
+          operation: 'promote',
+          scope: sc.value,
+          memory: result.memory,
+          transition: result.transition,
+          project_key: target.projectKey,
+        });
+      } catch (e) {
+        return textError(toError(e).error);
+      }
+    });
+
+    // memory_demote: tier down by one.
+    server.tool(TOOL_DEFS[33].name, TOOL_DEFS[33].input, async (args) => {
+      try {
+        const pr = resolveProjectRoot(args.cwd);
+        if (!pr.ok) return textError(pr.error);
+        const sc = validateScope(args.scope, { read: false });
+        if (!sc.ok) return textError(sc.error);
+        const memId = validateId(args.memory_id);
+        if (!memId.ok) return textError(memId.error);
+        const target = openScopeDb({ cwd: pr.value, scope: sc.value, record: true });
+        const result = demoteMemory(target.db, target.projectKey, memId.value, {
+          reason: args.reason || null,
+        });
+        if (!result.memory) return textError(`memory not found in ${sc.value}: ${memId.value}`);
+        return ok({
+          operation: 'demote',
+          scope: sc.value,
+          memory: result.memory,
+          transition: result.transition,
+          project_key: target.projectKey,
+        });
+      } catch (e) {
+        return textError(toError(e).error);
+      }
+    });
+
+    // memory_tier_history: audit log of tier transitions for a memory.
+    server.tool(TOOL_DEFS[34].name, TOOL_DEFS[34].input, async (args) => {
+      try {
+        const pr = resolveProjectRoot(args.cwd);
+        if (!pr.ok) return textError(pr.error);
+        const sc = validateScope(args.scope, { read: true });
+        if (!sc.ok) return textError(sc.error);
+        const memId = validateId(args.memory_id);
+        if (!memId.ok) return textError(memId.error);
+        const lim = validateLimit(args.limit, 1, 500, 200);
+        if (!lim.ok) return textError(lim.error);
+        const target = openScopeDb({ cwd: pr.value, scope: sc.value });
+        const items = listTierHistory(target.db, target.projectKey, memId.value, {
+          limit: lim.value,
+        });
+        return ok({
+          operation: 'tier_history',
+          scope: sc.value,
+          memory_id: memId.value,
+          items,
+          count: items.length,
+          project_key: target.projectKey,
+        });
+      } catch (e) {
+        return textError(toError(e).error);
+      }
+    });
+
+    // ---- v10 Wiki / LLM-Wiki ----
+
+    // wiki_upsert_page: create or update a page by name.
+    server.tool(TOOL_DEFS[35].name, TOOL_DEFS[35].input, async (args) => {
+      try {
+        const pr = resolveProjectRoot(args.cwd);
+        if (!pr.ok) return textError(pr.error);
+        const target = openScopeDb({ cwd: pr.value, scope: 'project', record: true });
+        const result = upsertWikiPage(target.db, target.projectKey, {
+          service_id: args.service_id || '',
+          team_id: args.team_id || '',
+          name: args.name,
+          body: args.body || '',
+          summary: args.summary || '',
+          links: Array.isArray(args.links) ? args.links : null,
+        });
+        return ok({
+          operation: 'wiki_upsert_page',
+          wiki_id: result.wiki_id,
+          name: result.name,
+          summary: result.summary,
+          updated_at: result.updated_at,
+          links: result.links,
+          project_key: target.projectKey,
+        });
+      } catch (e) {
+        return textError(toError(e).error);
+      }
+    });
+
+    // wiki_get_page: by id (preferred) or name.
+    server.tool(TOOL_DEFS[36].name, TOOL_DEFS[36].input, async (args) => {
+      try {
+        const pr = resolveProjectRoot(args.cwd);
+        if (!pr.ok) return textError(pr.error);
+        const target = openScopeDb({ cwd: pr.value, scope: 'project' });
+        const page = getWikiPage(target.db, target.projectKey, {
+          wikiId: args.wiki_id || null,
+          name: args.name || null,
+        });
+        if (!page) return textError('wiki page not found');
+        return ok({
+          operation: 'wiki_get_page',
+          page,
+          project_key: target.projectKey,
+        });
+      } catch (e) {
+        return textError(toError(e).error);
+      }
+    });
+
+    // wiki_traverse: BFS walk from a seed.
+    server.tool(TOOL_DEFS[37].name, TOOL_DEFS[37].input, async (args) => {
+      try {
+        const pr = resolveProjectRoot(args.cwd);
+        if (!pr.ok) return textError(pr.error);
+        const lim = validateLimit(args.max_hops, 0, 20, 2);
+        if (!lim.ok) return textError(lim.error);
+        const target = openScopeDb({ cwd: pr.value, scope: 'project' });
+        const out = traverseWiki(target.db, target.projectKey, args.wiki_id, {
+          max_hops: lim.value,
+          kinds: Array.isArray(args.kinds) ? args.kinds : null,
+        });
+        return ok({
+          operation: 'wiki_traverse',
+          wiki_id: args.wiki_id,
+          max_hops: lim.value,
+          nodes: out.nodes,
+          edges: out.edges,
+          project_key: target.projectKey,
+        });
+      } catch (e) {
+        return textError(toError(e).error);
+      }
+    });
+
+    // wiki_backlinks: incoming edges to a page.
+    server.tool(TOOL_DEFS[38].name, TOOL_DEFS[38].input, async (args) => {
+      try {
+        const pr = resolveProjectRoot(args.cwd);
+        if (!pr.ok) return textError(pr.error);
+        const target = openScopeDb({ cwd: pr.value, scope: 'project' });
+        const items = backlinksWiki(target.db, target.projectKey, args.wiki_id, {
+          kinds: Array.isArray(args.kinds) ? args.kinds : null,
+        });
+        return ok({
+          operation: 'wiki_backlinks',
+          wiki_id: args.wiki_id,
+          items,
+          count: items.length,
+          project_key: target.projectKey,
+        });
+      } catch (e) {
+        return textError(toError(e).error);
+      }
+    });
+
+    // wiki_resolve: name → page record.
+    server.tool(TOOL_DEFS[39].name, TOOL_DEFS[39].input, async (args) => {
+      try {
+        const pr = resolveProjectRoot(args.cwd);
+        if (!pr.ok) return textError(pr.error);
+        const target = openScopeDb({ cwd: pr.value, scope: 'project' });
+        const page = resolveWikiPage(target.db, target.projectKey, args.name);
+        return ok({
+          operation: 'wiki_resolve',
+          name: args.name,
+          page,
+          found: !!page,
+          project_key: target.projectKey,
+        });
+      } catch (e) {
+        return textError(toError(e).error);
+      }
+    });
+
+    // ---- v10 CodeGraph ----
+
+    // codegraph_extract: walk a directory and emit per-file symbol lists.
+    server.tool(TOOL_DEFS[40].name, TOOL_DEFS[40].input, async (args) => {
+      try {
+        const pr = resolveProjectRoot(args.cwd);
+        if (!pr.ok) return textError(pr.error);
+        const rawRoot = args.root && args.root.length > 0 ? args.root : pr.value;
+        // Refuse roots that escape the project boundary — otherwise a
+        // prompt-injection attack via a recalled memory could walk
+        // arbitrary directories. (Audit finding H1 / B1-2.)
+        const root = path.resolve(rawRoot);
+        const projectRoot = path.resolve(pr.value);
+        if (root !== projectRoot && !root.startsWith(projectRoot + path.sep)) {
+          return textError(
+            `codegraph_extract root must be within the project directory (${projectRoot}); got ${root}`,
+          );
+        }
+        const lim = validateLimit(args.limit, 1, 5000, 200);
+        if (!lim.ok) return textError(lim.error);
+        const files = await extractCodeGraph(root, { limit: lim.value });
+        return ok({
+          operation: 'codegraph_extract',
+          root,
+          files,
+          count: files.length,
+        });
+      } catch (e) {
+        return textError(toError(e).error);
+      }
+    });
+
+    // codegraph_build_edges: form call-graph edges between memories.
+    server.tool(TOOL_DEFS[41].name, TOOL_DEFS[41].input, async (args) => {
+      try {
+        const pr = resolveProjectRoot(args.cwd);
+        if (!pr.ok) return textError(pr.error);
+        const target = openScopeDb({ cwd: pr.value, scope: 'project', record: true });
+        const result = buildCodeGraphEdges(
+          target.db,
+          target.projectKey,
+          Array.isArray(args.files) ? args.files : [],
+          { apply: !!args.apply, kind: args.kind || 'calls' },
+        );
+        return ok({
+          operation: 'codegraph_build_edges',
+          kind: args.kind || 'calls',
+          apply: !!args.apply,
+          inserted: result.inserted,
+          candidates: result.candidates,
+          project_key: target.projectKey,
+        });
+      } catch (e) {
+        return textError(toError(e).error);
+      }
+    });
+
+    // codegraph_query_symbol: BFS from a seed.
+    server.tool(TOOL_DEFS[42].name, TOOL_DEFS[42].input, async (args) => {
+      try {
+        const pr = resolveProjectRoot(args.cwd);
+        if (!pr.ok) return textError(pr.error);
+        const lim = validateLimit(args.max_depth, 0, 20, 5);
+        if (!lim.ok) return textError(lim.error);
+        const memId = validateId(args.memory_id);
+        if (!memId.ok) return textError(memId.error);
+        const target = openScopeDb({ cwd: pr.value, scope: 'project' });
+        const out = queryMemoryGraph(target.db, target.projectKey, memId.value, {
+          kind: args.kind || null,
+          max_depth: lim.value,
+        });
+        return ok({
+          operation: 'codegraph_query_symbol',
+          memory_id: memId.value,
+          kind: args.kind || null,
+          max_depth: lim.value,
+          nodes: out.nodes,
+          project_key: target.projectKey,
+        });
+      } catch (e) {
+        return textError(toError(e).error);
+      }
+    });
+
+    // codegraph_impact_path: BFS shortest path.
+    function bfsPath(db, projectKey, fromId, toId, maxHops, kind) {
+      if (fromId === toId) return { path: [fromId], hops: 0 };
+      const kindList = kind ? [kind] : ['imports', 'calls', 'defines'];
+      const placeholders = kindList.map(() => '?').join(',');
+      const queue = [[fromId]];
+      const visited = new Set([fromId]);
+      while (queue.length > 0) {
+        const path = queue.shift();
+        // Guard: the path has `path.length - 1` edges. A `maxHops`
+        // cap should forbid any path whose edge count exceeds
+        // maxHops, so we drop paths with `length > maxHops + 1` (the
+        // +1 covers the seed node). The previous `length > maxHops + 1`
+        // check was correct in spirit but let one extra edge slip
+        // through when `next === toId` was found on the final
+        // extension; the bound check now also fires *before* queueing
+        // the candidate, so a run that returns `hops: maxHops + 1`
+        // is impossible.
+        if (path.length > maxHops + 1) continue;
+        const head = path[path.length - 1];
+        const edges = db
+          .prepare(
+            `SELECT from_id, to_id FROM memory_edges
            WHERE project_key = ? AND (from_id = ? OR to_id = ?)
              AND kind IN (${placeholders})`,
-        )
-        .all(projectKey, head, head, ...kindList);
-      for (const e of edges) {
-        const next = e.from_id === head ? e.to_id : e.from_id;
-        if (visited.has(next)) continue;
-        const newPath = [...path, next];
-        if (next === toId) return { path: newPath, hops: newPath.length - 1 };
-        // Bound check before enqueuing so we never store a path
-        // whose hop count exceeds the cap. Without this, returning
-        // a path that grew past maxHops was possible when `toId`
-        // was discovered on the boundary extension.
-        if (newPath.length > maxHops + 1) continue;
-        visited.add(next);
-        queue.push(newPath);
+          )
+          .all(projectKey, head, head, ...kindList);
+        for (const e of edges) {
+          const next = e.from_id === head ? e.to_id : e.from_id;
+          if (visited.has(next)) continue;
+          const newPath = [...path, next];
+          if (next === toId) return { path: newPath, hops: newPath.length - 1 };
+          // Bound check before enqueuing so we never store a path
+          // whose hop count exceeds the cap. Without this, returning
+          // a path that grew past maxHops was possible when `toId`
+          // was discovered on the boundary extension.
+          if (newPath.length > maxHops + 1) continue;
+          visited.add(next);
+          queue.push(newPath);
+        }
       }
+      return { path: [], hops: -1 };
     }
-    return { path: [], hops: -1 };
-  }
 
-  server.tool(TOOL_DEFS[43].name, TOOL_DEFS[43].input, async (args) => {
-    try {
-      const pr = resolveProjectRoot(args.cwd);
-      if (!pr.ok) return textError(pr.error);
-      const fromId = validateId(args.from_id);
-      if (!fromId.ok) return textError(fromId.error);
-      const toId = validateId(args.to_id);
-      if (!toId.ok) return textError(toId.error);
-      const lim = validateLimit(args.max_hops, 1, 20, 6);
-      if (!lim.ok) return textError(lim.error);
-      const target = openScopeDb({ cwd: pr.value, scope: 'project' });
-      const out = bfsPath(
-        target.db,
-        target.projectKey,
-        fromId.value,
-        toId.value,
-        lim.value,
-        args.kind || null,
-      );
-      return ok({
-        operation: 'codegraph_impact_path',
-        from_id: fromId.value,
-        to_id: toId.value,
-        path: out.path,
-        hops: out.hops,
-        project_key: target.projectKey,
-      });
-    } catch (e) {
-      return textError(toError(e).error);
-    }
-  });
+    server.tool(TOOL_DEFS[43].name, TOOL_DEFS[43].input, async (args) => {
+      try {
+        const pr = resolveProjectRoot(args.cwd);
+        if (!pr.ok) return textError(pr.error);
+        const fromId = validateId(args.from_id);
+        if (!fromId.ok) return textError(fromId.error);
+        const toId = validateId(args.to_id);
+        if (!toId.ok) return textError(toId.error);
+        const lim = validateLimit(args.max_hops, 1, 20, 6);
+        if (!lim.ok) return textError(lim.error);
+        const target = openScopeDb({ cwd: pr.value, scope: 'project' });
+        const out = bfsPath(
+          target.db,
+          target.projectKey,
+          fromId.value,
+          toId.value,
+          lim.value,
+          args.kind || null,
+        );
+        return ok({
+          operation: 'codegraph_impact_path',
+          from_id: fromId.value,
+          to_id: toId.value,
+          path: out.path,
+          hops: out.hops,
+          project_key: target.projectKey,
+        });
+      } catch (e) {
+        return textError(toError(e).error);
+      }
+    });
 
-  server.tool(TOOL_DEFS[44].name, TOOL_DEFS[44].input, async (args) => {
-    try {
-      const pr = resolveProjectRoot(args.cwd);
-      if (!pr.ok) return textError(pr.error);
-      const memId = validateId(args.memory_id);
-      if (!memId.ok) return textError(memId.error);
-      const target = openScopeDb({ cwd: pr.value, scope: 'project' });
-      const out = queryMemoryGraph(target.db, target.projectKey, memId.value, {
-        kind: args.kind || null,
-        max_depth: Math.max(1, Math.min(20, args.depth || 1)),
-      });
-      return ok({
-        operation: 'codegraph_callers',
-        memory_id: memId.value,
-        nodes: out.nodes,
-        project_key: target.projectKey,
-      });
-    } catch (e) {
-      return textError(toError(e).error);
-    }
-  });
+    server.tool(TOOL_DEFS[44].name, TOOL_DEFS[44].input, async (args) => {
+      try {
+        const pr = resolveProjectRoot(args.cwd);
+        if (!pr.ok) return textError(pr.error);
+        const memId = validateId(args.memory_id);
+        if (!memId.ok) return textError(memId.error);
+        const target = openScopeDb({ cwd: pr.value, scope: 'project' });
+        const out = queryMemoryGraph(target.db, target.projectKey, memId.value, {
+          kind: args.kind || null,
+          max_depth: Math.max(1, Math.min(20, args.depth || 1)),
+        });
+        return ok({
+          operation: 'codegraph_callers',
+          memory_id: memId.value,
+          nodes: out.nodes,
+          project_key: target.projectKey,
+        });
+      } catch (e) {
+        return textError(toError(e).error);
+      }
+    });
 
-  server.tool(TOOL_DEFS[45].name, TOOL_DEFS[45].input, async (args) => {
-    try {
-      const pr = resolveProjectRoot(args.cwd);
-      if (!pr.ok) return textError(pr.error);
-      const memId = validateId(args.memory_id);
-      if (!memId.ok) return textError(memId.error);
-      const target = openScopeDb({ cwd: pr.value, scope: 'project' });
-      const out = queryMemoryGraph(target.db, target.projectKey, memId.value, {
-        kind: args.kind || null,
-        max_depth: Math.max(1, Math.min(20, args.depth || 1)),
-      });
-      return ok({
-        operation: 'codegraph_callees',
-        memory_id: memId.value,
-        nodes: out.nodes,
-        project_key: target.projectKey,
-      });
-    } catch (e) {
-      return textError(toError(e).error);
-    }
-  });
+    server.tool(TOOL_DEFS[45].name, TOOL_DEFS[45].input, async (args) => {
+      try {
+        const pr = resolveProjectRoot(args.cwd);
+        if (!pr.ok) return textError(pr.error);
+        const memId = validateId(args.memory_id);
+        if (!memId.ok) return textError(memId.error);
+        const target = openScopeDb({ cwd: pr.value, scope: 'project' });
+        const out = queryMemoryGraph(target.db, target.projectKey, memId.value, {
+          kind: args.kind || null,
+          max_depth: Math.max(1, Math.min(20, args.depth || 1)),
+        });
+        return ok({
+          operation: 'codegraph_callees',
+          memory_id: memId.value,
+          nodes: out.nodes,
+          project_key: target.projectKey,
+        });
+      } catch (e) {
+        return textError(toError(e).error);
+      }
+    });
+  } // end KIMI_MEMORY_LEGACY_SUBSYSTEMS gate (ACL + tier + wiki + codegraph)
 
   // ---- ingest implementation (also used by hooks via JSON IPC) ----
   async function ingestOne({ home, db, projectKey, cwd, sessionId, workDirKey, force }) {

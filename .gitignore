@@ -45,6 +45,12 @@ ehthumbs_view.db
 # Runtime diagnostics (written by hooks)
 _diagnostics/
 
+# Kimi Code runtime state (sessions, plans, etc.) — created if anyone
+# runs `kimi` from this checkout. Plugin lives in users' $KIMI_CODE_HOME,
+# not at the repo root, so any appearance here is scratch.
+.kimi/
+.kimi-code/
+
 # Tooling artifacts
 .craftsman/
 .cache/

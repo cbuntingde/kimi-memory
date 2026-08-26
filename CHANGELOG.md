@@ -5,6 +5,82 @@ All notable changes to `kimi-memory` are recorded here. Versions follow
 the global DB is not touched; "Breaking" notes mean a stored row from a
 prior version is rejected / migrated by the schema upgrade on first open.
 
+## [Unreleased]
+
+### Added — Subsystem deprecation gate
+
+Four subsystems shipped in v0.5.0 (ACL/visibility, tier/persona, wiki,
+codegraph) are deprecated: they are ported from `TencentDB-Agent-Memory`
+but have no authenticated MCP caller and no agent-workflow integration.
+A new `KIMI_MEMORY_LEGACY_SUBSYSTEMS` env var hides the 20 corresponding
+MCP tools (ACL: 5, tier: 4, wiki: 5, codegraph: 6) and skips the
+auto-tier promotion + `persona_promotions` archive sweeps when set to
+`off`. The schema columns + tables remain in place so flipping the env
+var back on requires no migration. Removal is planned for the next
+major version.
+
+- `src/server.js` — the 20 legacy tool registrations are now wrapped in
+  `if (process.env.KIMI_MEMORY_LEGACY_SUBSYSTEMS !== 'off') { ... }`.
+- `src/auto-gc.js` — `runAutoTier` and the `persona_promotions`
+  archive in `runAutoArchive` honour the same gate.
+- `README.md`, `AGENTS.md`, `skills/kimi-memory/references/tools.md`
+  document the new env var.
+- `kimi.plugin.json` `interface.longDescription` now lists the 20
+  deprecated tools with a `[deprecated]` marker.
+
+### Added — Hook split
+
+`src/hooks/run.js` (1,772 lines, 8 events) is split into a slim
+dispatcher plus per-event modules under `src/hooks/handlers/`:
+
+```
+src/hooks/run.js                          # dispatcher (~95 lines)
+src/hooks/handlers/_helpers.js            # shared utils + lifecycle helpers
+src/hooks/handlers/session-start.js
+src/hooks/handlers/user-prompt-submit.js
+src/hooks/handlers/stop.js                # Stop + SessionEnd + PreCompact + Interrupt + StopFailure + autoExtract
+src/hooks/handlers/post-tool-use.js
+```
+
+The public helper exports (`buildRecallQuery`, `diversifyHitsByType`,
+`readRecentFilePaths`, `buildSessionThread`, `formatConsolidateSegment`)
+are re-exported from `run.js` for backward compatibility with any
+consumer that previously imported them from the dispatcher.
+
+### Added — Progressive disclosure for the `kimi-memory` skill
+
+`skills/kimi-memory/SKILL.md` was 25 KB (one monolithic file). It is
+now a ~10 KB routing/hygiene/types/flow file with deeper material in
+four reference files:
+
+- `skills/kimi-memory/references/tools.md` — full MCP tool catalog.
+- `skills/kimi-memory/references/recall-acknowledgement.md` — how to
+  acknowledge `[recall]`, `[focus]`, `[thread]`, `[tool-recall]`
+  segments on the hook status line.
+- `skills/kimi-memory/references/active-memory.md` — v9+ behaviour:
+  continuous retrieval, mid-turn recall, decay, cross-session thread,
+  background consolidation, auto-GC.
+- `skills/kimi-memory/references/decay-contract.md` — the Ebbinghaus
+  decay formula and the migration that introduced the columns.
+
+`kimi.plugin.json`'s `skillInstructions` is trimmed to match.
+
+### Added — Project docs
+
+`AGENTS.md`, `SECURITY.md`, and `CONTRIBUTING.md` now live at the
+repository root. They were missing in v0.6.0.
+
+### Compatibility notes
+
+- `KIMI_MEMORY_LEGACY_SUBSYSTEMS` defaults to `on` — the 20 legacy
+  tools remain registered by default, so existing automation that
+  calls them keeps working. Opt-out is explicit (`=off`).
+- The hook split is internal: handler function names + behaviour are
+  unchanged. No new tests required; all 41 existing test files pass
+  on the split.
+- The skill split is byte-equivalent for content; only the layout
+  changed. References are loaded on demand by the agent.
+
 ## [0.6.0] — 2026-08-19
 
 ### Added — Staged Dream consolidation (Phase 1)
