@@ -1,5 +1,10 @@
 # kimi-memory
 
+[![CI](https://github.com/cbuntingde/kimi-memory/actions/workflows/test.yml/badge.svg)](https://github.com/cbuntingde/kimi-memory/actions/workflows/test.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
+[![Node](https://img.shields.io/badge/node-%E2%89%A524-339933?logo=node.js&logoColor=white)](package.json)
+[![Code style: prettier](https://img.shields.io/badge/code_style-prettier-ff69b4.svg)](https://prettier.io)
+
 A local-first memory layer for Kimi Code. It gives the assistant persistent
 recall across projects — cross-project user preferences, durable project
 facts, working focus for the current task, and full session transcripts —
