@@ -317,18 +317,19 @@ export function guardLlmBaseUrl(rawUrl) {
   // forced to rewrite their config.toml.
   if (scheme === 'http' && url.hostname) {
     const host = url.hostname.toLowerCase();
-    const isLoopback = host === 'localhost' || host === '127.0.0.1' || host === '::1' || host === '[::1]';
+    const isLoopback =
+      host === 'localhost' || host === '127.0.0.1' || host === '::1' || host === '[::1]';
     // Detect a private IPv4 class without a DNS lookup (so this stays
     // deterministic and offline): 10/8, 172.16/12, 192.168/16,
     // 169.254/16 (link-local), 0.0.0.0.
     const ipv4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
     const isPrivateV4 =
       ipv4 &&
-      ((+ipv4[1] === 10) ||
+      (+ipv4[1] === 10 ||
         (+ipv4[1] === 172 && +ipv4[2] >= 16 && +ipv4[2] <= 31) ||
         (+ipv4[1] === 192 && +ipv4[2] === 168) ||
         (+ipv4[1] === 169 && +ipv4[2] === 254) ||
-        (+ipv4[1] === 0));
+        +ipv4[1] === 0);
     if (isLoopback || isPrivateV4) {
       return { ok: false, reason: `cleartext_local:${host}` };
     }

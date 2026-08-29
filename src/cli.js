@@ -1211,11 +1211,13 @@ async function cmdConsolidate(args) {
         embedding_coverage: { with_embedding: withEmbed, without_embedding: withoutEmbed },
         unclustered_active: unclustered,
         last_consolidate: lastConsolidate
-          ? { id: lastConsolidate.id, at: lastConsolidate.at, summary: safeJson(lastConsolidate.summary) }
+          ? {
+              id: lastConsolidate.id,
+              at: lastConsolidate.at,
+              summary: safeJson(lastConsolidate.summary),
+            }
           : null,
-        last_dream_apply: lastDreamApply
-          ? { id: lastDreamApply.id, at: lastDreamApply.at }
-          : null,
+        last_dream_apply: lastDreamApply ? { id: lastDreamApply.id, at: lastDreamApply.at } : null,
       };
       if (asJson) {
         emitJson({ operation: 'consolidate_status', ...out });
@@ -1223,8 +1225,12 @@ async function cmdConsolidate(args) {
         process.stdout.write(`with_embedding=${withEmbed}\n`);
         process.stdout.write(`without_embedding=${withoutEmbed}\n`);
         process.stdout.write(`unclustered_active=${unclustered}\n`);
-        process.stdout.write(`last_consolidate_at=${out.last_consolidate ? out.last_consolidate.at : ''}\n`);
-        process.stdout.write(`last_dream_apply_at=${out.last_dream_apply ? out.last_dream_apply.at : ''}\n`);
+        process.stdout.write(
+          `last_consolidate_at=${out.last_consolidate ? out.last_consolidate.at : ''}\n`,
+        );
+        process.stdout.write(
+          `last_dream_apply_at=${out.last_dream_apply ? out.last_dream_apply.at : ''}\n`,
+        );
       }
       closeDb();
       return;

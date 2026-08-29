@@ -609,9 +609,8 @@ export function wipeProjectLifecycleLogs(db, projectKey) {
     throw new Error('wipeProjectLifecycleLogs: db and projectKey are required');
   }
   return {
-    dream_jobs_deleted: db
-      .prepare('DELETE FROM dream_jobs WHERE project_key=?')
-      .run(projectKey).changes,
+    dream_jobs_deleted: db.prepare('DELETE FROM dream_jobs WHERE project_key=?').run(projectKey)
+      .changes,
     dream_proposals_deleted: db
       .prepare('DELETE FROM dream_proposals WHERE project_key=?')
       .run(projectKey).changes,

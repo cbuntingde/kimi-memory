@@ -17,11 +17,7 @@ import { mkdtempSync, rmSync, mkdirSync } from 'node:fs';
 import path from 'node:path';
 import { tmpdir } from 'node:os';
 import { mkTempHome, rmRf } from './_helpers.js';
-import {
-  openDb,
-  closeDb,
-  saveMemory,
-} from '../src/persist.js';
+import { openDb, closeDb, saveMemory } from '../src/persist.js';
 import { projectDbPath, deriveProjectKey } from '../src/project-key.js';
 import { wipeProjectLifecycleLogs } from '../src/persist/project.js';
 import { buildStaleMemoryLine } from '../src/hooks/handlers/_helpers.js';
@@ -74,14 +70,10 @@ test('auto-reset: wipeProjectLifecycleLogs deletes only the project rows', () =>
       )
       .run('job-b1', keyB, 'applied', 'test', '{}', '{}', 'now', 'now');
     dbA
-      .prepare(
-        `INSERT INTO consolidation_runs (id, project_key, summary, at) VALUES (?, ?, ?, ?)`,
-      )
+      .prepare(`INSERT INTO consolidation_runs (id, project_key, summary, at) VALUES (?, ?, ?, ?)`)
       .run('crun-a1', keyA, '{}', 'now');
     dbA
-      .prepare(
-        `INSERT INTO consolidation_runs (id, project_key, summary, at) VALUES (?, ?, ?, ?)`,
-      )
+      .prepare(`INSERT INTO consolidation_runs (id, project_key, summary, at) VALUES (?, ?, ?, ?)`)
       .run('crun-b1', keyB, '{}', 'now');
     closeDb();
 

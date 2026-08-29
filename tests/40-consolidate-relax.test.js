@@ -107,7 +107,10 @@ test('consolidate relax: 4-memory dataset forms a cluster without tag overlap (s
     assert.ok(res.scanned >= 4, 'scanned >= 4');
     // The threshold relaxation + 4 siblings should form a cluster.
     // Pre-v15 this required ≥2 shared tags and frequently returned 0.
-    assert.ok(res.clusters >= 1 || res.saved >= 1 || res.dedup_pairs >= 1, 'some consolidation happened');
+    assert.ok(
+      res.clusters >= 1 || res.saved >= 1 || res.dedup_pairs >= 1,
+      'some consolidation happened',
+    );
     closeDb();
   } finally {
     rmRf(home);
@@ -162,15 +165,13 @@ test('consolidate relax: near-dup cosine + shared content window emits a merge p
     const a = await saveWithEmbedding(db, key, {
       type: 'semantic',
       title: 'Release process',
-      content:
-        'Cut a release by tagging main with the new version and pushing the tag to origin.',
+      content: 'Cut a release by tagging main with the new version and pushing the tag to origin.',
       tags: ['release'],
     });
     await saveWithEmbedding(db, key, {
       type: 'semantic',
       title: 'Release procedure',
-      content:
-        'Cut a release by tagging main with the new version and pushing the tag to origin.',
+      content: 'Cut a release by tagging main with the new version and pushing the tag to origin.',
       tags: ['release'],
     });
     const res = await runConsolidate({

@@ -742,9 +742,7 @@ const MIGRATIONS = [
       )
       .get();
     if (!idx)
-      db.exec(
-        'CREATE INDEX idx_consolidation_runs_project ON consolidation_runs(project_key, at)',
-      );
+      db.exec('CREATE INDEX idx_consolidation_runs_project ON consolidation_runs(project_key, at)');
   },
 ];
 

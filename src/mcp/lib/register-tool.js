@@ -105,6 +105,9 @@ export function registerTool(server, def, handler, handlers, home) {
 function enumValues(zodNode) {
   let cur = zodNode;
   // eslint-disable-next-line no-constant-condition
+  // (justification: walk-until-null loop over Zod wrapper chain; the loop
+  // body always returns or reassigns `cur`, so the predicate is never
+  // tautological at runtime — ESLint flags the literal shape only.)
   while (cur) {
     if (cur._def && cur._def.typeName === 'ZodEnum') return cur._def.values;
     if (cur._def && cur._def.innerType) {
