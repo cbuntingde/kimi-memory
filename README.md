@@ -11,11 +11,6 @@ facts, working focus for the current task, and full session transcripts —
 all stored in local SQLite and surfaced through MCP tools, slash commands,
 and lifecycle hooks.
 
-<p align="center">
-  <img src="assets/demo-list-calls.png" alt="Kimi assistant running memory_list" width="48%" />
-  <img src="assets/demo-list-output.png" alt="Memory list and summary output" width="48%" />
-</p>
-
 ## Highlights
 
 - **Local-first.** All data lives in SQLite under `$KIMI_CODE_HOME/kimi-memory/`.
