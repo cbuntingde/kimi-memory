@@ -429,7 +429,14 @@ function findNearDupPairs(memories, decodeEmbedding) {
       // Target = higher-confidence sibling.
       const ac = a.confidence || 0;
       const bc = b.confidence || 0;
-      const target = bc > ac ? b : ac > bc ? a : (a.updatedAt || '').localeCompare(b.updatedAt || '') > 0 ? a : b;
+      const target =
+        bc > ac
+          ? b
+          : ac > bc
+            ? a
+            : (a.updatedAt || '').localeCompare(b.updatedAt || '') > 0
+              ? a
+              : b;
       const sibling = target === a ? b : a;
       const key = [a.id, b.id].sort().join('|');
       if (seenPairs.has(key)) continue;
