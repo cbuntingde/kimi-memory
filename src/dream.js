@@ -27,7 +27,7 @@
 // Phase 1 — the global store stays curated by the user via MCP /
 // `memory_save`.
 import { nowIso, hashId, shortId, safeJsonParse } from './util.js';
-import { runConsolidate, proposalSourceChecksum } from './consolidate.js';
+import { runConsolidate, proposalSourceChecksum, recordConsolidationRun } from './consolidate.js';
 import { decodeVector as decodeEmbedding } from './embedding.js';
 import { linkMemory } from './persist/edges.js';
 
@@ -471,6 +471,28 @@ export function applyDreamJob(db, projectKey, jobId, opts = {}) {
     db.prepare(
       "UPDATE dream_jobs SET status='applied', applied_at=?, updated_at=? WHERE id=? AND project_key=?",
     ).run(now, now, jobId, projectKey);
+  } catch {
+    /* best-effort */
+  }
+
+  // v15: write a consolidation_runs row so memory_status surfaces the
+  // dream apply too. Best-effort; the helper swallows its own errors.
+  try {
+    recordConsolidationRun(
+      db,
+      projectKey,
+      {
+        scanned: 0,
+        clusters: 0,
+        saved: applied,
+        skipped: stale,
+        errors: failed,
+        merged: applied,
+        mergeSkipped: 0,
+        proposals: applied,
+      },
+      { trigger: 'dream_apply' },
+    );
   } catch {
     /* best-effort */
   }

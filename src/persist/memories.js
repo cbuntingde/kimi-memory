@@ -130,7 +130,14 @@ function safeParseJson(text, fallback, isShape) {
 // needs to persist a secret-shaped string (e.g. an example fixture).
 // False positives are accepted: dropping a candidate that mentions a
 // generic "api_key" is far cheaper than persisting a real one.
-function assertNoSecret(input) {
+//
+// Exported so `mergeMemory` (in this file) and `setWorkingMemory` (in
+// project.js) can route the same gate through their direct-UPDATE
+// paths — `mergeMemory`'s `mergedContent` and `setWorkingMemory`'s slot
+// value are caller-controlled strings that would otherwise land in the
+// project SQLite verbatim and bypass the memory_save gate.
+// (Production-readiness review finding F-1.)
+export function assertNoSecret(input) {
   if (process.env.KIMI_MEMORY_SECRET_SCAN === 'off') return;
   // Tags and metadata are checked too — the previous version only
   // scanned title and content, leaving a small gap for credentials
@@ -729,6 +736,27 @@ export function mergeMemory(
   const from = getMemory(db, projectKey, fromId, { includeSuperseded: true });
   if (!into) throw new Error(`mergeMemory: into memory not found: ${intoId}`);
   if (!from) throw new Error(`mergeMemory: from memory not found: ${fromId}`);
+  // Reject merging against a soft-deleted row — the destination's
+  // tags / metadata would be revived by the UPDATE while the rest of
+  // the project still believes the row is deleted, leaving an
+  // inconsistent state. Superseded rows are still merge-eligible
+  // because `getMemory(..., includeSuperseded: true)` returns them
+  // and the original behaviour was to allow exactly that.
+  // (Production-readiness review finding F-8.)
+  if (into.status === 'deleted' || from.status === 'deleted') {
+    throw new Error(
+      `mergeMemory: cannot merge a deleted memory (into='${into.status}', from='${from.status}')`,
+    );
+  }
+
+  // Secret screen: mergedContent is a NEW caller-supplied string that
+  // lands verbatim in memories.content. Run it through the same gate
+  // memory_save / memory_update use. Without this, the merge path was
+  // a documented-in-SECURITY.md write that persisted secrets anyway.
+  // (Production-readiness review finding F-1.)
+  if (typeof mergedContent === 'string' && mergedContent.length > 0) {
+    assertNoSecret({ content: mergedContent });
+  }
 
   // Union tags (preserve order, de-dup case-insensitively).
   const seen = new Set();

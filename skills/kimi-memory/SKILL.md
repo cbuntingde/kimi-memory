@@ -56,7 +56,7 @@ Pick the right scope for every fact you save or recall:
 
 ## Tools
 
-The full catalog (durable memory, similarity + edges, working memory, sessions, ACL/visibility, tier/persona, wiki, codegraph, maintenance, dream) lives in `references/tools.md`. Quick reference:
+The full catalog (durable memory, similarity + edges, working memory, sessions, ACL/visibility, tier/persona, codegraph, maintenance, dream) lives in `references/tools.md`. Quick reference:
 
 - **Durable memory**: `memory_save`, `memory_recall`, `memory_list`, `memory_get`, `memory_update`, `memory_delete`, `memory_save_bulk`, `memory_status`, `memory_reinforce`.
 - **Similarity + edges**: `memory_similar`, `memory_link`, `memory_unlink`, `memory_edges`, `memory_merge`.
@@ -69,7 +69,7 @@ Defaults: `memory_save` / `memory_update` / `memory_delete` write to `scope: "pr
 ## Typical flow
 
 1. At `SessionStart` the plugin surfaces a compact status line + a brief summary like `Loaded 2 recent memories. (1 project, 1 global.)` (or `No recent memories.`) plus any working-memory slots. Use the **counts** on the status line to decide what to look at; pull full content via `memory_recall` if needed. If a prior session captured a focus (see `references/recall-acknowledgement.md`), a `[focus] "<title>" (working) — <body snippet>` line is emitted right after the summary — that is the answer to "what were we working on" without any further query.
-2. `UserPromptSubmit` emits the same status line plus a recall summary that names the types of memories that matched (e.g. `Recalled 3 memories. (2 project, 1 global.) [semantic: 2, procedural: 1]`). The per-memory titles reach the model through `hookSpecificOutput.additionalContext` (a numbered list, `1. (semantic, project, score=0.04) "title" — <body snippet>`). The trailing `— <body snippet>` is the first non-empty line of the memory's body, capped at 120 characters, so you can verify the recall matched what the user expected without depending on the title alone. Pull full bodies via `memory_recall` only when the snippet is not enough. When a session-focus row exists, a `[focus] "<title>" (working) — <body snippet>` line follows the summary (always — not gated on keyword match).
+2. `UserPromptSubmit` emits a single line in its human-readable message: `[kimi-memory] Recalled 3 memories. (2 project, 1 global.) [semantic: 2, procedural: 1]` (or `[kimi-memory] No recall hits.`). Counts and ingest results flow through the dispatcher's diagnostic log, not the chat. The per-memory titles reach the model through `hookSpecificOutput.additionalContext` (a numbered list, `1. (semantic, project, score=0.04) "title" — <body snippet>`). The trailing `— <body snippet>` is the first non-empty line of the memory's body, capped at 120 characters, so you can verify the recall matched what the user expected without depending on the title alone. Pull full bodies via `memory_recall` only when the snippet is not enough. When a session-focus row exists, a `[focus] "<title>" (working) — <body snippet>` line is appended to `additionalContext` (not the human-readable message — that stays minimal) so the model still has the "what were we working on" signal but the user doesn't see it inline.
 3. If the user states something durable: call `memory_save` with the right scope. Echo the returned `operation`, `scope`, and `memory.id`.
 4. Before answering a recall-style question: `memory_recall` (default `scope: "all"`).
 5. When the topic moves on: update or clear the working-memory slot.

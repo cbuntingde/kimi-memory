@@ -34,6 +34,10 @@ export {
   resetProjectDryRunCounts,
   promotePendingRows,
   flushEmbeddings,
+  // Re-exported so callers (CLI, tests) can dry-run the secret gate
+  // without reaching into a private module path.
+  // (Production-readiness review finding F-1.)
+  assertNoSecret,
 } from './memories.js';
 
 // ----- Search / recall / backfill -----
@@ -84,6 +88,7 @@ export {
   listProjectPaths,
   detectReclone,
   resetProject,
+  wipeProjectLifecycleLogs,
   mirrorConversationEventsFts,
 } from './project.js';
 

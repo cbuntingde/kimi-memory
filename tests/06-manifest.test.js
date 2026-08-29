@@ -127,30 +127,45 @@ test('manifest version matches package.json and package-lock.json', () => {
 });
 
 test('manifest tool count claim matches the registered tool count', () => {
-  const serverSrc = readFileSync(path.join(root, 'src', 'server.js'), 'utf8');
-  // Count `name: 'memory_…' / 'working_memory_…' / 'conversation_…' / 'acl_…' / 'wiki_…' / 'codegraph_…'`
+  // TOOL_DEFS lives in src/mcp/tool-defs.js since the Phase-1 refactor;
+  // the per-tool wires live in src/mcp/handlers/*.js since the
+  // Phase-2 refactor (one `registerTool(server, D.<name>, ...)` call
+  // per tool per handler file). The orchestrator src/server.js is a
+  // thin shell that imports + invokes those handlers.
+  const defsSrc = readFileSync(path.join(root, 'src', 'mcp', 'tool-defs.js'), 'utf8');
+  // Count `name: 'memory_…' / 'working_memory_…' / 'conversation_…' / 'acl_…' / 'codegraph_…'`
   // entries inside the TOOL_DEFS array. Each registered tool declares
   // exactly one. (acl_* added in v10 Phase 1; tier tools in Phase 3;
-  // wiki tools in Phase 4; codegraph tools in Phase 5.)
-  const def = serverSrc.match(/const TOOL_DEFS = \[([\s\S]*?)\];/);
-  assert.ok(def, 'TOOL_DEFS not found in src/server.js');
-  const toolNames =
+  // codegraph tools in Phase 5; wiki tools were in Phase 4 and removed
+  // in v14.)
+  const def = defsSrc.match(/export const TOOL_DEFS = \[([\s\S]*?)\];/);
+  assert.ok(def, 'TOOL_DEFS not found in src/mcp/tool-defs.js');
+  const allNames =
     def[1].match(
-      /name: '(?:memory_|working_memory_|conversation_|acl_|wiki_|codegraph_|dream_)[a-z_]+'/g,
+      /name:\s*'(memory_[a-z_]+|working_memory_[a-z_]+|conversation_[a-z_]+|acl_[a-z_]+|codegraph_[a-z_]+|dream_[a-z_]+)'/g,
     ) || [];
-  const toolCount = toolNames.length;
+  const toolCount = allNames.length;
   assert.ok(toolCount > 0, 'no tools registered in TOOL_DEFS');
-  // Every tool must be wired into `server.tool(TOOL_DEFS[N]…)`. The wire
-  // call may be on a single line or split across lines (memory_save is
-  // split), so accept whitespace between `server.tool(` and the index.
-  const wireIndices = new Set();
-  for (const m of serverSrc.matchAll(/server\.tool\(\s*TOOL_DEFS\[(\d+)\]/g)) {
-    wireIndices.add(Number(m[1]));
-  }
-  for (let i = 0; i < toolCount; i++) {
+  // Every tool must be wired by name via `registerTool(server, D.<name>, ...)`
+  // in one of the per-domain handler files. The reference is by name
+  // (not by index), so this assertion is index-agnostic — adding a new
+  // tool in any handler slot passes without re-numbering.
+  const handlersDir = path.join(root, 'src', 'mcp', 'handlers');
+  const handlerFiles = readdirSync(handlersDir)
+    .filter((f) => f.endsWith('.js'))
+    .map((f) => readFileSync(path.join(handlersDir, f), 'utf8'));
+  const handlersAll = handlerFiles.join('\n');
+  for (const decl of allNames) {
+    const name = decl.match(/'([^']+)'/)[1];
+    // Wire shape is `registerTool(server, D.<name>, ...)` or, for
+    // tools that opt into per-call options,
+    // `registerTool(server, { ...D.<name>, ...opts }, ...)`. Match the
+    // `D.<name>` token appearing anywhere in a registerTool call,
+    // before the next `async (args` handler body marker.
+    const wireRe = new RegExp(`registerTool\\([\\s\\S]*?D\\.${name}\\b[\\s\\S]*?async \\(args`);
     assert.ok(
-      wireIndices.has(i),
-      'TOOL_DEFS[' + i + '] is registered but not wired into server.tool',
+      wireRe.test(handlersAll),
+      `${name} is in TOOL_DEFS but not wired in any handler file`,
     );
   }
   // The long description must declare the same count. Accepts both the
@@ -220,12 +235,22 @@ test('README documents GitHub installation and inline teardown', () => {
 });
 
 test('memory_prune tool is registered, wired, and documented', () => {
-  const serverSrc = readFileSync(path.join(root, 'src', 'server.js'), 'utf8');
-  assert.match(serverSrc, /name: 'memory_prune'/, 'TOOL_DEFS must include memory_prune');
+  // TOOL_DEFS moved to src/mcp/tool-defs.js in the Phase-1 refactor;
+  // per-tool wires live in src/mcp/handlers/*.js since Phase 2.
+  const defsSrc = readFileSync(path.join(root, 'src', 'mcp', 'tool-defs.js'), 'utf8');
+  const maintenanceSrc = readFileSync(
+    path.join(root, 'src', 'mcp', 'handlers', 'maintenance.js'),
+    'utf8',
+  );
+  assert.match(defsSrc, /name: 'memory_prune'/, 'TOOL_DEFS must include memory_prune');
+  // The wire call is `registerTool(server, D.memory_prune, ...)` or
+  // `registerTool(server, { ...D.memory_prune, ...opts }, ...)`. Match
+  // the name token appearing anywhere within a registerTool call
+  // before the next `,\n    async` (start of the handler body).
   assert.match(
-    serverSrc,
-    /server\.tool\(\s*TOOL_DEFS\[(\d+)\]\.name, TOOL_DEFS\[\1\]\.input/,
-    'memory_prune must be wired into server.tool (same line)',
+    maintenanceSrc,
+    /registerTool\([\s\S]*?D\.memory_prune[\s\S]*?async \(args/,
+    'memory_prune must be wired via registerTool in src/mcp/handlers/maintenance.js',
   );
   // The long description must mention it.
   const long = (manifest.interface && manifest.interface.longDescription) || '';
@@ -233,10 +258,10 @@ test('memory_prune tool is registered, wired, and documented', () => {
   // The exact count is governed by the regex match above; this hardcode
   // exists to flag a description that claims a different number than the
   // TOOL_DEFS array. Bump this when a new tool is added. Accepts both
-  // the legacy `Tools (55):` phrasing and the post-deprecation
-  // `Tools (55 total; ...):` phrasing that splits the 55 into
-  // always-on + deprecated groups.
-  assert.match(long, /Tools \(55(?:\s+total[^)]*)?\)/, 'longDescription must claim 55 tools');
+  // the legacy `Tools (50):` phrasing and the post-deprecation
+  // `Tools (50 total; ...):` phrasing that splits the 50 into
+  // always-on + deprecated groups. (50 reflects v14 wiki removal — was 55.)
+  assert.match(long, /Tools \(50(?:\s+total[^)]*)?\)/, 'longDescription must claim 50 tools');
   // The slash command exists and links to the tool.
   const pruneCmd = readFileSync(path.join(root, 'commands', 'prune.md'), 'utf8');
   assert.match(pruneCmd, /memory_prune\(/);

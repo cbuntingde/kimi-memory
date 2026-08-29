@@ -421,12 +421,35 @@ test('UserPromptSubmit surfaces the focus line even when no keyword match', () =
       { home },
     );
     assert.equal(ups.status, 0);
+    // Parse the trailing JSON envelope. The focus line moved out of the
+    // human-readable `message` (so the user's chat isn't dominated by
+    // three lines of metadata per prompt) into the AI-facing
+    // `additionalContext` block, where the model still picks it up and
+    // can open with "Picking up from: …".
+    const upsJson = ups.stdout.match(/\{[\s\S]+\}\s*$/);
+    assert.ok(upsJson, 'trailing JSON envelope is present');
+    const upsParsed = JSON.parse(upsJson[0]);
     assert.match(
-      ups.stdout,
+      upsParsed.hookSpecificOutput.additionalContext,
       /\[focus\] "Last focus: investigate the embedding timeout" \(working\)/,
+      'focus line surfaces in additionalContext for the model to acknowledge',
+    );
+    // The human-readable message must NOT carry the focus line — that
+    // is the whole point of moving it to additionalContext.
+    assert.equal(
+      upsParsed.message.includes('[focus]'),
+      false,
+      'focus line must not appear in the human-readable message',
+    );
+    // The message is now just the minimal recall summary, prefixed
+    // with `[kimi-memory]`.
+    assert.match(
+      upsParsed.message,
+      /^\[kimi-memory\] (?:Recalled \d+ memor|No recall hits\.)/,
+      'message is the single `[kimi-memory] <summary>` line',
     );
     // And the prompt-derived recall is still a no-hit.
-    assert.match(ups.stdout, /No recall hits\.|Recalled \d+ memor/);
+    assert.match(upsParsed.message, /No recall hits\.|Recalled \d+ memor/);
   } finally {
     rmRf(home);
   }

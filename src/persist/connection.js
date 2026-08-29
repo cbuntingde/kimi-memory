@@ -8,7 +8,7 @@ import { mkdirSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { logPersistError } from '../diagnostics.js';
 
-const SCHEMA_VERSION = 13;
+const SCHEMA_VERSION = 15;
 
 // Schema migrations. Each entry is idempotent: it inspects the live
 // schema, no-ops when its target shape is already in place, and
@@ -397,66 +397,6 @@ const MIGRATIONS = [
       db.exec('CREATE INDEX idx_persona_promotions_memory ON persona_promotions(memory_id)');
   },
 
-  // v10: Wiki / LLM-Wiki tables (TencentDB port). Pages live alongside
-  // the per-project memories table (same DB file). Pages are keyed by
-  // (project_key, name) so the upsert is idempotent and re-saving the
-  // same name rewrites the body in place. Edges are typed via a CHECK
-  // constraint; a future-target edge (the linked page does not exist
-  // yet) is recorded with to_wiki_id='pending:<name>' so the link is
-  // preserved across re-saves and resolved once the target lands.
-  function migrateAddWikiTables(db) {
-    db.exec(`
-      CREATE TABLE IF NOT EXISTS wiki_pages (
-        wiki_id     TEXT PRIMARY KEY,
-        project_key TEXT NOT NULL,
-        service_id  TEXT NOT NULL DEFAULT '',
-        team_id     TEXT NOT NULL DEFAULT '',
-        name        TEXT NOT NULL,
-        body        TEXT NOT NULL DEFAULT '',
-        summary     TEXT NOT NULL DEFAULT '',
-        updated_at  TEXT NOT NULL,
-        UNIQUE(project_key, name)
-      )
-    `);
-    db.exec(`
-      CREATE TABLE IF NOT EXISTS wiki_links (
-        from_wiki_id TEXT NOT NULL,
-        to_wiki_id   TEXT NOT NULL,
-        project_key  TEXT NOT NULL,
-        kind         TEXT NOT NULL CHECK (kind IN ('mentions','derived_from','contradicts','supersedes')),
-        weight       REAL NOT NULL DEFAULT 1.0,
-        created_at   TEXT NOT NULL,
-        UNIQUE(project_key, from_wiki_id, to_wiki_id, kind)
-      )
-    `);
-    db.exec(`
-      CREATE VIRTUAL TABLE IF NOT EXISTS wiki_fts USING fts5(
-        wiki_id UNINDEXED,
-        project_key UNINDEXED,
-        name,
-        body,
-        summary,
-        tokenize = 'unicode61 remove_diacritics 2'
-      )
-    `);
-    const idxFrom = db
-      .prepare("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_wiki_links_from'")
-      .get();
-    if (!idxFrom)
-      db.exec('CREATE INDEX idx_wiki_links_from ON wiki_links(project_key, from_wiki_id)');
-    const idxTo = db
-      .prepare("SELECT name FROM sqlite_master WHERE type='index' AND name='idx_wiki_links_to'")
-      .get();
-    if (!idxTo) db.exec('CREATE INDEX idx_wiki_links_to ON wiki_links(project_key, to_wiki_id)');
-    const idxPage = db
-      .prepare(
-        "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_wiki_pages_project'",
-      )
-      .get();
-    if (!idxPage)
-      db.exec('CREATE INDEX idx_wiki_pages_project ON wiki_pages(project_key, updated_at)');
-  },
-
   // v10: CodeGraph edge kinds + memory_edges.metadata column (Phase 5).
   // Extends the memory_edges.kind CHECK to include the three codegraph
   // kinds (imports, calls, defines) and adds a `metadata TEXT` column
@@ -781,6 +721,31 @@ const MIGRATIONS = [
     if (!idxPropProj)
       db.exec('CREATE INDEX idx_dream_proposals_project ON dream_proposals(project_key, status)');
   },
+
+  // v15: consolidation_runs table. Records every consolidation pass
+  // outcome (inline runConsolidate + dream apply) so memory_status +
+  // the hook status line can answer "when did consolidation last run
+  // and what happened" without re-walking the memories table. Bounded
+  // by a 90-day TTL inside auto-gc; one row per project per pass.
+  function migrateAddConsolidationRunsTable(db) {
+    db.exec(`
+      CREATE TABLE IF NOT EXISTS consolidation_runs (
+        id          TEXT PRIMARY KEY,
+        project_key TEXT NOT NULL,
+        summary     TEXT NOT NULL DEFAULT '{}',
+        at          TEXT NOT NULL
+      )
+    `);
+    const idx = db
+      .prepare(
+        "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_consolidation_runs_project'",
+      )
+      .get();
+    if (!idx)
+      db.exec(
+        'CREATE INDEX idx_consolidation_runs_project ON consolidation_runs(project_key, at)',
+      );
+  },
 ];
 
 const SCHEMA_SQL = `
@@ -915,6 +880,17 @@ CREATE TABLE IF NOT EXISTS project_paths (
   record_count        INTEGER NOT NULL DEFAULT 1
 );
 CREATE INDEX IF NOT EXISTS idx_project_paths_root ON project_paths(canonical_root);
+
+-- v15: consolidation_runs log. One row per consolidation pass (inline
+-- runConsolidate at SessionStart + dream apply). Bounded by a 90-day
+-- TTL inside auto-gc; serves the memory_status.consolidation block.
+CREATE TABLE IF NOT EXISTS consolidation_runs (
+  id          TEXT PRIMARY KEY,
+  project_key TEXT NOT NULL,
+  summary     TEXT NOT NULL DEFAULT '{}',
+  at          TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_consolidation_runs_project ON consolidation_runs(project_key, at);
 `;
 
 // Path-keyed handle cache. Each hook or MCP call may legitimately open

@@ -304,8 +304,7 @@ export function buildCodeGraphEdges(db, projectKey, files, opts = {}) {
          JOIN memories m ON m.id = f.id
          WHERE memories_fts MATCH ?
            AND m.project_key = ?
-           AND m.status = 'active'
-           AND m.id NOT LIKE 'wiki-%'`,
+           AND m.status = 'active'`,
       );
       for (const sym of fileSymbols) {
         // Per-symbol try/catch: a malformed FTS5 token (e.g. one that

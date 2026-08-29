@@ -12,7 +12,7 @@ the user's other plugins, or third-party models.
 - **Asset**: the contents of every SQLite database under
   `$KIMI_CODE_HOME/kimi-memory/`. These are durable memory, working
   memory, working-log entries, conversation archives, ACL grants,
-  tier/persona state, wiki pages, and codegraph edges.
+  tier/persona state, and codegraph edges.
 - **Trusted**: the user, their Kimi Code runtime, the local filesystem.
 - **Adversarial surface**: text the user pastes into chat or that an
   upstream model emits. The plugin must reject known credential shapes

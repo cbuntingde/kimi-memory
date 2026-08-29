@@ -490,9 +490,9 @@ test('MCP round-trip: recall surfaces type breakdown + per-memory [recall: i/N] 
     assert.ok(jsonMatch, 'trailing JSON object is present in stdout');
     const json = JSON.parse(jsonMatch[0]);
     assert.match(
-      json.systemMessage,
+      json.message,
       /\[\s*semantic:\s*\d+(?:\s*,\s*[a-z]+:\s*\d+)*\s*\]/,
-      'type breakdown is present in systemMessage',
+      'type breakdown is present in message',
     );
     // The new design (v9.6+) routes the per-memory recall lines
     // through `hookSpecificOutput.additionalContext` so the model
@@ -520,9 +520,9 @@ test('MCP round-trip: recall surfaces type breakdown + per-memory [recall: i/N] 
     // The verbose previews must NOT be in the human-readable stdout
     // (the terminal would be too noisy).
     assert.equal(
-      json.systemMessage.includes('[recall: '),
+      json.message.includes('[recall: '),
       false,
-      'verbose previews must not be in the human-readable systemMessage',
+      'verbose previews must not be in the human-readable message',
     );
   } finally {
     mcp.stop();

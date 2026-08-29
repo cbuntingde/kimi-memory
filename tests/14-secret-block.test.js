@@ -15,9 +15,18 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkTempHome, rmRf, StdioMcp } from './_helpers.js';
-import { openDb, closeDb, memoryCounts, listMemories } from '../src/persist.js';
-import { saveMemory, saveMemoryBulk } from '../src/persist.js';
-import { projectDbPath, deriveProjectKey } from '../src/project-key.js';
+import {
+  openDb,
+  closeDb,
+  memoryCounts,
+  listMemories,
+  saveMemory,
+  saveMemoryBulk,
+  mergeMemory,
+  setWorkingMemory,
+  getWorkingMemory,
+} from '../src/persist.js';
+import { projectDbPath, deriveProjectKey, canonicalizeRoot } from '../src/project-key.js';
 
 const SECRET_SAMPLES = [
   { kind: 'openai', content: 'Use the key sk-abcdefghijklmnopqrstuvwxyz0123456789 for tests.' },
@@ -207,6 +216,143 @@ test('MCP round-trip: a clean save after a blocked attempt still works', async (
     const j = JSON.parse(good.content[0].text);
     assert.equal(j.operation, 'saved');
     assert.ok(j.memory && j.memory.id);
+  } finally {
+    mcp.stop();
+    rmRf(home);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Coverage for the two write paths that previously bypassed the secret
+// gate and landed credentials verbatim into the project SQLite:
+//   - memory_merge     (merged_content parameter)
+//   - working_memory_set (slot value)
+// (Production-readiness review finding F-1.)
+// ---------------------------------------------------------------------------
+
+test('persist.mergeMemory: refuses a secret-shaped merged_content', () => {
+  const home = mkTempHome();
+  try {
+    const key = deriveProjectKey(canonicalizeRoot('C:/test/secret-block-merge'));
+    const dbPath = projectDbPath(home, key);
+    const db = openDb(dbPath);
+    const into = saveMemory(db, key, { type: 'semantic', title: 'into', content: 'into body' });
+    const from = saveMemory(db, key, { type: 'semantic', title: 'from', content: 'from body' });
+    assert.throws(
+      () =>
+        mergeMemory(db, key, into.id, from.id, {
+          mergedContent: 'AWS access key id is AKIAIOSFODNN7EXAMPLE for the staging env.',
+        }),
+      (err) => {
+        assert.equal(err.code, 'KIMI_MEMORY_SECRET_DETECTED');
+        assert.match(err.message, /refusing to persist/);
+        return true;
+      },
+      'mergeMemory should refuse a secret-shaped mergedContent',
+    );
+    closeDb();
+    // Re-open and confirm the into-row's content was NOT overwritten.
+    const db2 = openDb(dbPath);
+    const row = db2
+      .prepare('SELECT content FROM memories WHERE id=? AND project_key=?')
+      .get(into.id, key);
+    assert.equal(row.content, 'into body', 'into-memory content untouched');
+  } finally {
+    closeDb();
+    rmRf(home);
+  }
+});
+
+test('persist.setWorkingMemory: refuses a secret-shaped slot value', () => {
+  const home = mkTempHome();
+  try {
+    const key = deriveProjectKey(canonicalizeRoot('C:/test/secret-block-wm'));
+    const dbPath = projectDbPath(home, key);
+    const db = openDb(dbPath);
+    assert.throws(
+      () => setWorkingMemory(db, key, 'current_focus', 'api_key = abcdefghijklmnop'),
+      (err) => {
+        assert.equal(err.code, 'KIMI_MEMORY_SECRET_DETECTED');
+        return true;
+      },
+      'setWorkingMemory should refuse a secret-shaped value',
+    );
+    closeDb();
+    // Re-open and confirm the slot stayed unset.
+    const db2 = openDb(dbPath);
+    const r = getWorkingMemory(db2, key, 'current_focus');
+    assert.equal(r, null, 'no working-memory slot written');
+  } finally {
+    closeDb();
+    rmRf(home);
+  }
+});
+
+test('MCP round-trip: memory_merge blocks secret-shaped merged_content', async () => {
+  const home = mkTempHome();
+  const mcp = new StdioMcp({ home });
+  mcp.start();
+  try {
+    await mcp.call('initialize', {
+      protocolVersion: '2024-11-05',
+      capabilities: {},
+      clientInfo: { name: 'test', version: '0' },
+    });
+    const cwd = 'C:/test/mcp-secret-block-merge';
+    const a = await mcp.toolCall('memory_save', {
+      cwd,
+      type: 'semantic',
+      title: 'target',
+      content: 'target body',
+    });
+    const b = await mcp.toolCall('memory_save', {
+      cwd,
+      type: 'semantic',
+      title: 'source',
+      content: 'source body',
+    });
+    const intoId = JSON.parse(a.content[0].text).memory.id;
+    const fromId = JSON.parse(b.content[0].text).memory.id;
+    const r = await mcp.toolCall('memory_merge', {
+      cwd,
+      into_id: intoId,
+      from_id: fromId,
+      merged_content: 'AWS access key id is AKIAIOSFODNN7EXAMPLE for the staging env.',
+    });
+    assert.equal(r.isError, true, 'memory_merge is rejected');
+    assert.match(r.content[0].text, /secret_detected/);
+    // The from-row should also stay unsuperseded; the merge did not run.
+    const status = await mcp.toolCall('memory_status', { cwd });
+    const j = JSON.parse(status.content[0].text);
+    assert.equal(j.memories.active, 2, 'both rows still active after a blocked merge');
+  } finally {
+    mcp.stop();
+    rmRf(home);
+  }
+});
+
+test('MCP round-trip: working_memory_set blocks a secret-shaped value', async () => {
+  const home = mkTempHome();
+  const mcp = new StdioMcp({ home });
+  mcp.start();
+  try {
+    await mcp.call('initialize', {
+      protocolVersion: '2024-11-05',
+      capabilities: {},
+      clientInfo: { name: 'test', version: '0' },
+    });
+    const cwd = 'C:/test/mcp-secret-block-wm';
+    const r = await mcp.toolCall('working_memory_set', {
+      cwd,
+      slot: 'current_focus',
+      value: 'api_key = abcdefghijklmnop',
+    });
+    assert.equal(r.isError, true, 'working_memory_set is rejected');
+    assert.match(r.content[0].text, /secret_detected/);
+    // Round-trip a get — should still be null.
+    const g = await mcp.toolCall('working_memory_get', { cwd, slot: 'current_focus' });
+    const j = JSON.parse(g.content[0].text);
+    assert.equal(j.value, null, 'no working-memory slot persisted');
   } finally {
     mcp.stop();
     rmRf(home);

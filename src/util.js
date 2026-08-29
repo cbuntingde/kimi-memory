@@ -44,16 +44,25 @@ export async function readStdin(limitBytes = 1024 * 1024) {
     const chunks = [];
     let total = 0;
     let aborted = false;
+    let truncated = false;
     const finish = () => {
       if (aborted) return;
       aborted = true;
       const buf = Buffer.concat(chunks);
-      resolve(buf.toString('utf8'));
+      resolve({ text: buf.toString('utf8'), truncated });
     };
     process.stdin.on('data', (c) => {
       if (aborted) return;
       total += c.length;
       if (total > limitBytes) {
+        // The 256 KB cap on stdin payloads is here to keep a runaway
+        // Kimi runtime (or a malicious caller) from holding the hook
+        // process open. Marking `truncated` lets the caller surface a
+        // warning to the diagnostics log; otherwise we silently swallow
+        // the tail, including any user-pasted secret bytes the redactor
+        // never sees.
+        // (Production-readiness review finding F-7.)
+        truncated = true;
         chunks.push(Buffer.from('[...truncated]'));
         process.stdin.removeAllListeners('data');
         process.stdin.resume(); // drain

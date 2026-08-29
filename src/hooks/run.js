@@ -52,7 +52,20 @@ const HANDLERS = {
 async function main() {
   const EVENT = process.env.KM_HOOK_EVENT || 'unknown';
   setContext({ home: HOME, event: EVENT });
-  const raw = await readStdin(256 * 1024);
+  const stdin = await readStdin(256 * 1024);
+  // Truncation observability: when the Kimi runtime hands us a payload
+  // larger than 256 KiB (a runaway session, a malicious caller, or a
+  // transcript tail bigger than the hook budget) the tail is replaced
+  // with a 4-char `[...truncated]` placeholder. Log it so the operator
+  // can correlate with whatever the agent then complained about.
+  // (Production-readiness review finding F-7.)
+  if (stdin.truncated) {
+    await logHookDiag(EVENT, 'warn', 'stdin_truncated', {
+      event: EVENT,
+      limit_bytes: 256 * 1024,
+    });
+  }
+  const raw = stdin.text;
   // Parse the stdin payload exactly once. The previous shape ran
   // safeJsonParse twice on every hook, spending a stringify/parse
   // cycle on up-to 256 KiB of JSON unnecessarily. (Audit fix.)

@@ -52,12 +52,6 @@ Same deprecation rationale as ACL. The `L0 → L1 → L2 → L3` tier + `persona
 
 - `memory_set_tier`, `memory_promote`, `memory_demote`, `memory_tier_history`.
 
-## Wiki (deprecated)
-
-The wiki is a separate `wiki_pages` + `wiki_links` + `wiki_fts` storage model that duplicates the memory store. The recall path does not surface wiki hits; nothing in the agent workflow calls these tools in production. Gated behind `KIMI_MEMORY_LEGACY_SUBSYSTEMS=off`.
-
-- `wiki_upsert_page`, `wiki_get_page`, `wiki_traverse`, `wiki_backlinks`, `wiki_resolve`.
-
 ## Codegraph (deprecated)
 
 The codegraph tools walk source files and build `imports/calls/defines` edges in `memory_edges`. The plugin does not use them for recall — they are user-callable only. Out of scope for a memory plugin. Gated behind `KIMI_MEMORY_LEGACY_SUBSYSTEMS=off`.
@@ -80,4 +74,4 @@ Phase 1 of the Dream subsystem replaces the inline fire-and-forget dream pass wi
 
 ## Gating legacy subsystems
 
-Set `KIMI_MEMORY_LEGACY_SUBSYSTEMS=off` in the environment to disable every tool in the ACL, tier/persona, wiki, codegraph, and (separately gated by `KIMI_MEMORY_DREAM=off`) Dream groups in one switch. The corresponding MCP tool registrations are skipped at boot; the schema tables remain (no data loss) so a user can flip the env var back on without a migration. See `AGENTS.md §Subsystem deprecation`.
+Set `KIMI_MEMORY_LEGACY_SUBSYSTEMS=off` in the environment to disable every tool in the ACL, tier/persona, codegraph, and (separately gated by `KIMI_MEMORY_DREAM=off`) Dream groups in one switch. The corresponding MCP tool registrations are skipped at boot; the schema tables remain (no data loss) so a user can flip the env var back on without a migration. The wiki group was removed entirely in v14; its tools are no longer registered. See `AGENTS.md §Subsystem deprecation`.

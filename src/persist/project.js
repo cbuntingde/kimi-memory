@@ -8,11 +8,21 @@ import { statSync } from 'node:fs';
 import path from 'node:path';
 import { nowIso, safeJsonParse } from '../util.js';
 import { ensureProjectDir, ingestStatePath } from '../project-key.js';
-import { rowToMemory } from './memories.js';
+import { rowToMemory, assertNoSecret } from './memories.js';
 
 // ----- Working memory -----
 
 export function setWorkingMemory(db, projectKey, slot, value) {
+  // Secret screen: the slot value lands verbatim in working_memory.value
+  // and is recalled into the agent context on the next prompt (via the
+  // SessionStart working-memory preview). A user paste of "remember my
+  // API key is api_key = abcdefghijklmnop" would otherwise bypass the
+  // memory_save gate and reach the agent on the next session. Run the
+  // same predicate the durable write path uses.
+  // (Production-readiness review finding F-1.)
+  if (typeof value === 'string' && value.length > 0) {
+    assertNoSecret({ content: value });
+  }
   const now = nowIso();
   db.prepare(
     `
@@ -582,4 +592,31 @@ export function resetProject(db, projectKey, { canonicalRoot = '' } = {}) {
     throw err;
   }
   return summary;
+}
+
+// Wipe per-project lifecycle log tables that the manual resetProject
+// deliberately leaves in place (so the manual MCP tool keeps its
+// audit trail). The auto-reset-on-reclone hook path calls this
+// after resetProject so a re-cloned project lands at literally
+// zero state: no memories, no dream_jobs, no dream_proposals, no
+// consolidation_runs.
+//
+// Scope is strict: every DELETE matches project_key=? so a multi-
+// project DB (and the future shared-DB design) keeps its sibling
+// project rows intact. Throws on any error.
+export function wipeProjectLifecycleLogs(db, projectKey) {
+  if (!db || !projectKey) {
+    throw new Error('wipeProjectLifecycleLogs: db and projectKey are required');
+  }
+  return {
+    dream_jobs_deleted: db
+      .prepare('DELETE FROM dream_jobs WHERE project_key=?')
+      .run(projectKey).changes,
+    dream_proposals_deleted: db
+      .prepare('DELETE FROM dream_proposals WHERE project_key=?')
+      .run(projectKey).changes,
+    consolidation_runs_deleted: db
+      .prepare('DELETE FROM consolidation_runs WHERE project_key=?')
+      .run(projectKey).changes,
+  };
 }

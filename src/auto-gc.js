@@ -410,11 +410,11 @@ export function runAutoTier(db, projectKey, { now = new Date() } = {}) {
     result.skipped = 'tier_opt_out';
     return result;
   }
-  // Legacy subsystem gate: ACL/tier/wiki/codegraph are deprecated.
-  // When the user opts out, skip tier promotions entirely so the
-  // deprecated `tier` column + `persona_promotions` audit table stay
-  // untouched. The schema is preserved so a future flip back on does
-  // not require data migration.
+  // Legacy subsystem gate: ACL/tier/codegraph are deprecated. Wiki
+  // was removed in v14. When the user opts out, skip tier promotions
+  // entirely so the deprecated `tier` column + `persona_promotions`
+  // audit table stay untouched. The schema is preserved so a future
+  // flip back on does not require data migration.
   if (process.env.KIMI_MEMORY_LEGACY_SUBSYSTEMS === 'off') {
     result.skipped = 'legacy_subsystems_off';
     return result;

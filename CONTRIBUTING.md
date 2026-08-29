@@ -36,7 +36,7 @@ to keep CI fast.
 - `src/cli.js` — standalone CLI. Mirrors the MCP tool surface where it
   makes sense.
 - `src/<subsystem>.js` — feature modules (acl, codegraph, consolidate,
-  decay, dream, session-focus, wiki, etc.).
+  decay, dream, session-focus, etc.).
 - `tests/NN-<name>.test.js` — number-prefixed so they sort in the order
   they were added.
 

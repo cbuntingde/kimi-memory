@@ -247,13 +247,93 @@ export async function resolveLlmTarget(homeDir) {
   const providerName = asString(modelBlock.provider);
   const providerBlock = (cfg.providers && cfg.providers[providerName]) || null;
   if (!providerBlock) return { error: `provider_not_found:${providerName}` };
+  const baseUrl = asString(providerBlock.base_url);
+  // SSRF hardening (opt-in). Disabled by default because the local-first
+  // threat model treats the user's own config.toml as trusted, and a
+  // user who points their provider at a self-hosted OpenAI-compatible
+  // proxy on `http://127.0.0.1:8080` would otherwise see the auto-
+  // extract path silently disabled. Operators with hardened configs
+  // turn it on via `KIMI_MEMORY_AUTO_EXTRACT_REQUIRE_HTTPS=1` to
+  //   - refuse cleartext `http://` base URLs, and
+  //   - block loopback / private / link-local hosts that would let a
+  //     tampered config exfiltrate the redacted transcript to an
+  //     attacker-controlled endpoint.
+  // Refusal is fail-open in the sense that the hook reports a count
+  // and moves on; we never crash the agent lifecycle.
+  // (Production-readiness review finding F-6.)
+  if (process.env.KIMI_MEMORY_AUTO_EXTRACT_REQUIRE_HTTPS === '1') {
+    const guarded = guardLlmBaseUrl(baseUrl);
+    if (!guarded.ok) {
+      return { error: `base_url_blocked:${guarded.reason}`, baseUrl };
+    }
+  }
   return {
     provider: providerName,
     model: asString(modelBlock.model) || defaultModel,
     apiKey: asString(providerBlock.api_key),
-    baseUrl: asString(providerBlock.base_url),
+    baseUrl,
     type: asString(providerBlock.type) || 'openai',
   };
+}
+
+// Pure helper: returns { ok, reason } describing whether a base URL is
+// acceptable for the auto-extract LLM call under the
+// `KIMI_MEMORY_AUTO_EXTRACT_REQUIRE_HTTPS=1` hardening policy.
+//
+// Accepts:
+//   - https://host[:port]/path
+//   - http://host[:port]/path   (loopback / private / link-local hosts
+//     are still permitted because local proxies are a legitimate use
+//     case; the strict-mode operator opts into cleartext rejection by
+//     setting the env var, but we don't second-guess a deliberate
+//     loopback pin — we only block non-HTTPS + the patterns flagged
+//     below)
+// Refuses:
+//   - any URL whose host resolves to a private / loopback / link-local
+//     address AND the scheme is `http://` (cleartext + local = highest-
+//     risk combination — same origin policy lift). Public `http://`
+//     hosts are still permitted so a self-hosted Enterprise proxy that
+//     pins TLS at a different layer can keep working.
+//   - any non-http(s) scheme (file://, ssh://, etc.).
+//
+// Public IPv4 / IPv6 hosts on https:// are unconditionally accepted.
+// (Production-readiness review finding F-6.)
+export function guardLlmBaseUrl(rawUrl) {
+  if (!rawUrl || typeof rawUrl !== 'string') {
+    return { ok: false, reason: 'no_base_url' };
+  }
+  let url;
+  try {
+    url = new URL(rawUrl);
+  } catch {
+    return { ok: false, reason: 'unparseable_url' };
+  }
+  const scheme = (url.protocol || '').replace(/:$/, '').toLowerCase();
+  if (scheme !== 'http' && scheme !== 'https') {
+    return { ok: false, reason: `unsupported_scheme:${scheme || 'unknown'}` };
+  }
+  // Cleartext HTTP + a non-public host = block. Public cleartext is
+  // accepted so operators who terminate TLS at a sibling LB are not
+  // forced to rewrite their config.toml.
+  if (scheme === 'http' && url.hostname) {
+    const host = url.hostname.toLowerCase();
+    const isLoopback = host === 'localhost' || host === '127.0.0.1' || host === '::1' || host === '[::1]';
+    // Detect a private IPv4 class without a DNS lookup (so this stays
+    // deterministic and offline): 10/8, 172.16/12, 192.168/16,
+    // 169.254/16 (link-local), 0.0.0.0.
+    const ipv4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
+    const isPrivateV4 =
+      ipv4 &&
+      ((+ipv4[1] === 10) ||
+        (+ipv4[1] === 172 && +ipv4[2] >= 16 && +ipv4[2] <= 31) ||
+        (+ipv4[1] === 192 && +ipv4[2] === 168) ||
+        (+ipv4[1] === 169 && +ipv4[2] === 254) ||
+        (+ipv4[1] === 0));
+    if (isLoopback || isPrivateV4) {
+      return { ok: false, reason: `cleartext_local:${host}` };
+    }
+  }
+  return { ok: true };
 }
 
 // Build the extraction prompt. existingTitles is a list of titles

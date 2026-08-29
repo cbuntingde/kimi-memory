@@ -174,47 +174,22 @@ export async function startProxy({
       err.code = 'tool_not_allowed';
       throw err;
     }
-    // The MCP McpServer exposes `server._registeredTools` (private)
-    // in some SDK versions; we fall back to invoking the named
-    // tool via the server's tool registry. For an external proxy the
-    // shape that matters is the wire response: we want the same
-    // `{ content: [{type:'text', text: JSON.stringify(payload)}] }`
-    // envelope the stdio MCP server emits.
-    //
-    // McpServer doesn't expose a public "call by name" API; the
-    // closest surface is the internal `_registeredTools` map. We use
-    // it as an implementation detail of this version of the SDK and
-    // fall back to a 501 if the shape ever drifts.
-    const srv = mcp.server;
-    const registry = srv && (srv._registeredTools || srv._tools);
-    if (!registry) {
-      // Defensive: the SDK does not expose a public "call by name" API,
-      // so the proxy relies on a private field whose name has shifted
-      // across SDK releases. When the SDK drifts again, surface a
-      // typed error so the operator can pin the SDK or upgrade the
-      // proxy, rather than silently returning 500 on every request.
-      // (Audit fix M11.)
-      const err = new Error(
-        'MCP server tool registry is not accessible in this @modelcontextprotocol/sdk version; ' +
-          'proxy is pinned to an SDK release that exposed `_registeredTools` or `_tools` on `McpServer`. ' +
-          'Either pin the SDK or update src/proxy/server.js to match the new shape.',
-      );
-      err.code = 'sdk_drift';
-      throw err;
-    }
-    const entry = registry.get(toolName) || registry[toolName];
-    if (!entry) {
+    // The orchestrator (src/server.js) populates `mcp.handlers` with
+    // every tool's wrapped handler at startup. The Map<name, fn>
+    // shape is owned by us, not the SDK, so this code no longer
+    // depends on the private `_registeredTools` / `_tools` fields
+    // that previously shifted across SDK releases.
+    const handler = mcp.handlers && mcp.handlers.get(toolName);
+    if (typeof handler !== 'function') {
       const err = new Error(`unknown tool: ${toolName}`);
       err.code = 'unknown_tool';
       throw err;
     }
-    const handler = entry.handler || entry.callback || entry.fn;
-    if (typeof handler !== 'function') {
-      throw new Error(`tool ${toolName} has no callable handler`);
-    }
+    // The wrapped handler ignores its second arg (its ctx is built
+    // internally from `args.cwd`); we pass the proxy signal context
+    // for forward-compat in case a future handler wants to honour
+    // cancellation through the proxy transport.
     return await handler(args || {}, {
-      // Minimal signal-bearing second arg — the stdio transport
-      // doesn't pass one but the tool handlers tolerate undefined.
       signal: new AbortController().signal,
       sendNotification: () => {},
       sendRequest: () => Promise.resolve({}),
@@ -277,8 +252,10 @@ export async function startProxy({
       let ready = true;
       let reason = null;
       try {
-        const registry = mcp.server && (mcp.server._registeredTools || mcp.server._tools);
-        if (!registry) {
+        // The orchestrator populates `mcp.handlers` at startup; if
+        // it's missing the orchestrator never ran, so /readyz fails
+        // closed (503) until the next reload.
+        if (!mcp.handlers || mcp.handlers.size === 0) {
           ready = false;
           reason = 'mcp tool registry not accessible';
         }
@@ -303,23 +280,10 @@ export async function startProxy({
     }
 
     if (path === '/tools' && req.method === 'GET') {
-      // List the tool names the proxy can call. The McpServer does
-      // not expose this directly; we walk the registry.
+      // List the tool names the proxy can call. Source of truth is
+      // `mcp.handlers`, owned by the orchestrator (no SDK reach).
       try {
-        const registry = mcp.server && (mcp.server._registeredTools || mcp.server._tools);
-        if (!registry) {
-          // Same defensive surface as dispatchTool — if the SDK
-          // shape drifts, the operator sees a typed error instead
-          // of a silent empty list. (Audit fix M11.)
-          const err = new Error(
-            'MCP server tool registry is not accessible in this SDK version; see /tools/POST error for the same code.',
-          );
-          err.code = 'sdk_drift';
-          throw err;
-        }
-        const names = registry
-          ? [...(registry.keys ? registry.keys() : Object.keys(registry))]
-          : [];
+        const names = mcp.handlers ? [...mcp.handlers.keys()] : [];
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ tools: names, count: names.length }));
       } catch (e) {

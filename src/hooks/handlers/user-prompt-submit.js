@@ -1,6 +1,7 @@
-// UserPromptSubmit handler. On every prompt: composite recall + status
-// line + focus + advisor match + working-memory preview + re-clone
-// warning + AI-facing recall context.
+// UserPromptSubmit handler. On every prompt: composite recall + ingest
+// + AI-facing recall context. The human-readable message is intentionally
+// minimal — just the recall summary line — so the user's chat transcript
+// isn't dominated by verbose counts.
 
 import path from 'node:path';
 import { ensureProjectDir, deriveProjectKey } from '../../project-key.js';
@@ -10,22 +11,14 @@ import {
   payloadProjectRoot,
   payloadPrompt,
   safeOpenDb,
-  logDiag,
-  buildCounts,
-  buildStatusLine,
-  buildWorkingMemoryPreview,
-  buildStaleMemoryLine,
   buildRecallContextLines,
   buildRecallSummary,
-  readLatestStats,
   safeHandleStop,
   emitLines,
   readLatestSessionFocus,
   buildSessionFocusLine,
-  formatFocusSegment,
 } from './_helpers.js';
 import { matchAdvisor, logAdvisorDiag } from '../../advisor/detect.js';
-import { buildDreamStatus } from '../../dream.js';
 
 export async function handleUserPromptSubmit(payload) {
   const cwd = payloadProjectRoot(payload);
@@ -40,14 +33,10 @@ export async function handleUserPromptSubmit(payload) {
   const globalDbPath = path.join(HOME, 'kimi-memory', '_global', 'memory.sqlite');
   const projectDb = safeOpenDb(projectDbPath);
   const globalDb = safeOpenDb(globalDbPath);
-  const counts = buildCounts({ projectDb, globalDb, key });
   const prompt = payloadPrompt(payload);
   const recall = await buildRecallSummary({ projectDb, globalDb, key, prompt });
-  const {
-    extract: latestExtract,
-    workLog: latestWorkLog,
-    focus: latestFocus,
-  } = await readLatestStats(cwd);
+  const focus = readLatestSessionFocus(projectDb, key);
+  const focusLine = buildSessionFocusLine(focus);
 
   let advisorMatch = null;
   try {
@@ -56,41 +45,36 @@ export async function handleUserPromptSubmit(payload) {
     logAdvisorDiag('matchAdvisor threw: ' + (e && e.message)).catch(() => {});
   }
 
-  const lines = [];
-  lines.push(
-    buildStatusLine({
-      event: 'UserPromptSubmit',
-      key,
-      cwd,
-      counts,
-      ingest,
-      extract: latestExtract,
-      workLog: latestWorkLog,
-      focus: latestFocus,
-      recall: {
-        project: recall.projectHits.length,
-        global: recall.globalHits.length,
-      },
-      dream: projectDb ? buildDreamStatus(projectDb, key) : null,
-    }),
-  );
-  if (recall.summary) lines.push(recall.summary);
-  const focus = readLatestSessionFocus(projectDb, key);
-  const focusLine = buildSessionFocusLine(focus);
-  if (focusLine) lines.push(focusLine);
+  // The human-readable message rendered inside the user's <hook_result>
+  // tag is intentionally minimal: just the recall summary line. The
+  // verbose status line (`event=… project_key=… pmem.active=…`), the
+  // focus line, and the working-memory preview used to ride along here
+  // and dominated every prompt's first three lines. Counts and ingest
+  // results still flow through `result` (which the dispatcher logs into
+  // `_diagnostics/hooks.log`), and the per-memory recall hits still
+  // flow through `hookSpecificOutput.additionalContext` so the model
+  // can acknowledge them. Nothing the user actually wanted to read was
+  // being lost — we were just emitting it on stdout where it looked
+  // like noise. (Audit finding — verbose UserPromptSubmit output.)
+  //
+  // The focus line moves to additionalContext so the model still gets
+  // the "what were we working on" signal — it just doesn't render in
+  // the user's chat anymore.
+  const message = `[kimi-memory] ${recall.summary || 'No recall hits.'}`;
+  const recallContext = buildRecallContextLines(recall, recall.topHits);
+  const additionalContextParts = [];
+  if (recallContext) additionalContextParts.push(recallContext);
+  if (focusLine) additionalContextParts.push(focusLine);
   if (advisorMatch) {
-    lines.push(
+    additionalContextParts.push(
       `[advisor] matched: "${advisorMatch}" — /advisor or ask naturally; skill \`advisor\` is loaded`,
     );
   }
-  const wm = buildWorkingMemoryPreview(projectDb, key);
-  for (const l of wm) lines.push(l);
-  const staleMemoryLine = buildStaleMemoryLine(projectDb, key, cwd);
-  if (staleMemoryLine) lines.push(staleMemoryLine);
-  emitLines(lines);
-  const additionalContext = buildRecallContextLines(recall, recall.topHits);
+  const additionalContext = additionalContextParts.length
+    ? additionalContextParts.join('\n')
+    : undefined;
   const output = {
-    systemMessage: lines.join('\n'),
+    message,
     hookSpecificOutput: {
       hookEventName: 'UserPromptSubmit',
       ...(additionalContext ? { additionalContext } : {}),
@@ -104,7 +88,6 @@ export async function handleUserPromptSubmit(payload) {
   return {
     ok: true,
     key,
-    counts,
     ingest,
     recall_hits: {
       project: recall.projectHits.length,
@@ -114,7 +97,6 @@ export async function handleUserPromptSubmit(payload) {
     per_type: recall.perTypeCounts,
     focus: focusLine ? true : false,
     advisor: advisorMatch,
-    stale_memory: staleMemoryLine ? true : false,
     additional_context: additionalContext,
   };
 }

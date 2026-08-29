@@ -23,15 +23,40 @@
 // Fail-open: every step is wrapped. The hook layer swallows exceptions
 // and reports counts via { saved, skipped, errors, error? }.
 
-import { nowIso } from './util.js';
+import { nowIso, hashId, shortId } from './util.js';
 import { AUTO_MERGE_THRESHOLDS } from './auto-gc.js';
 
 const CONSOLIDATE_THRESHOLD = 0.75; // cosine floor for "related enough"
-const MIN_TAG_OVERLAP = 2; // at least this many shared tags
+// MIN_TAG_OVERLAP dropped 2 → 1 in v15: real-world memories usually carry
+// 1–2 tags, so "2 shared tags" was the dominant reason small datasets
+// never formed a cluster. Cosine ≥ 0.75 still anchors the clusterer on
+// semantic similarity; the only relaxation is the tag-side filter.
+const MIN_TAG_OVERLAP = 1;
 const MIN_CLUSTER_SIZE = 3; // need >=3 siblings to synthesise
 const CONSOLIDATE_MAX_MEMBERS = 8; // cap cluster size to keep conclusion bodies readable
 const CONSOLIDATE_MAX_CLUSTERS = 20; // cap clusters per pass
 const COVERAGE_RATIO = 0.75; // an existing conclusion "covers" a cluster if >=75% of the cluster is already linked
+
+// Small-dataset escape. When the project carries fewer than this many
+// active memories, drop the tag-overlap filter entirely (cosine alone
+// decides). This is the difference between "the inline pass did
+// nothing because the project has 6 memories" and "the inline pass
+// caught 2 sibling pairs".
+const SMALL_DATASET_THRESHOLD = 10;
+
+// KIMI_MEMORY_CONSOLIDATE_RELAX=on (default on) gates the small-dataset
+// escape. Off restores strict tag-overlap behaviour.
+function isRelaxEnabled() {
+  const v = process.env.KIMI_MEMORY_CONSOLIDATE_RELAX;
+  return v === undefined || v === 'on';
+}
+
+// Effective tag-overlap floor, given the active memories count.
+function effectiveTagOverlap(memoryCount) {
+  if (!isRelaxEnabled()) return MIN_TAG_OVERLAP;
+  if (memoryCount < SMALL_DATASET_THRESHOLD) return 0;
+  return MIN_TAG_OVERLAP;
+}
 
 function tokenizeTags(tags) {
   if (!Array.isArray(tags)) return [];
@@ -68,6 +93,44 @@ function loadActiveMemories(db, projectKey) {
          AND (expires_at IS NULL OR datetime(expires_at) > datetime('now'))
          AND embedding IS NOT NULL
          AND embedding_dim IS NOT NULL
+       ORDER BY updated_at DESC
+       LIMIT ?`,
+    )
+    .all(projectKey, CONSOLIDATE_INPUT_CAP)
+    .map((r) => {
+      let tags = [];
+      try {
+        tags = JSON.parse(r.tags || '[]');
+      } catch {
+        tags = [];
+      }
+      return {
+        id: r.id,
+        type: r.type,
+        title: r.title || '',
+        content: r.content || '',
+        tags,
+        tagTokens: tokenizeTags(tags),
+        embedding: r.embedding,
+        embeddingDim: r.embedding_dim,
+        confidence: r.confidence,
+        updatedAt: r.updated_at,
+      };
+    });
+}
+
+// Pair-level loader: every active memory (with or without an
+// embedding). Title-dedup uses no embedding; near-dup uses embedding
+// when present and skips silently otherwise. Same input cap as the
+// clusterer so the O(N²) near-dup loop is bounded.
+function loadActiveMemoriesForPairs(db, projectKey) {
+  return db
+    .prepare(
+      `SELECT id, type, title, content, tags, embedding, embedding_dim, confidence, updated_at
+       FROM memories
+       WHERE project_key = ?
+         AND status = 'active'
+         AND (expires_at IS NULL OR datetime(expires_at) > datetime('now'))
        ORDER BY updated_at DESC
        LIMIT ?`,
     )
@@ -160,6 +223,12 @@ function clusterMemories(memories, { decodeEmbedding }) {
     if (v) decoded.set(m.id, v);
   }
 
+  // Small-dataset escape: when the project carries fewer than
+  // SMALL_DATASET_THRESHOLD active memories, the tag-overlap filter
+  // drops to 0 so a 4–6 memory project can still cluster. The cosine
+  // floor stays at CONSOLIDATE_THRESHOLD either way.
+  const tagFloor = effectiveTagOverlap(memories.length);
+
   for (let i = 0; i < memories.length; i++) {
     if (visited.has(memories[i].id)) continue;
     if (clusters.length >= CONSOLIDATE_MAX_CLUSTERS) break;
@@ -169,7 +238,7 @@ function clusterMemories(memories, { decodeEmbedding }) {
     if (!seedVec) continue;
 
     // Single-link expand: every other memory that is cosine ≥
-    // threshold AND shares ≥ MIN_TAG_OVERLAP tags is a sibling.
+    // threshold AND shares ≥ tagFloor tags is a sibling.
     const cluster = [seed];
     visited.add(seed.id);
     for (let j = i + 1; j < memories.length; j++) {
@@ -178,7 +247,7 @@ function clusterMemories(memories, { decodeEmbedding }) {
       const otherVec = decoded.get(other.id);
       if (!otherVec) continue;
       if (cosine(seedVec, otherVec) < CONSOLIDATE_THRESHOLD) continue;
-      if (tagOverlap(seed.tagTokens, other.tagTokens) < MIN_TAG_OVERLAP) continue;
+      if (tagOverlap(seed.tagTokens, other.tagTokens) < tagFloor) continue;
       cluster.push(other);
       visited.add(other.id);
       if (cluster.length >= CONSOLIDATE_MAX_MEMBERS) break;
@@ -249,6 +318,202 @@ function unionTags(cluster) {
   return out;
 }
 
+// ============================================================
+// Pair-level dedup paths (v15)
+// ============================================================
+//
+// Two narrow triggers that catch the "I saved the same thing twice"
+// case the clusterer misses:
+//   - title-dedup: same normalised title in the project → merge pair
+//   - near-dup cosine: cosine ≥ 0.92 AND a shared 10-word window
+//
+// Both paths emit `merge` proposals that flow through the existing
+// dream pipeline (checksum-validated apply) and the existing direct
+// mergeMemory path. Off via KIMI_MEMORY_DEDUP=off.
+
+// KIMI_MEMORY_DEDUP=on (default) enables the pair-level paths. Off
+// falls back to the clusterer-only behaviour.
+function isDedupEnabled() {
+  const v = process.env.KIMI_MEMORY_DEDUP;
+  return v === undefined || v === 'on';
+}
+
+// Case-fold + collapse whitespace + strip trailing punctuation. The
+// goal is "Build command: npm test" matching "build command: npm test."
+// rather than "build-command-npm-test". Anything more aggressive risks
+// merging memories that merely share a stock prefix.
+function normaliseTitle(title) {
+  if (typeof title !== 'string') return '';
+  return title
+    .toLowerCase()
+    .replace(/\s+/g, ' ')
+    .replace(/[.!?,;:]+$/g, '')
+    .trim();
+}
+
+// True iff two arrays share any contiguous sub-array of length ≥ `minLen`
+// (joined by space). Used as the "near-duplicate content" signal for the
+// near-dup cosine pass.
+function arraysShareWindow(a, b, minLen) {
+  if (!Array.isArray(a) || !Array.isArray(b)) return false;
+  if (a.length < minLen || b.length < minLen) return false;
+  const setA = new Set();
+  for (let i = 0; i + minLen <= a.length; i++) {
+    setA.add(a.slice(i, i + minLen).join(' '));
+  }
+  for (let i = 0; i + minLen <= b.length; i++) {
+    if (setA.has(b.slice(i, i + minLen).join(' '))) return true;
+  }
+  return false;
+}
+
+// Group memories by normalised title. For every group with ≥2 rows,
+// pick the highest-confidence sibling as the target and emit one pair
+// per other sibling. Idempotent within a run (a single memory can
+// appear as the sibling in multiple pairs across different groups only
+// when it has multiple distinct titles — extremely rare).
+function findTitleDedupPairs(memories) {
+  const groups = new Map();
+  for (const m of memories) {
+    const key = normaliseTitle(m.title || '');
+    if (!key) continue; // skip untitled memories
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(m);
+  }
+  const out = [];
+  for (const group of groups.values()) {
+    if (group.length < 2) continue;
+    const sorted = group.slice().sort((a, b) => {
+      const ac = a.confidence || 0;
+      const bc = b.confidence || 0;
+      if (bc !== ac) return bc - ac;
+      return (b.updatedAt || '').localeCompare(a.updatedAt || '');
+    });
+    const target = sorted[0];
+    for (let i = 1; i < sorted.length; i++) {
+      const sibling = sorted[i];
+      if (sibling.id === target.id) continue;
+      out.push({ target, sibling, trigger: 'title_dedup' });
+    }
+  }
+  return out;
+}
+
+// Find pairs whose embeddings are cosine ≥ NEAR_DUP_COSINE AND whose
+// contents share a 10-word window. Skips rows without a usable
+// embedding (the title-dedup path catches those). Idempotent within a
+// run via a (sorted ids) set.
+function findNearDupPairs(memories, decodeEmbedding) {
+  const NEAR_DUP_COSINE = 0.92;
+  const NEAR_DUP_WINDOW = 10;
+  const decoded = new Map();
+  for (const m of memories) {
+    const v = decodeEmbedding(m.embedding);
+    if (v) decoded.set(m.id, v);
+  }
+  const out = [];
+  const seenPairs = new Set();
+  for (let i = 0; i < memories.length; i++) {
+    const a = memories[i];
+    const aVec = decoded.get(a.id);
+    if (!aVec) continue;
+    const aWords = (a.content || '').split(/\s+/).filter(Boolean);
+    for (let j = i + 1; j < memories.length; j++) {
+      const b = memories[j];
+      const bVec = decoded.get(b.id);
+      if (!bVec) continue;
+      const sim = cosine(aVec, bVec);
+      if (sim < NEAR_DUP_COSINE) continue;
+      const bWords = (b.content || '').split(/\s+/).filter(Boolean);
+      if (!arraysShareWindow(aWords, bWords, NEAR_DUP_WINDOW)) continue;
+      // Target = higher-confidence sibling.
+      const ac = a.confidence || 0;
+      const bc = b.confidence || 0;
+      const target = bc > ac ? b : ac > bc ? a : (a.updatedAt || '').localeCompare(b.updatedAt || '') > 0 ? a : b;
+      const sibling = target === a ? b : a;
+      const key = [a.id, b.id].sort().join('|');
+      if (seenPairs.has(key)) continue;
+      seenPairs.add(key);
+      out.push({ target, sibling, trigger: 'near_dup', cosine: sim });
+    }
+  }
+  return out;
+}
+
+// Stable checksum for a pair. Mirrors the cluster checksum shape
+// (`id@updated_at`) so the apply step's re-derivation lands on the
+// same value when neither side drifted.
+function pairChecksum(a, b) {
+  const parts = [`${a.id}@${a.updatedAt || ''}`, `${b.id}@${b.updatedAt || ''}`];
+  return parts.sort().join('|');
+}
+
+// ============================================================
+// consolidation_runs writer (v15)
+// ============================================================
+//
+// One row per pass outcome. Lets memory_status surface "when did
+// consolidation last run and what happened" without re-walking the
+// memories table. The apply step in src/dream.js calls this too so
+// last_dream_apply_at and last_consolidate_at share the same source.
+//
+// Best-effort: write errors are swallowed so a logging failure never
+// blocks the actual consolidation write.
+export function recordConsolidationRun(db, projectKey, result, { trigger = 'inline' } = {}) {
+  if (!db || !projectKey) return { ok: false, reason: 'no_inputs' };
+  try {
+    const summary = {
+      trigger,
+      scanned: result.scanned || 0,
+      clusters: result.clusters || 0,
+      saved: result.saved || 0,
+      skipped: result.skipped || 0,
+      errors: result.errors || 0,
+      merged: result.merged || 0,
+      mergeSkipped: result.mergeSkipped || 0,
+      proposals: Array.isArray(result.proposals) ? result.proposals.length : 0,
+      dedup_pairs: result.dedup_pairs || 0,
+      dedup_title_pairs: result.dedup_title_pairs || 0,
+      dedup_near_dup_pairs: result.dedup_near_dup_pairs || 0,
+      embedding_missing: result.embedding_missing || 0,
+    };
+    const id = shortId(hashId('crun', projectKey, nowIso(), String(Math.random())), 16);
+    db.prepare(
+      `INSERT INTO consolidation_runs (id, project_key, summary, at)
+       VALUES (?, ?, ?, ?)`,
+    ).run(id, projectKey, JSON.stringify(summary), nowIso());
+    return { ok: true, id };
+  } catch (e) {
+    return { ok: false, reason: e && e.message ? e.message : String(e) };
+  }
+}
+
+// Build a `merge` proposal for a pair. The proposed content is the
+// target's body — the sibling is soft-superseded so recall still hits
+// the surviving row with the same body.
+function buildPairMergeProposal({ target, sibling, trigger, cosine }) {
+  const baseConf = trigger === 'title_dedup' ? 0.9 : 0.85;
+  const provenance = {
+    source: 'consolidation_pass',
+    cluster_size: 2,
+    recorded_at: nowIso(),
+    proposed_kind: 'pair_merge',
+    trigger,
+  };
+  if (typeof cosine === 'number') provenance.cosine = cosine;
+  return {
+    kind: 'merge',
+    source_ids: [target.id, sibling.id],
+    target_ids: [target.id],
+    proposed_content: target.content || '',
+    proposed_title: target.title || '',
+    proposed_tags: Array.isArray(target.tags) ? target.tags : [],
+    confidence: baseConf,
+    provenance,
+    source_checksum: pairChecksum(target, sibling),
+  };
+}
+
 // Top-level: walk clusters, write one conclusion per cluster.
 //
 // Caller passes saveMemory and memoryLink as injected dependencies so
@@ -290,6 +555,16 @@ export async function runConsolidate({
     merged: 0,
     mergeSkipped: 0,
     proposals: [],
+    // Pair-level dedup pass counts (v15). Plumbed through runConsolidate
+    // so the hook status line + memory_status can surface how many
+    // duplicates were caught without surfacing per-row details.
+    dedup_pairs: 0,
+    dedup_title_pairs: 0,
+    dedup_near_dup_pairs: 0,
+    // Embedding coverage diagnostics (B7). Tells the user "you have N
+    // active memories that the clusterer can't touch because no
+    // embedding" instead of a silent `clusters=0`.
+    embedding_missing: 0,
   };
   if (isDisabled()) {
     result.skipped = 'env_opt_out';
@@ -310,11 +585,92 @@ export async function runConsolidate({
   try {
     memories = loadActiveMemories(db, projectKey);
   } catch (e) {
+    recordConsolidationRun(db, projectKey, result, { trigger: 'inline' });
     return { ...result, error: e && e.message ? e.message : String(e) };
   }
   result.scanned = memories.length;
+
+  // Embedding-coverage diagnostic (B7): how many active memories have
+  // no embedding at all? Computed BEFORE the early-return so a 0-row
+  // clusterable set still surfaces this — otherwise a fresh project
+  // with no embeddings reports a silent `clusters=0` with no clue.
+  try {
+    result.embedding_missing = db
+      .prepare(
+        `SELECT COUNT(*) AS n FROM memories
+         WHERE project_key = ?
+           AND status = 'active'
+           AND (expires_at IS NULL OR datetime(expires_at) > datetime('now'))
+           AND (embedding IS NULL OR embedding_dim IS NULL)`,
+      )
+      .get(projectKey).n;
+  } catch {
+    result.embedding_missing = 0;
+  }
+
+  // ---- v15 Pair-level dedup pass ----
+  //
+  // Runs BEFORE the cluster path's MIN_CLUSTER_SIZE short-circuit so
+  // 2-memory projects still get duplicates merged. The pair pass has
+  // its own `length >= 2` guard so a fresh install (0 active rows)
+  // returns silently. Title-dedup catches exact-title duplicates
+  // without an embedding; near-dup cosine requires embeddings.
+  if (isDedupEnabled()) {
+    let pairRows;
+    try {
+      pairRows = loadActiveMemoriesForPairs(db, projectKey);
+    } catch {
+      pairRows = [];
+    }
+    if (pairRows.length >= 2) {
+      let covered;
+      try {
+        covered = loadExistingConclusionChildren(db, projectKey);
+      } catch {
+        covered = new Set();
+      }
+      const titlePairs = findTitleDedupPairs(pairRows);
+      let nearDupPairs = [];
+      try {
+        nearDupPairs = findNearDupPairs(pairRows, decodeEmbeddingImpl);
+      } catch {
+        nearDupPairs = [];
+      }
+      const emittedPairKeys = new Set();
+      const allPairs = [...titlePairs, ...nearDupPairs];
+      for (const pair of allPairs) {
+        if (covered.has(pair.target.id) || covered.has(pair.sibling.id)) continue;
+        const key = [pair.target.id, pair.sibling.id].sort().join('|');
+        if (emittedPairKeys.has(key)) continue;
+        emittedPairKeys.add(key);
+        result.dedup_pairs += 1;
+        if (pair.trigger === 'title_dedup') result.dedup_title_pairs += 1;
+        else result.dedup_near_dup_pairs += 1;
+        const proposal = buildPairMergeProposal(pair);
+        if (mode === 'proposal') {
+          result.proposals.push(proposal);
+        } else if (typeof mergeMemory === 'function') {
+          try {
+            mergeMemory(db, projectKey, pair.target.id, pair.sibling.id, {
+              mergedContent: proposal.proposed_content,
+              weight: 1.0,
+            });
+            result.merged += 1;
+          } catch {
+            result.mergeSkipped += 1;
+          }
+        }
+        covered.add(pair.target.id);
+        covered.add(pair.sibling.id);
+      }
+    }
+  }
+
+  // Below this point the original cluster path runs. By this time
+  // `result.dedup_pairs` already reflects any pair-level work.
   if (memories.length < MIN_CLUSTER_SIZE) {
     result.skipped = 'below_threshold';
+    recordConsolidationRun(db, projectKey, result, { trigger: 'inline' });
     return result;
   }
 
@@ -322,10 +678,10 @@ export async function runConsolidate({
   try {
     clusters = clusterMemories(memories, { decodeEmbedding: decodeEmbeddingImpl });
   } catch (e) {
+    recordConsolidationRun(db, projectKey, result, { trigger: 'inline' });
     return { ...result, error: e && e.message ? e.message : String(e) };
   }
   result.clusters = clusters.length;
-  if (clusters.length === 0) return result;
 
   let covered;
   try {
@@ -423,6 +779,7 @@ export async function runConsolidate({
     // crash (preserves the documented contract).
     if (!saveMemory || !memoryLink) {
       result.skipped = 'no_persist';
+      recordConsolidationRun(db, projectKey, result, { trigger: 'inline' });
       return result;
     }
 
@@ -547,6 +904,11 @@ export async function runConsolidate({
     }
   }
 
+  // v15: write a consolidation_runs row so memory_status + the hook
+  // status line can answer "when did this last run" without a SELECT
+  // scan. Best-effort; the helper swallows its own write errors.
+  recordConsolidationRun(db, projectKey, result, { trigger: 'inline' });
+
   return result;
 }
 
@@ -612,4 +974,9 @@ export const CONSOLIDATE_BOUNDS = {
   cosineThreshold: CONSOLIDATE_THRESHOLD,
   minTagOverlap: MIN_TAG_OVERLAP,
   coverageRatio: COVERAGE_RATIO,
+  smallDatasetThreshold: SMALL_DATASET_THRESHOLD,
 };
+
+// Exported so tests + the status line can describe the current
+// effective tag-overlap floor without re-deriving it.
+export { isRelaxEnabled, effectiveTagOverlap };

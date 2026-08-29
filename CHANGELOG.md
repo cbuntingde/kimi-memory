@@ -7,6 +7,67 @@ prior version is rejected / migrated by the schema upgrade on first open.
 
 ## [Unreleased]
 
+### Fixed — UserPromptSubmit hook output is now a single line
+
+The hook's human-readable `<hook_result>` message used to lead every
+prompt with three lines of metadata the user did not ask for:
+
+```
+[kimi-memory] event=UserPromptSubmit project_key=ffef2a61… pmem.active=5 gmem.active=0 wm=0 conv=3 events=682 ingest=ok:7 extract=saved:2/dup:0 work_log=updated focus=saved dream=applied:1 recall project:5 global:0 cwd=…
+Recalled 5 memories. (5 project.)  [working: 2, episodic: 1, procedural: 1, semantic: 1]
+[focus] "Last focus: <system-reminder> The previous turn was interrupted…" (working) — Most recent user requests in this session (oldest → newest):
+```
+
+It is now exactly one line:
+
+```
+[kimi-memory] Recalled 5 memories. (5 project.)  [working: 2, episodic: 1, procedural: 1, semantic: 1]
+```
+
+Counts, ingest results, and the verbose status line are still produced
+internally — they now flow through the dispatcher's diagnostic log
+(`$KIMI_CODE_HOME/kimi-memory/_diagnostics/hooks.log`) instead of stdout,
+so they remain greppable for debugging without cluttering the chat. The
+per-memory recall hits and the `[focus]` line both still reach the model
+through `hookSpecificOutput.additionalContext`, so the agent can still
+open with "Picking up from: …" or "From your saved notes: …" — the user
+just no longer sees any of that metadata inline.
+
+- `src/hooks/handlers/user-prompt-submit.js` — message is now exactly
+  `[kimi-memory] <recall.summary>`. The status line, focus line, WM
+  preview, stale-memory line, and advisor line all moved to the
+  diagnostic log; the focus line is also appended to `additionalContext`
+  so the agent still sees it.
+- `tests/04-hooks.test.js` — asserts the message is the single
+  `[kimi-memory] <recall summary>` line, no newline, no verbose fields.
+- `tests/23-session-focus.test.js` — focus line is now asserted inside
+  `additionalContext`, not the chat-facing message.
+- `skills/kimi-memory/SKILL.md`,
+  `skills/kimi-memory/references/recall-acknowledgement.md` — updated
+  to describe the new minimal output format.
+
+### Fixed — UserPromptSubmit hook stdout
+
+The hook was emitting both a plain-text block (`emitLines(...)`) AND a
+trailing JSON envelope on stdout. Kimi's hook runner
+(`packages/agent-core/src/session/hooks/runner.ts`) only recognises the
+top-level JSON field `message` — the previous `systemMessage` field is
+a Codex/Claude Code convention Kimi does not parse. Because no `message`
+was present, Kimi fell back to dumping the raw stdout verbatim, which
+included the entire JSON envelope, producing a doubled, noisy
+`<hook_result>` block in the user's chat.
+
+- `src/hooks/handlers/user-prompt-submit.js` — stdout is now a single
+  JSON envelope with `message` (Kimi's protocol field name) carrying the
+  human-readable lines and `hookSpecificOutput.additionalContext`
+  carrying the per-memory recall list. The plain-text `emitLines`
+  duplicate is gone.
+- `tests/04-hooks.test.js`, `tests/13-recall-per-type.test.js`,
+  `tests/23-session-focus.test.js` — updated to parse the new `message`
+  field.
+- `skills/kimi-memory/references/recall-acknowledgement.md` — corrected
+  the field-name reference (`message`, not `systemMessage`).
+
 ### Added — Subsystem deprecation gate
 
 Four subsystems shipped in v0.5.0 (ACL/visibility, tier/persona, wiki,
@@ -123,7 +184,10 @@ Phase 1 of the Dream subsystem replaces the inline, fire-and-forget
 | `dream_list_proposals`     | Paginated list of proposals by job + status.                        |
 | `dream_get_proposal`       | Single proposal by id.                                              |
 
-Total tool count: **46 → 55**.
+Total tool count: **46 → 55**, then **55 → 50** when the wiki subgroup
+was retired in the next major (the deprecated ACL / tier / codegraph
+tools remain for backward compat, gated behind
+`KIMI_MEMORY_LEGACY_SUBSYSTEMS=off`).
 
 ### Added — env-var / hook opt-outs
 

@@ -176,48 +176,56 @@ test('UserPromptSubmit reports real ingest and a brief recall summary instead of
       { home },
     );
     assert.equal(r.status, 0);
-    assert.match(r.stdout, /event=UserPromptSubmit/);
-    // Real ingest: at least the two seed events should land.
-    assert.match(r.stdout, /ingest=ok:[12-9]/, 'stdout=' + JSON.stringify(r.stdout));
-    // Recall hit counts on the status line.
-    assert.match(r.stdout, /recall project:\d+ global:\d+/);
-    // Brief recall summary OR "No recall hits." — the keyword-bearing
-    // prompt is "tabs" / "project" which FTS5 should match in the seeded
-    // global row.
-    assert.match(r.stdout, /Recalled \d+ memor(?:y|ies)(?:\. \(.+?\))?\.|No recall hits\./);
-    // Per-memory previews must NOT be emitted (the verbose
-    // `[global] [semantic] …` style of the legacy implementation).
-    // The new design puts recall snippets in additionalContext only.
+    // The verbose `event=… project_key=… pmem.active=…` status line is
+    // gone from the human-readable message — the chat transcript used
+    // to lead with three lines of noise before the recall summary.
+    // Counts and ingest results still flow through the dispatcher's
+    // diagnostic log, not stdout.
     assert.equal(
-      r.stdout.includes('[global] [semantic] tabs default'),
+      r.stdout.includes('event=UserPromptSubmit'),
       false,
-      'verbose global memory preview should not be emitted',
+      'verbose status line must not be in stdout',
     );
-    // The new format (`[recall: 1/N] "tabs default" ...`) also must
-    // not appear in the human-readable stdout — only in
-    // additionalContext.
     assert.equal(
-      r.stdout.includes('[recall: 1/'),
+      r.stdout.includes('recall project:'),
       false,
-      'verbose per-memory preview lines must not be in stdout',
+      'recall hit counts must not be in stdout',
     );
-    // Per the v9.6+ design, the hook writes a JSON object to stdout
-    // with both `systemMessage` (the human-readable lines) and
-    // `hookSpecificOutput.additionalContext` (the AI-facing recall).
-    // The memory content lives in additionalContext — that is the
-    // point of the feature. Verify the JSON is well-formed and that
-    // the additionalContext contains the recall hits.
-    // The JSON is the trailing brace-delimited object in stdout.
+    // The JSON envelope is the trailing brace-delimited object in stdout.
     const jsonMatch = r.stdout.match(/\{[\s\S]+\}\s*$/);
     assert.ok(jsonMatch, 'trailing JSON object is present in stdout');
     const json = JSON.parse(jsonMatch[0]);
-    assert.ok(json.systemMessage, 'systemMessage is present');
-    // The human-readable systemMessage must NOT contain the full
-    // memory content (too noisy for the terminal).
+    assert.ok(json.message, 'message is present');
+    // The message is exactly the single recall summary line, prefixed
+    // with `[kimi-memory]`. No status line, no focus line, no WM preview.
+    // Format: `[kimi-memory] Recalled N memor{y|ies}. (….) [type: N, …]`
+    assert.match(
+      json.message,
+      /^\[kimi-memory\] (?:Recalled \d+ memor(?:y|ies)\. \([^)]+\.\)(?:\s+\[\w+: \d+(?:, \w+: \d+)*\])?|No recall hits\.)$/,
+      'message is the minimal `[kimi-memory] <recall summary>` line',
+    );
+    // No newline in the message — it is a single line, not a stack.
+    assert.equal(json.message.includes('\n'), false, 'message must be a single line, not a stack');
+    // Per-memory previews must NOT be emitted in the human-readable
+    // message (the verbose `[global] [semantic] …` style of the legacy
+    // implementation, or the `[recall: 1/N]` line). The new design
+    // routes recall snippets through additionalContext only.
     assert.equal(
-      json.systemMessage.includes('Use tabs everywhere'),
+      json.message.includes('[global] [semantic] tabs default'),
       false,
-      'memory content must not be in the human-readable systemMessage',
+      'verbose global memory preview should not be emitted',
+    );
+    assert.equal(
+      json.message.includes('[recall: 1/'),
+      false,
+      'verbose per-memory preview lines must not be in stdout',
+    );
+    // The human-readable message must NOT contain the full memory
+    // content (too noisy for the terminal).
+    assert.equal(
+      json.message.includes('Use tabs everywhere'),
+      false,
+      'memory content must not be in the human-readable message',
     );
     // additionalContext must contain the recall hits so the AI can
     // acknowledge them.
@@ -228,22 +236,16 @@ test('UserPromptSubmit reports real ingest and a brief recall summary instead of
       /tabs default/,
       'additionalContext surfaces the recall hit title',
     );
-    // The verbose preview line must NOT appear in the human-readable
-    // systemMessage (it's now in additionalContext only).
-    assert.equal(
-      json.systemMessage.includes('[global] [semantic] tabs default'),
-      false,
-      'verbose preview must not be in the human-readable systemMessage',
-    );
     // Raw prompt must never be echoed anywhere.
     assert.equal(
       r.stdout.includes('remind me, do we use tabs'),
       false,
       'raw prompt must not be echoed',
     );
-    // Output is bounded.
+    // Output is bounded — even tighter now that the verbose status
+    // line is gone.
     assert.ok(
-      r.stdout.length < 4096,
+      r.stdout.length < 2048,
       'status output is bounded, got ' + r.stdout.length + ' bytes',
     );
   } finally {
