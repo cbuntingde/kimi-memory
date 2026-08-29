@@ -1,66 +1,31 @@
 # kimi-memory
 
-A local-first Kimi Code plugin that gives the agent a three-layer memory
-store — cross-project user memory, per-project durable + working memory,
-and per-project session archives — exposed through MCP tools, lifecycle
-hooks, and slash commands. Also includes an integrated advisor subsystem
-for reflective prompts.
+A local-first memory layer for Kimi Code. It gives the assistant persistent
+recall across projects — cross-project user preferences, durable project
+facts, working focus for the current task, and full session transcripts —
+all stored in local SQLite and surfaced through MCP tools, slash commands,
+and lifecycle hooks.
 
 <p align="center">
   <img src="assets/demo-list-calls.png" alt="Kimi assistant running memory_list" width="48%" />
   <img src="assets/demo-list-output.png" alt="Memory list and summary output" width="48%" />
 </p>
 
-## Common commands
+## Highlights
 
-Quick reference for the most-used entry points. The full catalog is in
-[Use](#use) (slash + MCP tools) and [Environment variables](#environment-variables)
-(every opt-out).
+- **Local-first.** All data lives in SQLite under `$KIMI_CODE_HOME/kimi-memory/`.
+  Nothing leaves your machine unless you opt in to the embedding model or
+  auto-extraction.
+- **Multi-layer storage.** Global user memory, per-project durable memory,
+  per-project working memory, and per-project session archives.
+- **Reflective advisor.** A built-in `/advisor` workflow turns project
+  context into anchored recommendations.
+- **Secret-safe by default.** Known credential shapes (API keys, tokens,
+  `.env` contents, PII) are refused at write time.
 
-| Action | Command |
-| --- | --- |
-| List this project's memories | `/kimi-memory:list_memories` |
-| Reflect on the active project | `/kimi-memory:advisor` |
-| Wipe a re-cloned project's stale rows | `/kimi-memory:reset-project --apply` |
-| Manually trigger consolidation on | `/kimi-memory:memos` (browser) or `node src/cli.js consolidate run --cwd <path>` |
-| Check pipeline status (counts + dream + auto-gc) | `node src/cli.js status --cwd <path>` |
-| Clean orphan project DBs | `node src/cli.js prune --cwd <path> --apply` |
+## Quick start
 
-**Most-relevant environment variables** — these are the ones that
-change observable behaviour. All defaults are tuned for production;
-set the env var to flip the default.
-
-| Variable | Default | Effect |
-| --- | --- | --- |
-| `KIMI_MEMORY_AUTO_RESET_ON_RECLONE` | `on` | Auto-wipe per-project rows when the SessionStart hook detects a re-clone. Set to `off` to keep the manual `[stale-memory]` hint instead. See [AGENTS.md §Re-clone auto-reset](AGENTS.md). |
-| `KIMI_MEMORY_EMBEDDINGS` | `on` | Set to `off` to skip the embedding encoder. Recall falls back to FTS5-only. |
-| `KIMI_MEMORY_CONSOLIDATE` | `on` | Set to `off` to skip the inline "conclusion + auto-merge" pass at SessionStart. |
-| `KIMI_MEMORY_DREAM` | `on` | Set to `off` to skip both Dream enqueue (Stop/SessionEnd) and `dream_generate_proposals`. |
-| `KIMI_MEMORY_AUTO_EXTRACT` | `on` | Set to `off` to disable the Stop-hook auto-extraction LLM call. |
-| `KIMI_MEMORY_LEGACY_SUBSYSTEMS` | `on` | Set to `off` to hide the deprecated MCP tools (ACL/visibility, tier/persona, codegraph). |
-
-## Architecture
-
-| Layer                     | Path                                                      | Read default                  | Write default                | Lifetime                           |
-| ------------------------- | --------------------------------------------------------- | ----------------------------- | ---------------------------- | ---------------------------------- |
-| Global user memory        | `$KIMI_CODE_HOME/kimi-memory/_global/memory.sqlite`       | `scope: "all"` or `"global"`  | `scope: "global"` (explicit) | Permanent; agent-curated.          |
-| Project durable + working | `$KIMI_CODE_HOME/kimi-memory/<project-key>/memory.sqlite` | `scope: "project"` or `"all"` | `scope: "project"` (default) | Permanent; agent-curated.          |
-| Project session archive   | same path; `conversations` + `conversation_events` tables | project-only, no `scope`      | automatic (hook-driven)      | Idempotent ingest of `wire.jsonl`. |
-| Shared cross-project pool | `$KIMI_CODE_HOME/kimi-memory/_shared/memory.sqlite`       | `scope: "all"` (with share)   | `acl_share_memory` only      | ACL-promoted rows.                 |
-
-`<project-key>` is a SHA-256 prefix of the canonical project root. The
-global DB uses `project_key = "_global"`; the shared pool uses
-`project_key = "_shared"`. Per-project queries never accidentally hit
-either.
-
-## Requirements
-
-- Kimi Code with plugin, hook, Skill, and MCP support.
-- Node.js ≥ 24 (`node:sqlite`; no native build required).
-
-## Install
-
-### From GitHub
+### Install from GitHub
 
 In the Kimi Code chat input:
 
@@ -68,74 +33,106 @@ In the Kimi Code chat input:
 /plugins install https://github.com/cbuntingde/kimi-memory
 ```
 
-Kimi pulls the source into `$KIMI_CODE_HOME/plugins/managed/kimi-memory/`.
-On its first MCP start, the plugin bootstraps the runtime dependencies
-from `package-lock.json` with `npm install`; no second manual step is
-required. The plugin is not on the Kimi marketplace, so a trust prompt
-will appear (default **Cancel**); choose the affirmative option. Then
-run `/reload` and verify with `/plugins info kimi-memory` — no
-diagnostic block means a clean install.
+Kimi pulls the source into `$KIMI_CODE_HOME/plugins/managed/kimi-memory/`
+and bootstraps its runtime dependencies on first use. A trust prompt
+appears because the plugin is not on the Kimi marketplace — choose the
+affirmative option, then run `/reload` and verify with
+`/plugins info kimi-memory`. No diagnostic block means a clean install.
 
-### From a local checkout
+### Install from a local checkout
 
 ```bash
 cd <path-to-this-repo>
 npm install
 ```
 
-Then from the Kimi chat input:
+Then in Kimi:
 
 ```text
 /plugins install <absolute-path-to-this-repo>
 /reload
 ```
 
-Local sources are copied into the managed plugin directory; edits to
-this checkout do not propagate. Reinstall (and `/reload`) after
-meaningful changes.
+Local sources are copied into the managed plugin directory; edits to this
+checkout do not propagate. Reinstall and `/reload` after meaningful
+changes.
 
-## Use
+### Requirements
 
-### Slash commands
+- Kimi Code with plugin, hook, Skill, and MCP support
+- Node.js 24 or newer (uses `node:sqlite`; no native build required)
 
-| Command                      | What it does                                                                                                                         |
-| ---------------------------- | ------------------------------------------------------------------------------------------------------------------------------------ |
-| `/kimi-memory:list_memories` | `memory_list` over project + global scope.                                                                                           |
-| `/kimi-memory:advisor`       | Reflection procedure over the active project (anchored recommendations, no remote). Also triggered by reflection phrases in prompts. |
-| `/kimi-memory:prune`         | Orphan-project DB cleanup (dry-run by default; `--apply` to delete).                                                                 |
-| `/kimi-memory:reset-project` | Wipe the per-project rows after a re-clone (dry-run by default; `--apply` to delete).                                                |
-| `/kimi-memory:memos`         | Open the companion `kimi-memos-dashboard` in the default browser (read-only view of every kimi-memory SQLite DB; separate plugin).   |
+## Everyday commands
 
-### Natural language
+The most common entry points. See [Slash commands](#slash-commands) and
+[MCP tools](#tools) for the complete surface.
 
-Phrases like "list memories", "remember this decision", or "what did we
-decide?" invoke the same MCP tools when the Skill matches. Every MCP
-call requires the active project's absolute root as `cwd` to prevent
-cross-project writes and supply provenance context.
+| Action                                                 | Command                                      |
+| ------------------------------------------------------ | -------------------------------------------- |
+| List this project's memories                           | `/kimi-memory:list_memories`                 |
+| Reflect on the active project                          | `/kimi-memory:advisor`                       |
+| Wipe a re-cloned project's stale rows                  | `/kimi-memory:reset-project --apply`         |
+| Open the companion dashboard in your browser           | `/kimi-memory:memos`                         |
+| Check pipeline status (counts, advisor queue, cleanup) | `node src/cli.js status --cwd <path>`        |
+| Clean orphan project databases                         | `node src/cli.js prune --cwd <path> --apply` |
+
+## Storage layers
+
+Each row of memory lives in exactly one place. Routes never cross
+layers, so a per-project query can never accidentally read a global row,
+and vice versa.
+
+| Layer                     | Path                                                  | Scope tag                    | Lifetime                     |
+| ------------------------- | ----------------------------------------------------- | ---------------------------- | ---------------------------- |
+| Global user memory        | `$KIMI_CODE_HOME/kimi-memory/_global/memory.sqlite`   | `scope: "global"`            | Permanent; you curate it     |
+| Project durable memory    | `$KIMI_CODE_HOME/kimi-memory/<project>/memory.sqlite` | `scope: "project"` (default) | Permanent; you curate it     |
+| Project working memory    | same database, `working_memory_*` tools               | project-only                 | Transient, current focus     |
+| Project session archive   | same database, `conversations` tables                 | project-only                 | Idempotent transcript ingest |
+| Shared cross-project pool | `$KIMI_CODE_HOME/kimi-memory/_shared/memory.sqlite`   | promoted on demand           | ACL-controlled rows          |
+
+`<project>` is a stable identifier derived from the canonical project root.
+
+## Slash commands
+
+| Command                      | What it does                                                                                          |
+| ---------------------------- | ----------------------------------------------------------------------------------------------------- |
+| `/kimi-memory:list_memories` | List memories across project and global scope                                                         |
+| `/kimi-memory:advisor`       | Reflection procedure over the active project, also triggered by phrases like "what should we change?" |
+| `/kimi-memory:prune`         | Orphan-project database cleanup (dry-run by default)                                                  |
+| `/kimi-memory:reset-project` | Wipe per-project rows after a re-clone (dry-run by default)                                           |
+| `/kimi-memory:memos`         | Open the companion `kimi-memos-dashboard` in your browser                                             |
+
+Natural language works too: phrases such as "remember this decision",
+"what did we decide?", or "list memories" invoke the same MCP tools when
+the Skill matches.
 
 ## Tools
 
-The plugin exposes 50 MCP tools over the `kimi-memory` stdio server:
+Fifty MCP tools are exposed over the `kimi-memory` stdio server.
 
-- **Durable memory** — `memory_save`, `memory_recall`, `memory_list`, `memory_get`, `memory_update`, `memory_delete`, `memory_save_bulk`, `memory_status`, `memory_reinforce`
-- **Similarity + edges** — `memory_similar`, `memory_link`, `memory_unlink`, `memory_edges`, `memory_merge`
-- **Synthesis** — `memory_conclusions_for`, `memory_parents`
-- **Working memory** — `working_memory_set`, `working_memory_get`, `working_memory_clear`
-- **Session archive** — `conversation_list`, `conversation_get`, `conversation_search`, `conversation_ingest`
-- **ACL / visibility** — `acl_grant`, `acl_revoke`, `acl_list`, `acl_share_memory`, `acl_resolve_principal`
-- **Tier / persona** — `memory_set_tier`, `memory_promote`, `memory_demote`, `memory_tier_history`
-- **Codegraph** — `codegraph_extract`, `codegraph_build_edges`, `codegraph_query_symbol`, `codegraph_impact_path`, `codegraph_callers`, `codegraph_callees`
-- **Maintenance** — `memory_prune`, `memory_reset_project`, `memory_diagnostics`
-- **Dream (staged consolidation)** — `dream_list_jobs`, `dream_get_job`, `dream_list_proposals`, `dream_get_proposal`, `dream_status`, `dream_enqueue`, `dream_generate_proposals`, `dream_apply_job`, `dream_discard_job`
+| Group                | Tools                                                                                                                                                                                 |
+| -------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Durable memory       | `memory_save`, `memory_recall`, `memory_list`, `memory_get`, `memory_update`, `memory_delete`, `memory_save_bulk`, `memory_status`, `memory_reinforce`                                |
+| Similarity and edges | `memory_similar`, `memory_link`, `memory_unlink`, `memory_edges`, `memory_merge`                                                                                                      |
+| Synthesis            | `memory_conclusions_for`, `memory_parents`                                                                                                                                            |
+| Working memory       | `working_memory_set`, `working_memory_get`, `working_memory_clear`                                                                                                                    |
+| Session archive      | `conversation_list`, `conversation_get`, `conversation_search`, `conversation_ingest`                                                                                                 |
+| Maintenance          | `memory_prune`, `memory_reset_project`, `memory_diagnostics`                                                                                                                          |
+| Staged consolidation | `dream_list_jobs`, `dream_get_job`, `dream_list_proposals`, `dream_get_proposal`, `dream_status`, `dream_enqueue`, `dream_generate_proposals`, `dream_apply_job`, `dream_discard_job` |
 
-Defaults: `memory_save` / `memory_update` / `memory_delete` write to
-`scope: "project"`; `memory_recall` / `memory_list` / `memory_get` read
+Some legacy groups — access control, tier and persona, code graph —
+remain available for existing integrations. They are deprecated; enable
+them with `KIMI_MEMORY_LEGACY_SUBSYSTEMS=on`. They will be removed in the
+next major version.
+
+By default, `memory_save`, `memory_update`, and `memory_delete` write to
+`scope: "project"`. `memory_recall`, `memory_list`, and `memory_get` read
 across `scope: "all"` (project first, then global). Pass an explicit
 `scope` to override.
 
 ### Standalone CLI
 
-The same surface is available without the MCP server via the
+The same surface is available without the MCP server through the
 `kimi-memory` bin entry:
 
 ```bash
@@ -145,106 +142,94 @@ kimi-memory status                            [--cwd <path>]
 kimi-memory recall <query>                    [--cwd <path>] [--limit N]
 kimi-memory prune                             [--cwd <path>] [--all-projects] [--apply]
 kimi-memory reset-project                     [--cwd <path>] [--apply]
-kimi-memory consolidate run                   [--cwd <path>] [--json]   # run inline consolidate now
-kimi-memory consolidate status                [--cwd <path>] [--json]   # embedding coverage + last run
+kimi-memory consolidate run                   [--cwd <path>] [--json]
+kimi-memory consolidate status                [--cwd <path>] [--json]
 kimi-memory dream status / list / get / enqueue / generate / apply / discard   [--cwd <path>]
 kimi-memory export                            [--cwd <path>] [--output <path>]
 kimi-memory import                            [--cwd <path>] [--input <path>]
 kimi-memory serve-http                        [--cwd <path>] [--port <port>]
 ```
 
-`--json` emits machine-readable JSON; `-q` suppresses per-row output;
+`--json` emits machine-readable output; `-q` suppresses per-row output;
 `--home <dir>` overrides `$KIMI_CODE_HOME`. `prune --apply` removes
-orphan project DBs whose canonical root no longer exists;
+orphan project databases whose canonical root no longer exists;
 `reset-project --apply` wipes the per-project rows of the active
-project. Both are dry runs by default.
+project. Both default to a dry run.
 
-## Environment variables
+## Configuration
 
-All optional; defaults are tuned for production.
+All environment variables are optional; defaults are tuned for production
+use.
 
-| Variable                            | Default | Effect                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
-| ----------------------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `KIMI_MEMORY_EMBEDDINGS`            | `on`    | Set to `off` to skip the embedding encoder. Recall falls back to FTS5-only.                                                                                                                                                                                                                                                                                                                                                                                                                                               |
-| `KIMI_MEMORY_EMBED_TIMEOUT_MS`      | `4000`  | Wall-clock cap on a single embedding call.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                |
-| `KIMI_MEMORY_AUTO_EXTRACT`          | `on`    | Set to `off` to disable the Stop-hook auto-extraction LLM call.                                                                                                                                                                                                                                                                                                                                                                                                                                                           |
-| `KIMI_MEMORY_AUTO_EXTRACT_REQUIRE_HTTPS` | unset | Set to `1` to opt in to a strict-mode SSRF guard on the auto-extract `base_url` — refuses cleartext `http://` to loopback / private / link-local hosts, refuses non-http(s) schemes, and skips the LLM call rather than sending a redacted transcript to a tampered base URL. Default off so users who pin a local OpenAI-compatible proxy are not forced to rewrite their `config.toml`. See the `guardLlmBaseUrl` reference in `src/extract.js`. |
-| `KIMI_MEMORY_SECRET_SCAN`           | `on`    | Set to `off` to bypass the server-side secret pre-write check. Use only for legitimate test fixtures.                                                                                                                                                                                                                                                                                                                                                                                                                     |
-| `KIMI_MEMORY_PROXY_CORS_ORIGINS`    | unset   | Comma-separated origin allowlist for the HTTP proxy.                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
-| `KIMI_MEMORY_CONSOLIDATE`           | `on`    | Set to `off` to skip the FTS5 inline "conclusion + auto-merge" pass at SessionStart. Dream jobs are gated separately by `KIMI_MEMORY_DREAM`.                                                                                                                                                                                                                                                                                                                                                                              |
-| `KIMI_MEMORY_DREAM`                 | `on`    | Set to `off` to skip both Dream enqueue (Stop/SessionEnd) and `dream_generate_proposals`. Existing `dream_jobs` rows stay queryable so the operator can still inspect / apply / discard them.                                                                                                                                                                                                                                                                                                                             |
-| `KIMI_MEMORY_AUTO_MERGE`            | `on`    | Set to `off` to disable the inline auto-merge of tight sibling clusters (conclusion synthesis still runs).                                                                                                                                                                                                                                                                                                                                                                                                                |
-| `KIMI_MEMORY_AUTO_GC`               | `on`    | Master switch for the auto-GC pipeline (prune + archive + tier).                                                                                                                                                                                                                                                                                                                                                                                                                                                          |
-| `KIMI_MEMORY_AUTO_PRUNE`            | `on`    | Set to `off` to skip auto-prune of dead rows.                                                                                                                                                                                                                                                                                                                                                                                                                                                                             |
-| `KIMI_MEMORY_AUTO_ARCHIVE`          | `on`    | Set to `off` to skip auto-archive of `conversation_events`.                                                                                                                                                                                                                                                                                                                                                                                                                                                               |
-| `KIMI_MEMORY_AUTO_TIER`             | `on`    | Set to `off` to skip auto-tier promotion / demotion.                                                                                                                                                                                                                                                                                                                                                                                                                                                                      |
-| `KIMI_MEMORY_LEGACY_SUBSYSTEMS`     | `on`    | Set to `off` to hide the deprecated MCP tools (ACL/visibility: 5 tools, tier/persona: 4 tools, codegraph: 6 tools) and skip auto-tier promotion + the `persona_promotions` archive sweep. The wiki group was removed in v14 (no schema migration needed — its tables stay in pre-existing DBs as dead data). The three remaining groups are ported from `TencentDB-Agent-Memory` but have no authenticated MCP caller and no agent-workflow integration; slated for removal in the next major version. See `AGENTS.md §Subsystem deprecation`. |
-| `KIMI_MEMORY_DISABLE_SESSION_FOCUS` | `off`   | Set to `1` to skip the Stop-hook session-focus capture.                                                                                                                                                                                                                                                                                                                                                                                                                                                                   |
-| `KIMI_MEMORY_PERF`                  | `on`    | Set to `off` to skip the 5k-corpus perf benchmarks in `tests/16-perf.test.js`.                                                                                                                                                                                                                                                                                                                                                                                                                                            |
-| `KIMI_MEMORY_AUTO_RESET_ON_RECLONE` | `on`    | Set to `off` to keep the manual `[stale-memory] ... call memory_reset_project ...` hint instead of auto-wiping per-project rows (memories, edges, dream_jobs, etc.) when the SessionStart hook detects the project directory was re-cloned after kimi-memory first saw it. Default on — most re-clone users want a fresh start. See `AGENTS.md §Re-clone auto-reset`. |
+| Variable                            | Default | Effect                                                                                                       |
+| ----------------------------------- | ------- | ------------------------------------------------------------------------------------------------------------ |
+| `KIMI_MEMORY_AUTO_RESET_ON_RECLONE` | `on`    | Auto-wipe per-project rows when SessionStart detects a re-clone. Set to `off` to keep a manual hint instead. |
+| `KIMI_MEMORY_EMBEDDINGS`            | `on`    | Set to `off` to skip the embedding encoder. Recall falls back to keyword search only.                        |
+| `KIMI_MEMORY_CONSOLIDATE`           | `on`    | Set to `off` to skip the inline synthesis and merge pass at session start.                                   |
+| `KIMI_MEMORY_DREAM`                 | `on`    | Set to `off` to skip staged consolidation. Existing queued jobs stay queryable.                              |
+| `KIMI_MEMORY_AUTO_EXTRACT`          | `on`    | Set to `off` to disable the assistant-driven memory extraction at the end of each turn.                      |
+| `KIMI_MEMORY_LEGACY_SUBSYSTEMS`     | `on`    | Set to `off` to hide the deprecated tool groups (access control, tier and persona, code graph).              |
 
-## Storage and privacy
+The full table — including timeouts, strict-mode network guards, and
+auto-cleanup switches — is documented in `AGENTS.md`.
 
-Local-first. SQLite databases live under `$KIMI_CODE_HOME/kimi-memory/`;
-the plugin never writes into Kimi's `sessions` tree.
+## Privacy and data handling
+
+Local-first by construction. The plugin never writes into Kimi's session
+tree. SQLite databases live under `$KIMI_CODE_HOME/kimi-memory/`:
 
 ```text
-$KIMI_CODE_HOME/kimi-memory/<project-key>/memory.sqlite
+$KIMI_CODE_HOME/kimi-memory/<project>/memory.sqlite
 $KIMI_CODE_HOME/kimi-memory/_global/memory.sqlite
 $KIMI_CODE_HOME/kimi-memory/_shared/memory.sqlite
 $KIMI_CODE_HOME/kimi-memory/_diagnostics/hooks.log
 ```
 
-The `hooks.log` is a JSON-line record of `{ event, level, message,
-context }` for hook failures, auto-extract issues, embedding errors,
-and stdin-truncation warnings. Free-form error strings are passed
-through `safeErrorMessage` before they land on disk so absolute paths,
-host:port fragments, and `scheme://` URLs are scrubbed from any
-third-party message.
+The diagnostic log records hook events at JSON-line granularity for
+failures, extraction issues, embedding errors, and truncation warnings.
+Free-form error messages are scrubbed before they land on disk, so
+absolute paths, host:port fragments, and URLs are removed from any
+third-party string.
 
-Two outbound behaviours:
+Two outbound behaviours, each opt-out:
 
-- The MiniLM model (~25 MB) downloads lazily from Hugging Face on first
-  use and caches locally. Disable with `KIMI_MEMORY_EMBEDDINGS=off`.
-- Auto-extraction sends one short LLM call per Stop event to the model
-  configured in `config.toml`. The transcript included in that call is
-  scrubbed server-side (`redactSecrets`) before it leaves the machine —
-  credentials typed in chat never reach the configured LLM provider.
+- The MiniLM embedding model (~25 MB) downloads lazily from Hugging Face
+  on first use and caches locally. Disable with
+  `KIMI_MEMORY_EMBEDDINGS=off`.
+- Auto-extraction makes one short model call per turn to the provider
+  configured in Kimi's `config.toml`. The transcript included in that
+  call is scrubbed server-side before it leaves the machine, so any
+  credentials pasted in chat never reach the configured provider.
   Disable with `KIMI_MEMORY_AUTO_EXTRACT=off`.
 
-The server `saveMemory` runs `looksLikeSecret` on every write and
-refuses to persist known credential shapes (OpenAI, Anthropic, GitHub,
-AWS, JWT, PEM, `key=…`, `Authorization: Bearer`). False positives are
-preferred over persisting a real secret.
+Every memory write is checked against a catalogue of known credential
+shapes: OpenAI, Anthropic, GitHub, AWS, JWT, PEM, `key=…` assignments,
+and `Authorization: Bearer` headers. False positives are preferred to
+persisting a real secret. See `SECURITY.md` for the full policy.
 
 ## Uninstall and data retention
 
 - `/plugins remove kimi-memory` deletes the installation record but
   leaves the managed copy and memory databases on disk.
 - Remove the managed copy: `rm -rf "$KIMI_CODE_HOME/plugins/managed/kimi-memory"`.
-- Wipe every kimi-memory database:
-  `rm -rf "$KIMI_CODE_HOME/kimi-memory/"`.
+- Wipe every kimi-memory database: `rm -rf "$KIMI_CODE_HOME/kimi-memory/"`.
 - For orphan-project cleanup only, use `/kimi-memory:prune` (or
-  `memory_prune(scope: "all-projects")`) — dry-run by default, then
-  `apply: true` to delete. The global DB and the active project's DB
-  are always preserved.
+  `memory_prune` with `scope: "all-projects"`). Dry-run by default;
+  pass `apply: true` to delete. The global database and the active
+  project's database are always preserved.
 
 ## Development
 
 ```bash
 npm install
-npm run check             # node --check on every source file
-npm test                  # node --test tests/*.test.js
-npm run format:check      # prettier --check on every tracked file
+npm run check             # syntax check on every source file
+npm test                  # runs tests/*.test.js
+npm run format:check      # formatter check on every tracked file
 npm run backfill-embeddings
 ```
 
-The full test suite runs in a few seconds because tests opt out of the
-embedding model download via `KIMI_MEMORY_EMBEDDINGS=off` in
-`tests/_helpers.js`. The `assets/` directory holds the static assets
-shipped with the plugin (`icon.svg` plus the README hero screenshots)
-and is kept under version control so the manifest and tests can rely
-on a stable relative path.
+The full test suite runs in a few seconds; tests opt out of the
+embedding model download so no large artifacts are pulled during CI.
 
 ## License
 
