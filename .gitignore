@@ -67,3 +67,8 @@ todo.md
 TODO.md
 ROADMAP.md
 .audit/
+
+# Local debug scratch — hook dev traces. See AGENTS.md "Re-clone auto-reset"
+# for where these come from; rerun a hook harness to regenerate.
+.tmp-hook/
+_trace.js
