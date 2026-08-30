@@ -173,3 +173,76 @@ test('CLI import --replace wipes the target before loading', async () => {
   }
   rmRf(home);
 });
+
+test('CLI export → import preserves v10 ACL, tier, persona_id, synthesizes edges', async () => {
+  const home = mkdtempSync(path.join(tmpdir(), 'pm-acl-'));
+  const cwd = canonicalizeRoot('C:/projects/cli-acl-' + Date.now());
+  const mcp = new StdioMcp({ home });
+  mcp.start();
+  let savedId;
+  let concId;
+  try {
+    await mcp.call('initialize', {
+      protocolVersion: '2024-11-05',
+      capabilities: {},
+      clientInfo: { name: 'acl-test', version: '0' },
+    });
+    const saveA = await mcp.toolCall('memory_save', {
+      cwd,
+      type: 'episodic',
+      title: 'parent memory',
+      content: 'will be synthesised',
+      tags: ['alpha'],
+      shared_with: ['user:alice', 'role:editor'],
+    });
+    savedId = JSON.parse(saveA.content[0].text).memory.id;
+    const promote = await mcp.toolCall('memory_promote', {
+      cwd,
+      memory_id: savedId,
+      reason: 'manual test promotion',
+    });
+    assert.equal(JSON.parse(promote.content[0].text).memory.tier, 'L1');
+    const saveConc = await mcp.toolCall('memory_save', {
+      cwd,
+      type: 'conclusion',
+      title: 'synthesis',
+      content: 'one conclusion',
+      synthesizes: [savedId],
+    });
+    concId = JSON.parse(saveConc.content[0].text).memory.id;
+  } finally {
+    mcp.stop();
+  }
+
+  const dump = path.join(home, 'acl.json');
+  const exp = runCli(['export', dump, '--cwd', cwd, '--scope', 'project'], { home });
+  assert.equal(exp.status, 0, 'export must exit 0; stderr=' + exp.stderr);
+
+  const key = deriveProjectKey(cwd);
+  closeDb(projectDbPath(home, key));
+  const r = runCli(['import', dump, '--cwd', cwd, '--scope', 'project'], { home });
+  assert.equal(r.status, 0, 'import must exit 0; stderr=' + r.stderr);
+
+  const db = openDb(projectDbPath(home, key));
+  try {
+    const row = db.prepare('SELECT * FROM memories WHERE id=? AND project_key=?').get(savedId, key);
+    assert.ok(row, 'parent memory must exist after import');
+    assert.equal(row.visibility, 'private');
+    assert.equal(row.shared_with, '["user:alice","role:editor"]');
+    assert.equal(row.tier, 'L1');
+    const synth = db
+      .prepare('SELECT child_id FROM memory_synthesizes WHERE parent_id=? AND project_key=?')
+      .all(concId, key);
+    assert.deepEqual(
+      synth.map((r) => r.child_id),
+      [savedId],
+    );
+    const fts = db
+      .prepare('SELECT id FROM memories_fts WHERE id=? AND project_key=?')
+      .get(savedId, key);
+    assert.ok(fts, 'FTS row must exist after import');
+  } finally {
+    closeDb(projectDbPath(home, key));
+  }
+  rmRf(home);
+});

@@ -68,3 +68,81 @@ test('nonLoopbackToolGuard: empty allow list leaves everything denied', () => {
     else process.env.KIMI_MEMORY_PROXY_ALLOW_TOOLS = previous;
   }
 });
+
+test('nonLoopbackToolGuard: KIMI_MEMORY_PROXY_DENY_TOOLS wins over ALLOW_TOOLS', () => {
+  const prevAllow = process.env.KIMI_MEMORY_PROXY_ALLOW_TOOLS;
+  const prevDeny = process.env.KIMI_MEMORY_PROXY_DENY_TOOLS;
+  try {
+    process.env.KIMI_MEMORY_PROXY_ALLOW_TOOLS = 'memory_reset_project,memory_prune';
+    process.env.KIMI_MEMORY_PROXY_DENY_TOOLS = 'memory_reset_project';
+    // The deny-list overrides the allow-list.
+    const err = nonLoopbackToolGuard('memory_reset_project', { host: '0.0.0.0' });
+    assert.ok(err && err.includes('KIMI_MEMORY_PROXY_DENY_TOOLS'));
+    // A non-denylisted tool still passes through the allow-list.
+    assert.equal(nonLoopbackToolGuard('memory_prune', { host: '0.0.0.0' }), null);
+    // Non-destructive tools are unaffected.
+    assert.equal(nonLoopbackToolGuard('memory_recall', { host: '0.0.0.0' }), null);
+  } finally {
+    if (prevAllow === undefined) delete process.env.KIMI_MEMORY_PROXY_ALLOW_TOOLS;
+    else process.env.KIMI_MEMORY_PROXY_ALLOW_TOOLS = prevAllow;
+    if (prevDeny === undefined) delete process.env.KIMI_MEMORY_PROXY_DENY_TOOLS;
+    else process.env.KIMI_MEMORY_PROXY_DENY_TOOLS = prevDeny;
+  }
+});
+
+test('nonLoopbackToolGuard: deny-list applies to non-destructive tools too', () => {
+  const prevDeny = process.env.KIMI_MEMORY_PROXY_DENY_TOOLS;
+  try {
+    process.env.KIMI_MEMORY_PROXY_DENY_TOOLS = 'memory_recall';
+    const err = nonLoopbackToolGuard('memory_recall', { host: '0.0.0.0' });
+    assert.ok(err && err.includes('KIMI_MEMORY_PROXY_DENY_TOOLS'));
+  } finally {
+    if (prevDeny === undefined) delete process.env.KIMI_MEMORY_PROXY_DENY_TOOLS;
+    else process.env.KIMI_MEMORY_PROXY_DENY_TOOLS = prevDeny;
+  }
+});
+
+test('startProxy: refuses to start on a non-loopback host without KIMI_MEMORY_PROXY_REQUIRE_HTTPS', async () => {
+  const prev = process.env.KIMI_MEMORY_PROXY_REQUIRE_HTTPS;
+  try {
+    delete process.env.KIMI_MEMORY_PROXY_REQUIRE_HTTPS;
+    const { startProxy } = await import('../src/proxy/server.js');
+    await assert.rejects(
+      () =>
+        startProxy({
+          host: '0.0.0.0',
+          port: 0,
+          kimiHomeDir: process.env.KIMI_CODE_HOME,
+          pluginRootDir: process.cwd(),
+          authToken: 'tok',
+        }),
+      /refusing to start/,
+    );
+  } finally {
+    if (prev === undefined) delete process.env.KIMI_MEMORY_PROXY_REQUIRE_HTTPS;
+    else process.env.KIMI_MEMORY_PROXY_REQUIRE_HTTPS = prev;
+  }
+});
+
+test('startProxy: KIMI_MEMORY_PROXY_REQUIRE_HTTPS=off lets the operator opt in to cleartext', async () => {
+  const prev = process.env.KIMI_MEMORY_PROXY_REQUIRE_HTTPS;
+  try {
+    process.env.KIMI_MEMORY_PROXY_REQUIRE_HTTPS = 'off';
+    const { startProxy } = await import('../src/proxy/server.js');
+    const proxy = await startProxy({
+      host: '127.0.0.1',
+      port: 0,
+      kimiHomeDir: process.env.KIMI_CODE_HOME,
+      pluginRootDir: process.cwd(),
+      authToken: 'tok',
+    });
+    try {
+      assert.equal(proxy.host, '127.0.0.1');
+    } finally {
+      await proxy.close();
+    }
+  } finally {
+    if (prev === undefined) delete process.env.KIMI_MEMORY_PROXY_REQUIRE_HTTPS;
+    else process.env.KIMI_MEMORY_PROXY_REQUIRE_HTTPS = prev;
+  }
+});

@@ -7,6 +7,35 @@ prior version is rejected / migrated by the schema upgrade on first open.
 
 ## [Unreleased]
 
+### Fixed — Missing imports in `src/hooks/handlers/` broke every hook spawn
+
+Two files in the hook split were missing imports that were always
+consumed at runtime, so every hook invocation that reached the
+affected call site threw `ReferenceError`. The dispatcher caught
+the error and wrote `[kimi-memory] hook <EVENT> failed: <name> is
+not defined` to stdout instead of the real handler output, which
+failed 10 tests across `tests/04-hooks.test.js`,
+`tests/15-hook-stress.test.js`, and `tests/23-session-focus.test.js`.
+
+- `src/hooks/handlers/lib/pipeline.js` — `logHookDiag` (the
+  underlying sink the helper `logDiag` writes through) was used on
+  line 102 but never imported. Every Stop / SessionEnd / PreCompact
+  / Interrupt / StopFailure hook crashed the first time the
+  shared `logDiag` was invoked from a deeper handler.
+- `src/hooks/handlers/session-start.js` — the import block from
+  `./_helpers.js` was missing `readLatestSessionFocus`,
+  `buildSessionFocusLine`, `buildSessionThread`, `firstContentLine`,
+  `buildWorkingMemoryPreview`, and `buildStaleMemoryLine`, and the
+  cross-module imports `runConsolidate` (from `../../consolidate.js`)
+  and `buildDreamStatus` (from `../../dream.js`) were absent. Every
+  SessionStart hook crashed at the first `runConsolidate` call and
+  emitted no stdout, so all of `tests/04-hooks.test.js`'s
+  SessionStart assertions and the bounded-preview cases in
+  `tests/15-hook-stress.test.js` failed.
+
+After the fix, `npm test` reports 416/416 pass (was 405/416 with
+10 failures), and `npx prettier --check .` is clean.
+
 ### Fixed — UserPromptSubmit hook output is now a single line
 
 The hook's human-readable `<hook_result>` message used to lead every
@@ -46,7 +75,48 @@ just no longer sees any of that metadata inline.
   `skills/kimi-memory/references/recall-acknowledgement.md` — updated
   to describe the new minimal output format.
 
-### Fixed — UserPromptSubmit hook stdout
+### Changed — Recall summary surfaces the candidate-pool denominator
+
+The `UserPromptSubmit` summary line used to read `Recalled N memories.
+(N project, N global.) [semantic: …]` with no context for how
+representative `N` was. An 8-memory project always returned 8 hits
+even when only 1 was relevant, and the user had no way to tell from
+the line alone. The line now includes the pool denominator and reads
+`Recalled N memories of M.` where `M` is the active-memory count
+across project + global.
+
+- `Recalled 1 memory of 1.` (1 global.) — tiny pool, single hit.
+- `Recalled 5 memories of 24.` (4 project, 1 global.) [semantic: 2, procedural: 1] — partial-coverage recall.
+- `Recalled N memories.` (no `of M`) — fresh install, neither DB exists, so `poolSize === 0` and the denominator is suppressed.
+- `No recall hits.` — unchanged.
+
+`src/hooks/handlers/lib/pipeline.js` — `buildRecallSummary` reads the
+active count from both DBs via `memoryCounts(...).active` and adds
+`of ${poolSize}` to the summary template when `poolSize > 0`.
+`tests/04-hooks.test.js` regex updated to accept the optional `of M`
+segment; `tests/23-session-focus.test.js` regex was already tolerant.
+Skill doc strings updated (`skills/kimi-memory/SKILL.md:72`,
+`skills/kimi-memory/references/recall-acknowledgement.md:3,30`).
+
+### Fixed — Recall accuracy: pool-aware cap + score-gap elbow
+
+The recall surface had a hard-coded `RECALL_CANDIDATE_LIMIT = 8` per
+DB, so a project with 8 saved memories surfaced 8 hits on every prompt
+even when only 1 was actually relevant. Two new tunables in
+`src/hooks/handlers/lib/constants.js` make the surface adaptive:
+
+- `RECALL_BASE_LIMIT = 8` — hard ceiling per DB (the previous default).
+- `RECALL_MIN_HITS = 3` — floor on the per-DB limit, so a 1-memory project still gets surfaced.
+- `RECALL_GAP_FACTOR = 0.4` — score-gap elbow: after per-type selection, drop any hit whose RRF score is below `topScore * 0.4`.
+
+The per-DB limit is now `max(RECALL_MIN_HITS, min(RECALL_BASE_LIMIT, ceil(active / 2)))`, so a 12-memory project caps at 6 hits per DB and a 50-memory project still caps at 8. The cap is the SQL `limit`, so the padding rows are not even read off disk. The gap filter runs after per-type selection so the user keeps a balanced 1-per-type preview; only the padding rows get trimmed.
+
+- `src/hooks/handlers/lib/pipeline.js` — `buildRecallSummary` rewritten with pool-aware cap + score-gap filter.
+- `src/hooks/handlers/lib/constants.js` — three new tunables documented with their thresholds.
+- `tests/45-recall-gap-filter.test.js` — new file, 6 tests covering constants, pool-aware cap (3, 8, 12, 50 memories), no-DB edge case, and the gap-filter scenario.
+
+Set `KIMI_MEMORY_RECALL_GAP_FACTOR=0` to disable the gap filter
+(escape hatch for tests + advanced users who want the pre-filter surface).
 
 The hook was emitting both a plain-text block (`emitLines(...)`) AND a
 trailing JSON envelope on stdout. Kimi's hook runner
@@ -137,8 +207,10 @@ repository root. They were missing in v0.6.0.
   tools remain registered by default, so existing automation that
   calls them keeps working. Opt-out is explicit (`=off`).
 - The hook split is internal: handler function names + behaviour are
-  unchanged. No new tests required; all 41 existing test files pass
-  on the split.
+  unchanged. The split itself was incomplete at the time of writing
+  (see the `[Unreleased]` "Missing imports in `src/hooks/handlers/`"
+  entry — 10 hook tests were silently failing until the missing
+  `logHookDiag` and `_helpers.js` imports were added).
 - The skill split is byte-equivalent for content; only the layout
   changed. References are loaded on demand by the agent.
 

@@ -67,6 +67,9 @@ import {
   EXTRACT_MAX_LATENCY_MS,
   HOME,
   EVENT,
+  RECALL_BASE_LIMIT,
+  RECALL_MIN_HITS,
+  RECALL_GAP_FACTOR,
 } from './constants.js';
 import {
   formatConsolidateSegment,
@@ -91,6 +94,7 @@ import {
   lastDreamEnqueuedAt,
   getAutoApplyConfidence,
 } from '../../../dream.js';
+import { runDreaming } from '../../../dreaming.js';
 import { logHookDiag } from '../../../diagnostics.js';
 
 // ---- Diagnostics route ----
@@ -100,13 +104,6 @@ import { logHookDiag } from '../../../diagnostics.js';
 // the `memory_diagnostics` MCP tool reads.
 export async function logDiag(level, message, extra) {
   await logHookDiag(EVENT, level, message, extra || {}).catch(() => {});
-  if (level === 'error') {
-    try {
-      process.stderr.write('[kimi-memory:hook:' + EVENT + '] ' + message + '\n');
-    } catch {
-      /* ignore */
-    }
-  }
 }
 
 // ---- Payload adapters ----
@@ -184,6 +181,27 @@ export function pluralize(n, singular, plural) {
   return `${n} ${n === 1 ? singular : plural || singular + 's'}`;
 }
 
+// Score-gap elbow. Pure helper so the gap filter is unit-testable
+// without going through the full FTS+embedding pipeline (where
+// producing a clean score gap is fragile). Given an array of hits
+// with `id` and `score` fields, returns a new array containing only
+// hits whose score is >= `topScore * factor`. `factor = 0` disables
+// the filter (returns the input unchanged). `factor` is clamped to
+// [0, 1] so a typo'd config can't produce weird results.
+export function applyScoreGapFilter(hits, factor) {
+  if (!Array.isArray(hits) || hits.length <= 1) return hits;
+  const f = Math.max(0, Math.min(1, Number(factor) || 0));
+  if (f === 0) return hits;
+  // Use `.toSorted()` (Node 24+) so the input array is not mutated.
+  const sorted = hits.toSorted((a, b) => (b.score || 0) - (a.score || 0));
+  const topScore = sorted[0].score || 0;
+  const elbow = topScore * f;
+  const keep = new Set();
+  for (const m of sorted) {
+    if ((m.score || 0) >= elbow) keep.add(m.id);
+  }
+  return hits.filter((m) => keep.has(m.id));
+}
 export function derivePromptTokens(prompt) {
   if (!prompt) return [];
   const tokens = prompt
@@ -327,8 +345,6 @@ export function diversifyHitsByType(hits, { topN = 3 } = {}) {
   return picks;
 }
 
-// ---- Recall summary + context-line builders ----
-
 export async function buildRecallSummary({ projectDb, globalDb, key, prompt }) {
   const workingSlots = projectDb ? listWorkingMemory(projectDb, key) : [];
   const focusRow = projectDb ? readLatestSessionFocus(projectDb, key) : null;
@@ -345,21 +361,67 @@ export async function buildRecallSummary({ projectDb, globalDb, key, prompt }) {
       topHits: [],
     };
   }
-  const RECALL_CANDIDATE_LIMIT = 8;
-  const projectHits = projectDb
+  // (Audit fix — recall always returned 8 hits once a project had 8+
+  // memories.) Pool-aware per-DB limit + score-gap elbow. The previous
+  // behaviour was a hard `8` per DB regardless of how many memories
+  // the project actually had, so an 8-memory project surfaced 8 hits
+  // on every prompt even when only 1 was actually relevant. The new
+  // shape:
+  //   - Cap per DB at `RECALL_BASE_LIMIT` (the previous default).
+  //   - For small pools, lower the cap so we don't surface ~75% of
+  //     every saved memory on every prompt — `ceil(poolSize / 2)`,
+  //     with a `RECALL_MIN_HITS` floor so a project with one memory
+  //     still gets surfaced (it's the only thing to show).
+  //   - The cap is the SQL `limit` so we don't even read the padding
+  //     rows off disk. The gap filter (top-N by score elbow) trims
+  //     the tail further once search returns.
+  const projectActive = projectDb ? memoryCounts(projectDb, key).active || 0 : 0;
+  const globalActive = globalDb ? memoryCounts(globalDb, GLOBAL_PROJECT_KEY).active || 0 : 0;
+  // poolSize is the denominator for the `Recalled N of M.` summary
+  // line so the user sees how representative the hits are. 0 on a
+  // fresh install (neither DB exists).
+  const poolSize = projectActive + globalActive;
+  const projectLimit = Math.max(
+    RECALL_MIN_HITS,
+    Math.min(RECALL_BASE_LIMIT, Math.ceil(projectActive / 2)),
+  );
+  const globalLimit = Math.max(
+    RECALL_MIN_HITS,
+    Math.min(RECALL_BASE_LIMIT, Math.ceil(globalActive / 2)),
+  );
+
+  const rawProjectHits = projectDb
     ? await searchMemories(projectDb, key, query, {
-        limit: RECALL_CANDIDATE_LIMIT,
+        limit: projectLimit,
         perType: true,
         includeScore: true,
       })
     : [];
-  const globalHits = globalDb
+  const rawGlobalHits = globalDb
     ? await searchMemories(globalDb, GLOBAL_PROJECT_KEY, query, {
-        limit: RECALL_CANDIDATE_LIMIT,
+        limit: globalLimit,
         perType: true,
         includeScore: true,
       })
     : [];
+
+  // Score-gap elbow. After per-type bucketing has produced the
+  // balanced candidate list, drop any hit whose RRF score is below
+  // `topScore * RECALL_GAP_FACTOR`. The intuition: a hit at <40% of
+  // the top hit's relevance is probably a noisy keyword/embedding
+  // match, not a real connection the agent should surface. Disabled
+  // when factor = 0 (tests + opt-out escape hatch). See
+  // `applyScoreGapFilter` for the pure helper + test coverage.
+  let projectHits = rawProjectHits;
+  let globalHits = rawGlobalHits;
+  if (RECALL_GAP_FACTOR > 0 && rawProjectHits.length + rawGlobalHits.length > 1) {
+    const allRaw = [...rawProjectHits, ...rawGlobalHits];
+    const trimmedAll = applyScoreGapFilter(allRaw, RECALL_GAP_FACTOR);
+    const keep = new Set(trimmedAll.map((m) => m.id));
+    projectHits = rawProjectHits.filter((m) => keep.has(m.id));
+    globalHits = rawGlobalHits.filter((m) => keep.has(m.id));
+  }
+
   const allHits = [...projectHits, ...globalHits];
   const total = allHits.length;
 
@@ -377,10 +439,10 @@ export async function buildRecallSummary({ projectDb, globalDb, key, prompt }) {
       .sort((a, b) => b[1] - a[1])
       .map(([t, n]) => `${t}: ${n}`);
     const typeStr = typeParts.length ? ` [${typeParts.join(', ')}]` : '';
+    const ofTotal = poolSize > 0 ? ` of ${poolSize}` : '';
     summary =
-      `Recalled ${pluralize(total, 'memory', 'memories')}. (${parts.join(', ')}.) ${typeStr}`.trim();
+      `Recalled ${pluralize(total, 'memory', 'memories')}${ofTotal}. (${parts.join(', ')}.) ${typeStr}`.trim();
   }
-
   const projectIdSet = new Set(projectHits.map((m) => m.id));
   const orderedForDiversify = [
     ...projectHits.sort((a, b) => (b.score || 0) - (a.score || 0)),
@@ -847,7 +909,33 @@ export async function maybeEnqueueDream(projectDb, projectKey, cwd) {
   }
   return enqueue;
 }
-
+// wall-clock floor or activity gate). Called from SessionStart. The
+// orchestrator decides mode + interval + include set from the
+// per-project state file at $KIMI_CODE_HOME/kimi-memory/<project>/
+// dreaming.json (with the global _config/dreaming.json as fallback).
+// Returns the run summary so the status line can render the result.
+// (Fires when the floor has elapsed or `force` is true; otherwise
+// returns `{ fired: false, skipped: 'below_interval' }`.)
+export async function maybeDreaming({ projectDb, projectKey, cwd, force = false, kimiHomeDir }) {
+  if (!projectDb || !projectKey) return { skipped: 'no_inputs' };
+  if (process.env.KIMI_MEMORY_DREAMING === 'off') return { skipped: 'env_opt_out' };
+  let result;
+  try {
+    result = await runDreaming({
+      db: projectDb,
+      projectKey,
+      cwd,
+      force,
+      saveMemory,
+      memoryLink: linkMemory,
+      mergeMemory,
+      kimiHomeDir,
+    });
+  } catch (e) {
+    return { skipped: 'threw', error: e && e.message ? e.message : String(e) };
+  }
+  return result;
+}
 // Phase-1 Dream apply. Called from SessionStart. We only ever apply
 // one job per SessionStart so the 8s hook budget is never overrun.
 export async function maybeApplyReadyDream(projectDb, projectKey) {

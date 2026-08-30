@@ -312,3 +312,132 @@ test('MCP round-trip: memory_link → memory_edges → memory_unlink → memory_
     rmRf(home);
   }
 });
+
+test('memory_parents honors project|global|all scope (regression: was project-only)', async () => {
+  const home = mkTempHome();
+  const cwd = 'C:/test/parents-scope';
+  const mcp = new StdioMcp({ home });
+  mcp.start();
+  try {
+    await mcp.call('initialize', {
+      protocolVersion: '2024-11-05',
+      capabilities: {},
+      clientInfo: { name: 'test', version: '0' },
+    });
+    // Two project children + a project conclusion that synthesizes
+    // them. The default (no scope) → 'all'; project → 2 children;
+    // global → 0 (the conclusion lives in project scope).
+    const saveA = await mcp.toolCall('memory_save', {
+      cwd,
+      scope: 'project',
+      type: 'episodic',
+      title: 'project child A',
+      content: 'p-a',
+    });
+    const saveB = await mcp.toolCall('memory_save', {
+      cwd,
+      scope: 'project',
+      type: 'episodic',
+      title: 'project child B',
+      content: 'p-b',
+    });
+    const idA = JSON.parse(saveA.content[0].text).memory.id;
+    const idB = JSON.parse(saveB.content[0].text).memory.id;
+
+    const saveConc = await mcp.toolCall('memory_save', {
+      cwd,
+      scope: 'project',
+      type: 'conclusion',
+      title: 'project synthesis',
+      content: 'two project kids',
+      synthesizes: [idA, idB],
+    });
+    const concId = JSON.parse(saveConc.content[0].text).memory.id;
+
+    // Now a global conclusion that synthesizes one global child.
+    const saveG = await mcp.toolCall('memory_save', {
+      cwd,
+      scope: 'global',
+      type: 'episodic',
+      title: 'global child G',
+      content: 'g',
+    });
+    const idG = JSON.parse(saveG.content[0].text).memory.id;
+    const saveGConc = await mcp.toolCall('memory_save', {
+      cwd,
+      scope: 'global',
+      type: 'conclusion',
+      title: 'global synthesis',
+      content: 'one global kid',
+      synthesizes: [idG],
+    });
+    const gConcId = JSON.parse(saveGConc.content[0].text).memory.id;
+
+    // Default (no scope arg → reads default to 'all'): every child
+    // across both scopes comes back. The project conclusion's edges
+    // are project-scoped; the global conclusion's edges are global-
+    // scoped. Cross-DB synthesis is not supported by the schema, so
+    // the project conclusion yields 2 children, the global yields 1.
+    const projAllDefault = await mcp.toolCall('memory_parents', { cwd, id: concId });
+    const projDefaultPayload = JSON.parse(projAllDefault.content[0].text);
+    assert.equal(projDefaultPayload.scope, 'all');
+    // Only the project conclusion's children come back; the global
+    // conclusion's edge points into the _global DB and never crosses
+    // over.
+    assert.deepEqual(projDefaultPayload.items.map((m) => m.id).sort(), [idA, idB].sort());
+    assert.ok(projDefaultPayload.items.every((m) => m.scope === 'project'));
+    // Project scope narrows to the two project children.
+    const projOnly = await mcp.toolCall('memory_parents', {
+      cwd,
+      id: concId,
+      scope: 'project',
+    });
+    const projPayload = JSON.parse(projOnly.content[0].text);
+    assert.equal(projPayload.scope, 'project');
+    assert.deepEqual(projPayload.items.map((m) => m.id).sort(), [idA, idB].sort());
+    assert.ok(projPayload.items.every((m) => m.scope === 'project'));
+    // Global scope on the project conclusion yields nothing: the
+    // conclusion lives in the project DB and never appears in _global.
+    const projGlobal = await mcp.toolCall('memory_parents', {
+      cwd,
+      id: concId,
+      scope: 'global',
+    });
+    const projGlobalPayload = JSON.parse(projGlobal.content[0].text);
+    assert.equal(projGlobalPayload.scope, 'global');
+    assert.equal(projGlobalPayload.count, 0);
+    // The global conclusion: scope=global yields its single child.
+    const globalOnly = await mcp.toolCall('memory_parents', {
+      cwd,
+      id: gConcId,
+      scope: 'global',
+    });
+    const globalPayload = JSON.parse(globalOnly.content[0].text);
+    assert.equal(globalPayload.scope, 'global');
+    assert.deepEqual(
+      globalPayload.items.map((m) => m.id),
+      [idG],
+    );
+    assert.ok(globalPayload.items.every((m) => m.scope === 'global'));
+    // Default on the global conclusion yields the global child only.
+    const globalAllDefault = await mcp.toolCall('memory_parents', { cwd, id: gConcId });
+    const globalDefaultPayload = JSON.parse(globalAllDefault.content[0].text);
+    assert.equal(globalDefaultPayload.scope, 'all');
+    assert.deepEqual(globalDefaultPayload.items.map((m) => m.id).sort(), [idG]);
+    // Project scope on the global conclusion yields nothing.
+    const globalProjOnly = await mcp.toolCall('memory_parents', {
+      cwd,
+      id: gConcId,
+      scope: 'project',
+    });
+    const globalProjPayload = JSON.parse(globalProjOnly.content[0].text);
+    assert.equal(globalProjPayload.scope, 'project');
+    assert.equal(globalProjPayload.count, 0);
+    // No scope=all merge expected: cross-DB synthesis is not
+    // supported, so the global conclusion's edges never reach into
+    // the project DB and vice versa. The scope-routing behaviour is
+  } finally {
+    mcp.stop();
+    rmRf(home);
+  }
+});

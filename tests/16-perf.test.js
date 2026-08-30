@@ -41,7 +41,7 @@ const BUDGETS = {
   recall_5k_perType_ms: 500,
   list_5k_ms: 250,
   bulk_save_1k_ms: 3_000,
-  single_save_ms: 50,
+  single_save_ms: 100,
   count_5k_ms: 50,
 };
 

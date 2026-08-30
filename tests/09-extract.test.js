@@ -50,16 +50,38 @@ test('parseExtractionResponse: rejects unsupported types and empty content', () 
     {"type":"semantic","title":"ok","content":"valid","tags":[]}
   ]`;
   const out = parseExtractionResponse(text);
-  assert.equal(out.length, 1);
   assert.equal(out[0].title, 'ok');
 });
 
-test('parseExtractionResponse: caps at MAX_CANDIDATES_PER_CALL (3)', () => {
+test('parseExtractionResponse: accepts context_snapshot for narration / state / plans', () => {
+  const text = `[
+    {"type":"context_snapshot","title":"Looking at repo state + prior sea work","content":"Let me look at the current state of the repo to understand context, and check for prior sea work.","tags":["snapshot","investigation"]},
+    {"type":"context_snapshot","title":"focus: ship code-discipline v2","content":"In-flight: implementing audit-lint-disable-justification; goal is ship code-discipline v2.","tags":["snapshot","focus"]}
+  ]`;
+  const out = parseExtractionResponse(text);
+  assert.equal(out.length, 2);
+  for (const m of out) {
+    assert.equal(m.type, 'context_snapshot');
+    assert.ok(m.tags.includes('snapshot'), 'tagged snapshot');
+  }
+});
+
+test('parseExtractionResponse: rejects unknown types (still strict)', () => {
+  const text = `[
+    {"type":"banana","title":"x","content":"y","tags":[]},
+    {"type":"context_snapshot","title":"ok","content":"valid","tags":["snapshot"]}
+  ]`;
+  const out = parseExtractionResponse(text);
+  assert.equal(out.length, 1);
+  assert.equal(out[0].type, 'context_snapshot');
+});
+
+test('parseExtractionResponse: caps at MAX_CANDIDATES_PER_CALL (6)', () => {
   const arr = [];
   for (let i = 0; i < 10; i++)
     arr.push({ type: 'semantic', title: 't' + i, content: 'c' + i, tags: [] });
   const out = parseExtractionResponse(JSON.stringify(arr));
-  assert.equal(out.length, 3);
+  assert.equal(out.length, 6);
 });
 
 test('parseExtractionResponse: returns [] for invalid JSON or non-string', () => {
@@ -341,6 +363,76 @@ test('runAutoExtract: happy path — mock LLM returns candidates, dedup keeps th
       assert.equal(all.length, 2);
       const prov = all.map((m) => m.provenance && m.provenance.source);
       assert.ok(prov.every((p) => p === 'auto_extract'));
+    } finally {
+      closeDb();
+    }
+  } finally {
+    rmRf(home);
+  }
+});
+
+test('runAutoExtract: context_snapshot rows rank below durable facts (confidence + priority)', async () => {
+  const home = mkTempHome();
+  try {
+    writeRaw(
+      `${home}/config.toml`,
+      `
+      default_model = "x/m"
+      [providers.x]
+      type="openai"
+      api_key="k"
+      base_url="https://example/v1"
+      [models."x/m"]
+      provider = "x"
+      model = "m"
+    `,
+    );
+    const key = deriveProjectKey('C:/test/extract-snapshot');
+    const db = openDb(projectDbPath(home, key));
+    try {
+      const fakeReply = JSON.stringify([
+        {
+          type: 'semantic',
+          title: 'commit policy',
+          content: 'squash + keep remote branch',
+          tags: ['git'],
+        },
+        {
+          type: 'context_snapshot',
+          title: 'Looking at repo state + prior sea work',
+          content:
+            'Let me look at the current state of the repo to understand context, and check for prior sea work.',
+          tags: ['snapshot', 'investigation'],
+        },
+      ]);
+      const r = await runAutoExtract({
+        homeDir: home,
+        cwd: 'C:/test',
+        projectKey: key,
+        db,
+        transcript:
+          'USER: do we squash?\nASSISTANT: yes, squash + keep remote branch.\nUSER: Let me look at the current state of the repo to understand context, and check for prior sea work.',
+        saveMemory,
+        searchMemories,
+        callLlm: async () => fakeReply,
+      });
+      assert.equal(r.saved, 2);
+      const all = listMemories(db, key, {});
+      assert.equal(all.length, 2);
+      const snap = all.find((m) => m.type === 'context_snapshot');
+      const sem = all.find((m) => m.type === 'semantic');
+      assert.ok(snap, 'snapshot row present');
+      assert.ok(sem, 'semantic row present');
+      // Snapshots rank strictly below durable facts on both axes
+      assert.ok(
+        snap.confidence < sem.confidence,
+        `snapshot.confidence (${snap.confidence}) must be below semantic.confidence (${sem.confidence})`,
+      );
+      assert.ok(
+        snap.priority < sem.priority,
+        `snapshot.priority (${snap.priority}) must be below semantic.priority (${sem.priority})`,
+      );
+      assert.ok(snap.tags.includes('snapshot'), 'snapshot row carries the snapshot tag');
     } finally {
       closeDb();
     }

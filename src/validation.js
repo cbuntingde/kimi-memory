@@ -6,7 +6,15 @@ import { canonicalizeRoot } from './project-key.js';
 // migration's rebuild clause. The v10 skill phase added 'skill' here
 // so memory_save / memory_list / memory_save_bulk accept it; the DB
 // layer already accepted it from migrateAddSkillType.
-const TYPES = new Set(['working', 'episodic', 'semantic', 'procedural', 'conclusion', 'skill']);
+const TYPES = new Set([
+  'working',
+  'episodic',
+  'semantic',
+  'procedural',
+  'conclusion',
+  'skill',
+  'context_snapshot',
+]);
 const STATUSES = new Set(['active', 'superseded', 'deleted']);
 const SLOTS = new Set([
   'current_focus',

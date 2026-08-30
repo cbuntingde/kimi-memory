@@ -43,8 +43,9 @@ test('B1-5: cmdImport refuses files larger than 50 MB', async () => {
     truncateSync(big, 60 * 1024 * 1024);
     assert.ok(statSync(big).size > 50 * 1024 * 1024, 'precondition: file > 50 MB');
     const cliSrc = readFileSync(new URL('../src/cli.js', import.meta.url), 'utf8');
-    assert.match(cliSrc, /MAX_IMPORT_BYTES/);
-    assert.match(cliSrc, /import file too large/);
+    const cliImportSrc = readFileSync(new URL('../src/cli-cmd/import.js', import.meta.url), 'utf8');
+    assert.match(cliSrc + cliImportSrc, /MAX_IMPORT_BYTES/);
+    assert.match(cliSrc + cliImportSrc, /import file too large/);
   } finally {
     rmRf(home);
   }

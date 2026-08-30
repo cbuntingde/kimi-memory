@@ -57,6 +57,21 @@ Local sources are copied into the managed plugin directory; edits to this
 checkout do not propagate. Reinstall and `/reload` after meaningful
 changes.
 
+### One outbound call to know about
+
+By default, `KIMI_MEMORY_AUTO_EXTRACT=on` fires at the end of every
+Stop / SessionEnd / SessionStart: a small chat call goes to the same
+provider Kimi's `config.toml` already routes through, with the most
+recent conversation exchange and any project metadata detected from
+manifest files. The transcript is scrubbed server-side by
+`redactSecrets()` before it leaves the machine — known credential
+shapes are replaced with `[REDACTED_*]` placeholders — and the
+provider's own policies apply on top. If you don't want that call,
+set `KIMI_MEMORY_AUTO_EXTRACT=off` before the first SessionStart, or
+pass `[kimi-memory] disable_auto_extract = true` in your `config.toml`.
+See [Privacy and data handling](#privacy-and-data-handling) for the
+full surface.
+
 ### Requirements
 
 - Kimi Code with plugin, hook, Skill, and MCP support
@@ -66,15 +81,13 @@ changes.
 
 The most common entry points. See [Slash commands](#slash-commands) and
 [MCP tools](#tools) for the complete surface.
-
-| Action                                                 | Command                                      |
-| ------------------------------------------------------ | -------------------------------------------- |
-| List this project's memories                           | `/kimi-memory:list_memories`                 |
-| Reflect on the active project                          | `/kimi-memory:advisor`                       |
-| Wipe a re-cloned project's stale rows                  | `/kimi-memory:reset-project --apply`         |
-| Open the companion dashboard in your browser           | `/kimi-memory:memos`                         |
-| Check pipeline status (counts, advisor queue, cleanup) | `node src/cli.js status --cwd <path>`        |
-| Clean orphan project databases                         | `node src/cli.js prune --cwd <path> --apply` |
+| Action | Command |
+| List this project's memories | `/kimi-memory:list_memories` |
+| Reflect on the active project | `/kimi-memory:advisor` |
+| Wipe a re-cloned project's stale rows | `/kimi-memory:reset-project --apply` |
+| Open the companion dashboard in your browser | `/kimi-memory:memos` |
+| Check pipeline status (counts, advisor queue, cleanup) | `node src/cli.js status --cwd <path>` |
+| Clean orphan project databases | `node src/cli.js prune --cwd <path> --apply` |
 
 ## Storage layers
 
@@ -169,6 +182,14 @@ use.
 | `KIMI_MEMORY_DREAM`                 | `on`    | Set to `off` to skip staged consolidation. Existing queued jobs stay queryable.                              |
 | `KIMI_MEMORY_AUTO_EXTRACT`          | `on`    | Set to `off` to disable the assistant-driven memory extraction at the end of each turn.                      |
 | `KIMI_MEMORY_LEGACY_SUBSYSTEMS`     | `on`    | Set to `off` to hide the deprecated tool groups (access control, tier and persona, code graph).              |
+| `KIMI_MEMORY_SECRET_SCAN`           | `on`    | Set to `off` to bypass the credential-shape gate on save + import. Off is intended for fixture imports only. |
+| `KIMI_MEMORY_PROXY_TOKEN`           | unset   | Bearer token the memory proxy demands on every request. Recommended on any non-loopback bind.                |
+| `KIMI_MEMORY_PROXY_ALLOW_TOOLS`     | unset   | Comma-separated destructive tool names the proxy may serve on a non-loopback bind (e.g. `memory_save`).      |
+| `KIMI_MEMORY_PROXY_DENY_TOOLS`      | unset   | Comma-separated tool names that must never be served by the proxy, regardless of ALLOW_TOOLS.                |
+| `KIMI_MEMORY_PROXY_REQUIRE_HTTPS`   | unset   | Set to `1`/`on` to demand a TLS terminator in front of any non-loopback bind; set to `off` to opt out.       |
+| `KIMI_MEMORY_RECALL_BASE_LIMIT`     | `8`     | Hard ceiling on the number of hits recalled per DB. The pool-aware cap is `min(8, ceil(active/2))`.          |
+| `KIMI_MEMORY_RECALL_MIN_HITS`       | `3`     | Floor on the per-DB recall limit. A 1-memory project still gets surfaced.                                    |
+| `KIMI_MEMORY_RECALL_GAP_FACTOR`     | `0.4`   | Score-gap elbow: drop any hit below `topScore * factor`. Set to `0` to disable (pre-filter surface).         |
 
 The full table — including timeouts, strict-mode network guards, and
 auto-cleanup switches — is documented in `AGENTS.md`.

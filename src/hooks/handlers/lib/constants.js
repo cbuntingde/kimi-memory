@@ -25,6 +25,44 @@ export const STATUS_RECENT_GLOBAL = 4;
 export const PROMPT_RECALL_LIMIT = 4;
 export const PROMPT_TOKEN_LIMIT = 6;
 
+// ---- Recall tuning (UserPromptSubmit hook) ----
+//
+// (Audit fix — recall always returned 8 hits once a project had 8+
+// memories.) The recall surface had a hard `8` per-DB constant
+// regardless of pool size, so a project with 8 saved memories
+// surfaced 8 hits on every prompt even when only 1 was actually
+// relevant. The new shape is pool-aware + score-gap filtered; see
+// `src/hooks/handlers/lib/pipeline.js:buildRecallSummary`.
+//
+// env: KIMI_MEMORY_RECALL_BASE_LIMIT. Hard ceiling per DB call.
+// The previous default. Set above the pool-aware cap so large pools
+// still surface a useful mix without flooding the agent's context.
+export const RECALL_BASE_LIMIT = (() => {
+  const v = Number(process.env.KIMI_MEMORY_RECALL_BASE_LIMIT);
+  return Number.isFinite(v) && v >= 1 ? Math.floor(v) : 8;
+})();
+// env: KIMI_MEMORY_RECALL_MIN_HITS. Floor on the per-DB limit. A
+// tiny pool (1–5 memories) should not be artificially capped below
+// 3, or the user sees a single hit and assumes recall is broken
+// when more rows exist. The pool-aware cap is
+// `Math.ceil(poolSize * 0.5)` which is < 3 below poolSize=6; this
+// floor keeps the surface usable.
+export const RECALL_MIN_HITS = (() => {
+  const v = Number(process.env.KIMI_MEMORY_RECALL_MIN_HITS);
+  return Number.isFinite(v) && v >= 1 ? Math.floor(v) : 3;
+})();
+// env: KIMI_MEMORY_RECALL_GAP_FACTOR. Score-gap elbow. After
+// per-type selection, drop any hit whose `score` is below
+// `topScore * RECALL_GAP_FACTOR`. A hit at 40% of the top hit's
+// RRF score is judged marginal and trimmed; one at 50% or above
+// is judged relevant. Conservative default keeps broad-recall
+// prompts from going silent; tune down for noisier corpora. Set
+// to 0 to disable the gap filter entirely.
+export const RECALL_GAP_FACTOR = (() => {
+  const v = Number(process.env.KIMI_MEMORY_RECALL_GAP_FACTOR);
+  return Number.isFinite(v) && v >= 0 && v <= 1 ? v : 0.4;
+})();
+
 // ---- Payload field name tables ----
 //
 // Field names Kimi has used across versions for the project's working

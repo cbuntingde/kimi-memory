@@ -198,10 +198,13 @@ test('UserPromptSubmit reports real ingest and a brief recall summary instead of
     assert.ok(json.message, 'message is present');
     // The message is exactly the single recall summary line, prefixed
     // with `[kimi-memory]`. No status line, no focus line, no WM preview.
-    // Format: `[kimi-memory] Recalled N memor{y|ies}. (….) [type: N, …]`
+    // Format: `[kimi-memory] Recalled N memor{y|ies}[ of M]. (….) [type: N, …]`
+    // The optional `of M` tail is the candidate-pool denominator (project
+    // active + global active memories), surfaced so the user sees how
+    // representative the hits are. Omitted only when poolSize is 0.
     assert.match(
       json.message,
-      /^\[kimi-memory\] (?:Recalled \d+ memor(?:y|ies)\. \([^)]+\.\)(?:\s+\[\w+: \d+(?:, \w+: \d+)*\])?|No recall hits\.)$/,
+      /^\[kimi-memory\] (?:Recalled \d+ memor(?:y|ies)(?: of \d+)?\. \([^)]+\.\)(?:\s+\[\w+: \d+(?:, \w+: \d+)*\])?|No recall hits\.)$/,
       'message is the minimal `[kimi-memory] <recall summary>` line',
     );
     // No newline in the message — it is a single line, not a stack.

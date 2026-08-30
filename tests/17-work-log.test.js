@@ -307,7 +307,14 @@ test('maybeWriteWorkLog: cross-references today\u2019s memory titles in the cont
       runGit: fakeRunGitWith(['a1 first']),
     });
     assert.equal(r.written, 1);
-    const content = listMemories(db, key, {})[0].content;
+    // The work-log row is the only one with the expected title; find it
+    // explicitly rather than relying on listMemories' insertion order
+    // (which has no documented guarantee and has historically picked
+    // a different row first when the seed used a shared updated_at).
+    const all = listMemories(db, key, {});
+    const workLog = all.find((m) => /work log$/.test(m.title || ''));
+    assert.ok(workLog, 'work-log row must exist after a successful write');
+    const content = workLog.content;
     assert.match(content, /Memories saved\/updated today on this project \(2\)/);
     assert.match(content, /- release flow/);
     assert.match(content, /- db backup/);

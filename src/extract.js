@@ -22,7 +22,7 @@ import { withLlmRetry } from './retry.js';
 import { logAutoExtractError } from './diagnostics.js';
 import { parseToml } from './toml.js';
 
-const MAX_CANDIDATES_PER_CALL = 3;
+const MAX_CANDIDATES_PER_CALL = 6; // bumped from 3 to make room for durable + context_snapshot
 const MAX_INPUT_CHARS = 12000; // ~3k tokens of conversation context
 const LLM_TIMEOUT_MS = 4000; // hard cap on the chat call
 
@@ -115,18 +115,26 @@ export function redactSecrets(text) {
   );
   return out;
 }
-const EXTRACT_SYSTEM_PROMPT = `You are a memory extraction module. Read the conversation and any project metadata summary provided, and decide whether it contains any durable facts worth remembering for the user's future self.
+const EXTRACT_SYSTEM_PROMPT = `You are a memory extraction module for an automated coding agent memory system. Read the conversation and any project metadata summary provided and emit a JSON array of candidate memories.
 
-A "durable fact" is a preference, decision, convention, or stable context that would still be useful hours or days later. Skip transient debugging, in-flight tasks, and one-off questions.
+Every candidate must be one of these types:
 
-In addition to conversation facts, extract project build/stack details when present:
-- build command(s)
-- test command(s)
-- dependency update policy (e.g., "check for latest unless pinned or specified")
-- short stack summary (language, framework, tooling)
+* "semantic" — stable convention, decision, preference, or convention about the project (e.g. "uses tabs for indent", "commit policy: --squash, keep remote branch"). Durability: weeks+.
+* "episodic" — a concrete event that happened (e.g. "shipped PR #N", "fixed the lint-disable justification gap"). Durability: months for postmortems; decays otherwise.
+* "procedural" — how to do something repeatable (e.g. "run npm run check before commit", "verification commands: go mod tidy && go build ./…"). Durability: stable until the workflow changes.
+* "context_snapshot" — project state, current focus, plans, or "I am about to look at X, checking Y" narration that the user will want recalled next session but should NOT crowd out durable facts. Use this when:
+    * the user stated what they are investigating / planning to do ("let me look at the current state of the repo to understand context, and check for prior sea work")
+    * an in-progress task has a clear goal ("implement audit-lint-disable-justification", "ship code-discipline v2")
+    * the assistant declared a focus area ("focus: v2 integration tests next", "investigating post-write review flow")
+    * the conversation captures a snapshot of the project's state at a point in time ("C:\\Chris-Dev\\kimi-code is at commit b38a176, audit-log entry F2 landed")
 
-Respond with a JSON array. Each entry: { "type": "semantic"|"episodic"|"procedural", "title": "<=80 chars>", "content": "<=500 chars", "tags": ["<short tag>", ...] }.
-Return [] if nothing qualifies. No prose, no markdown fences — JSON only.`;
+Auto-extraction is automatic and fully hands-off. The user does NOT want to manually call a save tool to preserve state — every piece of state worth recalling on a future turn must be captured here, including narration-style "I'm about to investigate X" lines, framed as a snapshot. Tag every context_snapshot with tags including "snapshot" so it can be filtered.
+
+In addition to the rules above, also extract project build/stack details when present (build commands, test commands, dependency update policy, short stack summary). Use type="semantic" for build/stack and type="procedural" for the dependency update policy.
+
+Respond with a JSON array. Each entry: { "type": "semantic"|"episodic"|"procedural"|"context_snapshot", "title": "<=80 chars", "content": "<=500 chars", "tags": ["<short tag>", ...] }.
+
+Aim for 3-6 candidates per call: a mix of durable facts (semantic / episodic / procedural) and at least one context_snapshot whenever the conversation describes current state, an in-flight task, or a stated plan. Return [] only when the transcript is genuinely empty of state worth recalling. No prose, no markdown fences — JSON only.`;
 
 // Project metadata detector: reads well-known manifests under the
 // project root and returns a compact summary for build/stack extraction.
@@ -407,9 +415,9 @@ export function parseExtractionResponse(text) {
   }
   const out = [];
   for (const raw of arr) {
-    if (!raw || typeof raw !== 'object') continue;
     const type = asString(raw.type);
-    if (!['semantic', 'episodic', 'procedural'].includes(type)) continue;
+    if (!['semantic', 'episodic', 'procedural', 'context_snapshot'].includes(type)) continue;
+
     const title = asString(raw.title).slice(0, 500);
     const content = asString(raw.content).slice(0, 4000);
     if (!content) continue;
@@ -725,13 +733,19 @@ export async function runAutoExtract({
       continue;
     }
     try {
+      // Snapshot candidates rank below durable facts so they don't
+      // crowd out recall of conventions, decisions, and procedures.
+      // The confounder — the LLM may over-snapshot — is offset by
+      // ranking alone: durable facts surface first in default order,
+      // snapshots still come up via FTS5 search on the next session.
+      const isSnapshot = cand.type === 'context_snapshot';
       saveMemory(db, projectKey, {
         type: cand.type,
         title: cand.title,
         content: cand.content,
         tags: cand.tags,
-        confidence: 0.6, // lower than the default 0.8 to flag uncertainty
-        priority: -1, // below user-saved rows in the default list order
+        confidence: isSnapshot ? 0.45 : 0.6, // snapshots rank lowest
+        priority: isSnapshot ? -3 : -1, // snapshots below other auto-extract rows
         provenance: {
           source: 'auto_extract',
           model: target.model,

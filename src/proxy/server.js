@@ -77,13 +77,35 @@ export async function startProxy({
   // `=false`, `=no`, or `=off` all turn auth off — not just `=off`
   // literally.
   const bypass = proxyAuthBypass();
-
   // Refuse the dangerous combo: auth bypass on a non-loopback bind
   // exposes the entire MCP surface (read + write) to the network with
   // no authentication. The CLI flag --no-auth + --host 0.0.0.0 would
   // otherwise be a one-keystroke data-leak path.
   if (bypass && host !== '127.0.0.1' && host !== '::1' && host !== 'localhost') {
     const msg = `kimi-memory proxy: refusing to start — KIMI_MEMORY_PROXY_AUTH=off with host=${host} would expose unauthenticated access. Use a loopback host or set KIMI_MEMORY_PROXY_TOKEN.`;
+    log(msg);
+    throw new Error(msg);
+  }
+  // KIMI_MEMORY_PROXY_REQUIRE_HTTPS=1 demands TLS termination. The
+  // proxy itself does not speak TLS (we're a stdio MCP transport
+  // translated to plain HTTP); the assumption is that a TLS
+  // terminator — haproxy, nginx, Caddy — sits in front. Without
+  // that terminator, bearer tokens flow cleartext and any attacker
+  // on the same broadcast domain reads them. Refuse to start unless
+  // either the bind host is loopback OR the operator explicitly opts
+  // in to cleartext-on-the-wire via KIMI_MEMORY_PROXY_REQUIRE_HTTPS=off.
+  const requireHttps = (process.env.KIMI_MEMORY_PROXY_REQUIRE_HTTPS || '').toLowerCase().trim();
+  const requireHttpsOn = requireHttps === '1' || requireHttps === 'on' || requireHttps === 'true';
+  const requireHttpsOff =
+    requireHttps === 'off' || requireHttps === '0' || requireHttps === 'false';
+  const isLoopbackBind =
+    host === '127.0.0.1' || host === '::1' || host === 'localhost' || host === '';
+  if (!isLoopbackBind && !requireHttpsOff) {
+    const msg =
+      `kimi-memory proxy: refusing to start — non-loopback bind host=${host} without TLS. ` +
+      `Either place a TLS terminator in front of the proxy and set KIMI_MEMORY_PROXY_REQUIRE_HTTPS=1, ` +
+      `or pass --host 127.0.0.1 (or any loopback address). ` +
+      `To override explicitly (NOT recommended), set KIMI_MEMORY_PROXY_REQUIRE_HTTPS=off.`;
     log(msg);
     throw new Error(msg);
   }
@@ -432,6 +454,16 @@ export function nonLoopbackToolGuard(toolName, { host } = {}) {
   const loopback =
     bindHost === '127.0.0.1' || bindHost === '::1' || bindHost === 'localhost' || bindHost === '';
   if (loopback) return null;
+  // Operator-set deny-list always wins, regardless of any allow-list.
+  // Useful for hardening the proxy against a specific tool even when
+  // the operator has broader ALLOW_TOOLS set.
+  const denied = (process.env.KIMI_MEMORY_PROXY_DENY_TOOLS || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  if (denied.includes(toolName)) {
+    return `tool ${toolName} is on the operator's deny-list (KIMI_MEMORY_PROXY_DENY_TOOLS). Remove it to allow.`;
+  }
   if (!NETWORK_DESTRUCTIVE_TOOLS.has(toolName)) return null;
   // Operator-opt-in: each destructive tool must be named explicitly.
   const allowed = (process.env.KIMI_MEMORY_PROXY_ALLOW_TOOLS || '')

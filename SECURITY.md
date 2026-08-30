@@ -56,10 +56,34 @@ finding that meets the bar for public tracking.
   ACL rows are advisory, not enforced on the MCP server.
 - It does not encrypt the SQLite files at rest. The databases live in
   the user's home directory under their existing OS-level protections.
-- It does not transmit any memory or hook payload to a third party.
-  The one outbound behaviour is the embedding model download from
-  Hugging Face on first use (cached locally after); disable with
-  `KIMI_MEMORY_EMBEDDINGS=off`.
+
+## Outbound calls (and how to turn them off)
+
+Two outbound behaviours, both opt-out. Each makes one HTTPS call per
+trigger; nothing is persisted server-side beyond what your provider
+keeps under its own retention policy.
+
+1. **Embedding encoder download** (`KIMI_MEMORY_EMBEDDINGS=on`,
+   default on). The MiniLM model (~25 MB) downloads lazily from
+   Hugging Face on first use and is cached locally under the
+   transformers cache directory. Disable with
+   `KIMI_MEMORY_EMBEDDINGS=off`; recall falls back to keyword search.
+2. **Auto-extract LLM call** (`KIMI_MEMORY_AUTO_EXTRACT=on`,
+   default on). At every Stop / SessionEnd / SessionStart the plugin
+   sends the most recent conversation exchange plus detected project
+   metadata to the provider Kimi's `config.toml` already routes
+   through. The transcript is scrubbed by `redactSecrets` before it
+   leaves the machine — known credential shapes are replaced with
+   `[REDACTED_*]` placeholders — and the provider's own policies
+   apply on top. To opt out, set `KIMI_MEMORY_AUTO_EXTRACT=off` or
+   add `disable_auto_extract = true` to the `[kimi-memory]` table in
+   `config.toml`.
+
+For an additional SSRF guard on the auto-extract provider URL, set
+`KIMI_MEMORY_AUTO_EXTRACT_REQUIRE_HTTPS=1`. With that on, cleartext
+`http://` provider bases and loopback / private / link-local targets
+are refused before the request is built — see
+`src/extract.js#guardLlmBaseUrl`.
 
 ## Cryptographic primitives in use
 

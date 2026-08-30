@@ -13,7 +13,7 @@ import { z } from 'zod';
 export const TOOL_DEFS = [
   {
     name: 'memory_save',
-    desc: 'Persist a memory entry. type \u2208 working|episodic|semantic|procedural|conclusion|skill.',
+    desc: 'Persist a memory entry. type ∈ working|episodic|semantic|procedural|conclusion|skill|context_snapshot.',
     input: {
       cwd: z.string().describe('Project root (absolute path). Required.'),
       scope: z
@@ -23,9 +23,17 @@ export const TOOL_DEFS = [
           'project: per-project durable memory (default). global: cross-project user memory under $KIMI_CODE_HOME/kimi-memory/_global/.',
         ),
       type: z
-        .enum(['working', 'episodic', 'semantic', 'procedural', 'conclusion', 'skill'])
+        .enum([
+          'working',
+          'episodic',
+          'semantic',
+          'procedural',
+          'conclusion',
+          'skill',
+          'context_snapshot',
+        ])
         .describe(
-          'Memory type. conclusion is the higher-order type that synthesizes N underlying memories via the synthesizes[] input. skill is a v10 trigger-matching memory matched against tool invocations via matchSkillTriggers.',
+          'Memory type. conclusion synthesizes N underlying memories. skill is matched against tool invocations. context_snapshot is for auto-extracted project state / plans / current-investigation lines — ranked below durable facts.',
         ),
       title: z.string().max(500).optional(),
       content: z.string().min(1).max(200000).describe('Memory body.'),
@@ -84,7 +92,9 @@ export const TOOL_DEFS = [
         .min(1)
         .max(500)
         .describe('Search query. Supports basic FTS5 operators: "exact phrase" or -exclude.'),
-      type: z.enum(['working', 'episodic', 'semantic', 'procedural']).optional(),
+      type: z
+        .enum(['working', 'episodic', 'semantic', 'procedural', 'context_snapshot'])
+        .optional(),
       limit: z.number().int().min(1).max(200).optional(),
       // Note: `recent_first` and `sort_by` were removed from the schema
       // (Audit SG-3). Results are always FTS-ranked; the per-type and
@@ -165,7 +175,15 @@ export const TOOL_DEFS = [
           'project: this project only. global: _global DB only. all: project + global, project first (default all).',
         ),
       type: z
-        .enum(['working', 'episodic', 'semantic', 'procedural', 'conclusion', 'skill'])
+        .enum([
+          'working',
+          'episodic',
+          'semantic',
+          'procedural',
+          'conclusion',
+          'skill',
+          'context_snapshot',
+        ])
         .optional(),
       status: z.enum(['active', 'superseded', 'deleted']).optional(),
       limit: z.number().int().min(1).max(500).optional(),
@@ -504,9 +522,11 @@ export const TOOL_DEFS = [
     input: {
       cwd: z.string().describe('Project root (absolute path). Required.'),
       scope: z
-        .enum(['project', 'global'])
+        .enum(['project', 'global', 'all'])
         .optional()
-        .describe('project: per-project durable memory (default). global: _global DB only.'),
+        .describe(
+          'project: this project only (default). global: _global DB only. all: project + global.',
+        ),
       id: z.string().min(4).max(64).describe('Conclusion memory id.'),
       limit: z.number().int().min(1).max(500).optional(),
     },
@@ -851,6 +871,20 @@ export const TOOL_DEFS = [
       cwd: z.string().describe('Project root (absolute path). Required.'),
       job_id: z.string().min(4).max(64).describe('Dream job id.'),
       reason: z.string().max(500).optional().describe('Optional discard reason.'),
+    },
+  },
+  {
+    name: 'dreaming',
+    desc: 'Configure and run the dreaming subsystem that consolidates, combines, and prunes memories on a wall-clock floor. The `args` field is a JSON object stringified before send. Allowed keys: sub (one of: status, on, off, auto, run, last), scope (project or global), interval_spec (e.g. 30m, 3h, 24h, 1d), interval_ms (integer ms; mutually exclusive with interval_spec), include (comma-separated subset of consolidate,dream,gc), exclude (comma-separated subset), force (true|false).',
+    input: {
+      cwd: z.string().describe('Project root (absolute path). Required.'),
+      args: z
+        .string()
+        .min(2)
+        .max(4000)
+        .describe(
+          'JSON-stringified object of options. See tool description for keys. Examples: "{\\"sub\\":\\"status\\"}" or "{\\"sub\\":\\"on\\",\\"interval_spec\\":\\"3h\\"}" or "{\\"sub\\":\\"run\\",\\"force\\":true}".',
+        ),
     },
   },
 ];

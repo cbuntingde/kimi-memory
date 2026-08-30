@@ -269,23 +269,41 @@ export function register(server, handlers, home) {
     home,
   );
 
-  // ---- memory_parents (inverse: parents of a conclusion) ----
+  // ---- memory_parents (inverse: parents of a conclusion; honors project|global|all) ----
   registerTool(
     server,
     D.memory_parents,
     async (args, ctx) => {
+      // ctx.scope is already resolved by the wrapper's auto-detect
+      // (this tool's Zod schema includes 'all', so the wrapper
+      // treats it as a read tool and defaults scope to 'all').
+      // Validate at the handler boundary so a malformed caller arg
+      // surfaces as a tool error rather than a silent fallback.
+      const sc = validateScope(args.scope, { read: true });
+      if (!sc.ok) throw toolError(sc.error);
       const id = validateId(args.id);
       if (!id.ok) throw toolError(id.error);
       const lim = validateLimit(args.limit, 1, 500, 200);
       if (!lim.ok) throw toolError(lim.error);
-      if (!ctx.db) throw toolError(`memory not found: ${id.value}`);
-      const items = getParents(ctx.db, ctx.projectKey, id.value, { limit: lim.value });
+      const scope = ctx.scope || sc.value;
+      const merged = [];
+      if (scope === 'project' || scope === 'all') {
+        const items = getParents(ctx.db, ctx.projectKey, id.value, { limit: lim.value });
+        merged.push(...items.map((m) => ({ ...m, scope: 'project' })));
+      }
+      if (scope === 'global' || scope === 'all') {
+        const target = openScopeDbInner({ cwd: ctx.cwd, scope: 'global', home });
+        if (target.db) {
+          const items = getParents(target.db, GLOBAL_PROJECT_KEY, id.value, { limit: lim.value });
+          merged.push(...items.map((m) => ({ ...m, scope: 'global' })));
+        }
+      }
       return {
         operation: 'parents',
-        scope: ctx.scope,
+        scope,
         id: id.value,
-        items,
-        count: items.length,
+        items: merged,
+        count: merged.length,
         project_key: ctx.projectKey,
       };
     },

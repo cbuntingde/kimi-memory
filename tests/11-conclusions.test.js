@@ -199,6 +199,12 @@ test('validateType accepts the new conclusion type', () => {
   assert.equal(v.value, 'conclusion');
 });
 
+test('validateType accepts context_snapshot for auto-extracted state / plans', () => {
+  const v = validateType('context_snapshot');
+  assert.equal(v.ok, true);
+  assert.equal(v.value, 'context_snapshot');
+});
+
 test('MCP round-trip: memory_save with synthesizes → memory_conclusions_for → memory_parents', async () => {
   const home = mkTempHome();
   const cwd = 'C:/test/conclusion-mcp';

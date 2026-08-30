@@ -8,7 +8,7 @@ import { mkdirSync, statSync } from 'node:fs';
 import path from 'node:path';
 import { logPersistError } from '../diagnostics.js';
 
-const SCHEMA_VERSION = 15;
+const SCHEMA_VERSION = 16;
 
 // Schema migrations. Each entry is idempotent: it inspects the live
 // schema, no-ops when its target shape is already in place, and
@@ -744,6 +744,85 @@ const MIGRATIONS = [
     if (!idx)
       db.exec('CREATE INDEX idx_consolidation_runs_project ON consolidation_runs(project_key, at)');
   },
+
+  // v16: extend the memories CHECK to include 'context_snapshot'. This
+  // is the durable home for auto-extracted project state, plans, and
+  // "looking at X, checking Y" narration lines that the user wants
+  // recallable but should not rank above durable facts. Same
+  // probe-then-rebuild shape as migrateAddSkillType (v10): read the
+  // CREATE TABLE SQL from sqlite_master, short-circuit if the new
+  // type is already in the CHECK. The rebuild drops + recreates
+  // memories + memories_fts and re-applies every index in SCHEMA_SQL,
+  // mirroring the v10 path exactly.
+  function migrateAddContextSnapshotType(db) {
+    const createSql =
+      db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='memories'").get()
+        ?.sql || '';
+    const hasContextSnapshot = /type\s+IN\s*\([^)]*\bcontext_snapshot\b/i.test(createSql);
+    if (hasContextSnapshot) return;
+    db.exec(`
+      BEGIN;
+      CREATE TABLE memories_new (
+        id            TEXT PRIMARY KEY,
+        project_key   TEXT NOT NULL,
+        type          TEXT NOT NULL CHECK (type IN ('working','episodic','semantic','procedural','conclusion','skill','context_snapshot')),
+        title         TEXT,
+        content       TEXT NOT NULL,
+        tags          TEXT NOT NULL DEFAULT '[]',
+        metadata      TEXT NOT NULL DEFAULT '{}',
+        provenance    TEXT NOT NULL DEFAULT '{}',
+        confidence    REAL NOT NULL DEFAULT 0.8,
+        status        TEXT NOT NULL DEFAULT 'active' CHECK (status IN ('active','superseded','deleted')),
+        priority      INTEGER NOT NULL DEFAULT 0,
+        supersedes    TEXT,
+        superseded_by TEXT,
+        created_at    TEXT NOT NULL,
+        updated_at    TEXT NOT NULL,
+        expires_at    TEXT,
+        embedding       BLOB,
+        embedding_model TEXT,
+        embedding_dim   INTEGER,
+        embedded_at     TEXT,
+        access_count     INTEGER NOT NULL DEFAULT 0,
+        last_accessed_at TEXT,
+        last_embed_error TEXT,
+        stability_days    REAL NOT NULL DEFAULT 30,
+        last_rehearsed_at TEXT,
+        visibility TEXT NOT NULL DEFAULT 'private' CHECK (visibility IN ('private','team','restricted','agent','task')),
+        shared_with TEXT NOT NULL DEFAULT '[]',
+        team_id     TEXT,
+        agent_id    TEXT,
+        user_id     TEXT,
+        session_id  TEXT,
+        task_id     TEXT,
+        tier        TEXT NOT NULL DEFAULT 'L0' CHECK (tier IN ('L0','L1','L2','L3')),
+        persona_id  TEXT,
+        is_session_focus INTEGER NOT NULL DEFAULT 0
+      );
+      INSERT INTO memories_new
+        SELECT id, project_key, type, title, content, tags, metadata, provenance,
+               confidence, status, priority, supersedes, superseded_by,
+               created_at, updated_at, expires_at,
+               embedding, embedding_model, embedding_dim, embedded_at,
+               access_count, last_accessed_at, last_embed_error,
+               stability_days, last_rehearsed_at,
+               visibility, shared_with, team_id, agent_id, user_id, session_id, task_id,
+               tier, persona_id, is_session_focus
+        FROM memories;
+      DROP TABLE memories;
+      ALTER TABLE memories_new RENAME TO memories;
+      CREATE INDEX idx_memories_project_type   ON memories(project_key, type);
+      CREATE INDEX idx_memories_project_status ON memories(project_key, status);
+      CREATE INDEX idx_memories_expires        ON memories(expires_at);
+      CREATE INDEX idx_memories_supersedes     ON memories(supersedes);
+      CREATE INDEX idx_memories_embedded_at    ON memories(embedded_at);
+      CREATE INDEX idx_memories_project_embedding_dim ON memories(project_key, embedding_dim);
+      DELETE FROM memories_fts;
+      INSERT INTO memories_fts (id, project_key, type, title, content, tags)
+        SELECT id, project_key, type, title, content, tags FROM memories;
+      COMMIT;
+    `);
+  },
 ];
 
 const SCHEMA_SQL = `
@@ -755,7 +834,7 @@ CREATE TABLE IF NOT EXISTS schema_meta (
 CREATE TABLE IF NOT EXISTS memories (
   id            TEXT PRIMARY KEY,
   project_key   TEXT NOT NULL,
-  type          TEXT NOT NULL CHECK (type IN ('working','episodic','semantic','procedural')),
+  type          TEXT NOT NULL CHECK (type IN ('working','episodic','semantic','procedural','context_snapshot')),
   title         TEXT,
   content       TEXT NOT NULL,
   tags          TEXT NOT NULL DEFAULT '[]',  -- JSON array

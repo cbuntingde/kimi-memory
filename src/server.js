@@ -39,12 +39,10 @@ import { register as registerConversations } from './mcp/handlers/conversations.
 import { register as registerEdges } from './mcp/handlers/edges.js';
 import { register as registerMaintenance } from './mcp/handlers/maintenance.js';
 import { register as registerDream } from './mcp/handlers/dream.js';
+import { register as registerDreaming } from './mcp/handlers/dreaming.js';
 import { register as registerAcl } from './mcp/handlers/acl.js';
 import { register as registerTier } from './mcp/handlers/tier.js';
 import { register as registerCodegraph } from './mcp/handlers/codegraph.js';
-
-// Re-export TOOL_DEFS so the proxy can read the same array without
-// importing the orchestrator directly. Source of truth remains
 // src/mcp/tool-defs.js; per-domain handler modules look tools up by
 // name via the TOOL_DEFS_BY_NAME sibling export.
 export { TOOL_DEFS };
@@ -89,8 +87,8 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
   registerConversations(server, handlers, home);
   registerEdges(server, handlers, home);
   registerMaintenance(server, handlers, home);
+  registerDreaming(server, handlers, home);
   registerDream(server, handlers, home);
-
   // Legacy subsystems (20 tools): ACL/visibility, tier/persona,
   // codegraph. Each module self-gates on
   // KIMI_MEMORY_LEGACY_SUBSYSTEMS and returns early when the env var
