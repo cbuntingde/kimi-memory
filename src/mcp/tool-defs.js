@@ -657,6 +657,22 @@ export const TOOL_DEFS = [
       descriptor: z.string().min(1).max(256).describe('Principal descriptor (kind:id).'),
     },
   },
+  // ----- v18 cross-project promotion -----
+  // Distinct from acl_share_memory (which targets the deprecated
+  // _shared pool). Targets the always-on _global store; not gated by
+  // KIMI_MEMORY_LEGACY_SUBSYSTEMS.
+  {
+    name: 'memory_promote_to_global',
+    desc: 'Move one or more project memories into the cross-project _global store at $KIMI_CODE_HOME/kimi-memory/_global/memory.sqlite. The source rows are removed from the project DB; the moved rows keep the same id with project_key="_global". Use when auto-extract under-classified a fact (it stayed in the project DB when it should have gone to global) or when the operator is reconciling a project cache. Returns { moved: [{id, new_global_id, type, title}], skipped: [{id, reason}] }. Idempotent: re-running with the same ids returns the moved rows in `skipped` with reason "not_found".',
+    input: {
+      cwd: z.string().describe('Project root (absolute path). Required.'),
+      memory_ids: z
+        .array(z.string().min(4).max(64))
+        .min(1)
+        .max(500)
+        .describe('Source memory ids to promote from the project DB.'),
+    },
+  },
   // ----- v10 tier / persona -----
   {
     name: 'memory_set_tier',

@@ -56,7 +56,7 @@ test('sessionFocusTitle: truncates long prompts, keeps short ones whole', () => 
   assert.equal(sessionFocusTitle(null), 'Last focus: (no prompt summary)');
 });
 
-test('readSessionUserPrompts: returns oldest → newest, ignores empty summaries', () => {
+test('readSessionUserPrompts: returns oldest → newest, falls back to payload when summary is empty', () => {
   const home = mkTempHome();
   const key = deriveProjectKey('C:/test/focus-prompts');
   const db = openDb(projectDbPath(home, key));
@@ -64,10 +64,26 @@ test('readSessionUserPrompts: returns oldest → newest, ignores empty summaries
     const insert = db.prepare(
       'INSERT INTO conversation_events (project_key, session_id, line_no, byte_offset, role, kind, summary, payload, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
     );
+    // line 1: summary has text → surfaced from `summary`.
     insert.run(key, 'sess1', 1, 100, 'user', 'message', 'first', '{}', '2026-08-01T00:00:00Z');
-    insert.run(key, 'sess1', 2, 200, 'user', 'message', '', '{}', '2026-08-01T00:00:01Z');
+    // line 2: summary is empty but payload contains text the wire
+    // extractor would have surfaced → surfaced via the payload fallback.
+    insert.run(
+      key,
+      'sess1',
+      2,
+      200,
+      'user',
+      'message',
+      '',
+      JSON.stringify({ type: 'turn.prompt', input: 'fallback from payload' }),
+      '2026-08-01T00:00:01Z',
+    );
+    // line 3: assistant — filtered by role, never returned.
     insert.run(key, 'sess1', 3, 300, 'assistant', 'message', 'reply', '{}', '2026-08-01T00:00:02Z');
+    // line 4: another summary-bearing user prompt.
     insert.run(key, 'sess1', 4, 400, 'user', 'message', 'second', '{}', '2026-08-01T00:00:03Z');
+    // line 5: different session — must not leak.
     insert.run(
       key,
       'sess2',
@@ -83,11 +99,38 @@ test('readSessionUserPrompts: returns oldest → newest, ignores empty summaries
     const r = readSessionUserPrompts(db, key, 'sess1', { limit: 5 });
     assert.deepEqual(
       r.map((p) => p.prompt),
-      ['first', 'second'],
+      ['first', 'fallback from payload', 'second'],
     );
     assert.deepEqual(
       r.map((p) => p.line_no),
-      [1, 4],
+      [1, 2, 4],
+    );
+    assert.deepEqual(
+      r.map((p) => p.source),
+      ['summary', 'payload', 'summary'],
+    );
+  } finally {
+    closeDb();
+    rmRf(home);
+  }
+});
+
+test('readSessionUserPrompts: drops rows where summary AND payload are both empty', () => {
+  const home = mkTempHome();
+  const key = deriveProjectKey('C:/test/focus-empty');
+  const db = openDb(projectDbPath(home, key));
+  try {
+    const insert = db.prepare(
+      'INSERT INTO conversation_events (project_key, session_id, line_no, byte_offset, role, kind, summary, payload, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+    );
+    insert.run(key, 'sess1', 1, 100, 'user', 'message', 'first', '{}', '2026-08-01T00:00:00Z');
+    insert.run(key, 'sess1', 2, 200, 'user', 'message', '', '{}', '2026-08-01T00:00:01Z');
+    insert.run(key, 'sess1', 3, 300, 'user', 'message', 'third', '{}', '2026-08-01T00:00:02Z');
+
+    const r = readSessionUserPrompts(db, key, 'sess1', { limit: 5 });
+    assert.deepEqual(
+      r.map((p) => p.prompt),
+      ['first', 'third'],
     );
   } finally {
     closeDb();
@@ -175,6 +218,112 @@ test('captureSessionFocus: below threshold → skipped, no memory written', asyn
     assert.equal(r.skipped, 'below_threshold');
     assert.equal(r.written, 0);
     assert.equal(listMemories(db, key, {}).length, 0);
+  } finally {
+    closeDb();
+    rmRf(home);
+  }
+});
+
+test('captureSessionFocus: payload-only prompt with no summary still writes a focus row', async () => {
+  // Wire-ingest sometimes drops `summary` (LLM call skipped, malformed
+  // message) but `payload` retains the raw text. The permissive pass
+  // surfaces such events so the focus row lands and the next session
+  // has a thread to pick up.
+  const home = mkTempHome();
+  const key = deriveProjectKey('C:/test/focus-payload');
+  const db = openDb(projectDbPath(home, key));
+  try {
+    const insert = db.prepare(
+      'INSERT INTO conversation_events (project_key, session_id, line_no, byte_offset, role, kind, summary, payload, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+    );
+    insert.run(
+      key,
+      'sess-payload',
+      1,
+      100,
+      'user',
+      'message',
+      '',
+      JSON.stringify({ type: 'turn.prompt', input: 'first payload-only prompt' }),
+      '2026-08-01T00:00:00Z',
+    );
+    insert.run(
+      key,
+      'sess-payload',
+      2,
+      200,
+      'user',
+      'message',
+      '',
+      JSON.stringify({ type: 'turn.prompt', input: 'second payload-only prompt' }),
+      '2026-08-01T00:00:01Z',
+    );
+    const r = await captureSessionFocus({
+      db,
+      projectKey: key,
+      sessionId: 'sess-payload',
+      saveMemory,
+    });
+    assert.equal(r.skipped, null);
+    assert.equal(r.written, 1);
+    assert.ok(r.id, 'returns the saved memory id');
+    const m = listMemories(db, key, {})[0];
+    assert.match(m.title, /^Last focus: second payload-only prompt/);
+    assert.match(m.content, /first payload-only prompt/);
+    assert.match(m.content, /second payload-only prompt/);
+  } finally {
+    closeDb();
+    rmRf(home);
+  }
+});
+
+test('captureSessionFocus: user events with no text body at all → no_user_prompt_text', async () => {
+  // User-role events that have neither `summary` nor extractable text
+  // in `payload` must skip cleanly with the dedicated reason. The
+  // diagnostic line stays unambiguous for the operator.
+  const home = mkTempHome();
+  const key = deriveProjectKey('C:/test/focus-empty-text');
+  const db = openDb(projectDbPath(home, key));
+  try {
+    const insert = db.prepare(
+      'INSERT INTO conversation_events (project_key, session_id, line_no, byte_offset, role, kind, summary, payload, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+    );
+    insert.run(key, 'sess-empty', 1, 100, 'user', 'tool_call', '', '{}', '2026-08-01T00:00:00Z');
+    insert.run(key, 'sess-empty', 2, 200, 'user', 'tool_call', '', '{}', '2026-08-01T00:00:01Z');
+    const r = await captureSessionFocus({
+      db,
+      projectKey: key,
+      sessionId: 'sess-empty',
+      saveMemory,
+    });
+    assert.equal(r.skipped, 'no_user_prompt_text');
+    assert.equal(r.written, 0);
+    assert.equal(listMemories(db, key, {}).length, 0);
+  } finally {
+    closeDb();
+    rmRf(home);
+  }
+});
+
+test('captureSessionFocus: zero user events → below_threshold (unchanged)', async () => {
+  // Regression guard: the empty-session path must still report
+  // `below_threshold`, not the new `no_user_prompt_text` reason.
+  const home = mkTempHome();
+  const key = deriveProjectKey('C:/test/focus-no-user');
+  const db = openDb(projectDbPath(home, key));
+  try {
+    // Seed an assistant-only event so the session has rows but no user-role ones.
+    db.prepare(
+      'INSERT INTO conversation_events (project_key, session_id, line_no, byte_offset, role, kind, summary, payload, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+    ).run(key, 'sess-no-user', 1, 100, 'assistant', 'message', 'ack', '{}', '2026-08-01T00:00:00Z');
+    const r = await captureSessionFocus({
+      db,
+      projectKey: key,
+      sessionId: 'sess-no-user',
+      saveMemory,
+    });
+    assert.equal(r.skipped, 'below_threshold');
+    assert.equal(r.written, 0);
   } finally {
     closeDb();
     rmRf(home);
@@ -385,6 +534,70 @@ test('Stop captures session focus; SessionStart surfaces it on a fresh project',
     assert.match(
       start.stdout,
       /\[focus\] "Last focus: second prompt — narrowing down" \(working\)/,
+    );
+  } finally {
+    rmRf(home);
+  }
+});
+
+test('Stop → SessionStart end-to-end: <system-reminder> blocks in user prompts are stripped from the focus row', () => {
+  // End-to-end regression for the wire.js reminder-stripping fix. The
+  // host runtime injects <system-reminder>...</system-reminder> blocks
+  // into user prompts as tooling guidance (todo reminders, hook results,
+  // session reminders). The wire ingest must strip those blocks before
+  // they land in conversation_events.summary; this test pins that
+  // contract end-to-end through the Stop → SessionStart pipeline.
+  //
+  // The pre-fix bug was: focus rows captured the literal reminder
+  // text as the user's "last prompt", contaminating durable memory
+  // and the next session's focus preview. The fix is in wire.js
+  // stripSystemReminders; this test guards the integration.
+  const home = mkTempHome();
+  try {
+    const cwd = 'C:/example/proj-focus-clean';
+    const session = 's-focus-reminder';
+    const workKey = 'wk-focus-reminder';
+    const sessDir = path.join(home, 'sessions', workKey, session);
+    // Realistic wire.jsonl shape: the runtime prefixes the user
+    // prompt with a <system-reminder> block before the user's own
+    // words. Both events end up as user-role rows; the focus row's
+    // title and body must come from the clean suffix only.
+    writeJsonl(path.join(sessDir, 'wire.jsonl'), [
+      {
+        role: 'user',
+        text: '<system-reminder>\nThe TodoList tool has not been updated recently.\n</system-reminder>\n\nfirst prompt of the session',
+        created_at: '2026-08-01T00:00:00Z',
+      },
+      { role: 'assistant', text: 'ack', created_at: '2026-08-01T00:00:01Z' },
+      {
+        role: 'user',
+        text: '<system-reminder>advisor nudge</system-reminder>\n\nsecond prompt — narrowing down',
+        created_at: '2026-08-01T00:00:02Z',
+      },
+    ]);
+    writeJsonl(path.join(home, 'session_index.jsonl'), [
+      { sessionId: session, workDirKey: workKey },
+    ]);
+
+    const stop = runHook('Stop', { cwd, session_id: session }, { home });
+    assert.equal(stop.status, 0, 'Stop hook must succeed with reminder-contaminated prompts');
+
+    const start = runHook('SessionStart', { cwd, session_id: 's-focus-clean-next' }, { home });
+    assert.equal(start.status, 0);
+    // Focus line surfaces in the SessionStart stdout — verify the
+    // title carries the user's actual text, not the reminder.
+    assert.match(
+      start.stdout,
+      /\[focus\] "Last focus: second prompt — narrowing down" \(working\)/,
+      'focus title must come from the clean user text, not the reminder',
+    );
+    // Belt-and-braces: no <system-reminder> token in any focus-related
+    // stdout. The SessionStart focus line preview, the recent-summary
+    // block, and any thread block are all expected to be clean.
+    assert.equal(
+      /<system-reminder/i.test(start.stdout),
+      false,
+      `SessionStart stdout must not contain <system-reminder>; got:\n${start.stdout}`,
     );
   } finally {
     rmRf(home);

@@ -132,9 +132,75 @@ Auto-extraction is automatic and fully hands-off. The user does NOT want to manu
 
 In addition to the rules above, also extract project build/stack details when present (build commands, test commands, dependency update policy, short stack summary). Use type="semantic" for build/stack and type="procedural" for the dependency update policy.
 
-Respond with a JSON array. Each entry: { "type": "semantic"|"episodic"|"procedural"|"context_snapshot", "title": "<=80 chars", "content": "<=500 chars", "tags": ["<short tag>", ...] }.
+SCOPE — every candidate also carries a scope field that decides which store the row lands in:
 
-Aim for 3-6 candidates per call: a mix of durable facts (semantic / episodic / procedural) and at least one context_snapshot whenever the conversation describes current state, an in-flight task, or a stated plan. Return [] only when the transcript is genuinely empty of state worth recalling. No prose, no markdown fences — JSON only.`;
+* "project" (default if omitted) — facts about the active repository, its conventions, its current state. Lives in the per-project DB and surfaces only when the user is in this project.
+* "global" — cross-project facts the agent should recall no matter which repository is open. Use ONLY for:
+    * user preferences ("user prefers dark mode", "user always runs npm run check before commit")
+    * environment facts ("GitHub handle is cbunt", "default shell is bash")
+    * reusable procedures ("to onboard on a new machine: …")
+    * cross-project conventions or policies the user has stated
+  When in doubt, default to "project" — over-classifying as global pollutes the cross-project store and dilutes recall.
+
+Respond with a JSON array. Each entry: { "type": "semantic"|"episodic"|"procedural"|"context_snapshot", "scope": "project"|"global" (optional, defaults to "project"), "title": "<=80 chars", "content": "<=500 chars", "tags": ["<short tag>", ...] }.
+
+Aim for 3-6 candidates per call: a mix of durable facts (semantic / episodic / procedural) and at least one context_snapshot whenever the conversation describes current state, an in-flight task, or a stated plan. At most one global candidate per call; the cross-project store should grow slowly. Return [] only when the transcript is genuinely empty of state worth recalling. No prose, no markdown fences — JSON only.`;
+
+// Stack-tool patterns. Each entry matches the tool's name (word-boundary)
+// anywhere in a script body — so `jest --watch`, `npx jest`, and
+// `node ./node_modules/.bin/jest` all trigger the "jest" tag. The
+// detector scans every script in package.json, not just `build` /
+// `test`, so a `lint:fix: "eslint --fix"` still surfaces "eslint".
+//
+// The previous detector only matched devDependency names (`typescript`
+// in deps, `packageManager` field), which left bare-Node projects
+// (no `packageManager`, no `typescript` dep, `scripts.test: "node
+// --test"`) labeled as `Stack: unknown` — useless for the agent. The
+// regex scan covers that common case without requiring the manifest
+// to declare each tool as a dependency. A false positive here is
+// harmless: the tag is informational, not authoritative.
+const STACK_TOOL_PATTERNS = [
+  // Test runners (most common bare-Node case is `node --test`)
+  { re: /\bnode\s+--test\b/, tag: 'node (test runner)' },
+  { re: /\bjest\b/, tag: 'jest' },
+  { re: /\bvitest\b/, tag: 'vitest' },
+  { re: /\bmocha\b/, tag: 'mocha' },
+  { re: /\bava\b/, tag: 'ava' },
+  { re: /\btap\b/, tag: 'tap' },
+  // TypeScript variants
+  { re: /\btsc\b/, tag: 'typescript (compiler)' },
+  { re: /\btsx\b/, tag: 'tsx' },
+  { re: /\bts-node\b/, tag: 'ts-node' },
+  // Bundlers / build orchestrators
+  { re: /\bvite\b/, tag: 'vite' },
+  { re: /\bwebpack\b/, tag: 'webpack' },
+  { re: /\brollup\b/, tag: 'rollup' },
+  { re: /\besbuild\b/, tag: 'esbuild' },
+  { re: /\bparcel\b/, tag: 'parcel' },
+  { re: /\bturbo\b/, tag: 'turbo' },
+  { re: /\bnx\b/, tag: 'nx' },
+  // Linters / formatters (informational)
+  { re: /\beslint\b/, tag: 'eslint' },
+  { re: /\bprettier\b/, tag: 'prettier' },
+];
+
+// Scan every script body for stack-tool matches. Each tag is emitted
+// at most once even if multiple scripts reference the same tool —
+// duplicates in `stack` would pollute the surfaced memory.
+function detectStackTools(scripts, stack) {
+  if (!scripts || typeof scripts !== 'object') return;
+  const seen = new Set(stack);
+  for (const body of Object.values(scripts)) {
+    if (typeof body !== 'string' || !body) continue;
+    for (const { re, tag } of STACK_TOOL_PATTERNS) {
+      if (seen.has(tag)) continue;
+      if (re.test(body)) {
+        stack.push(tag);
+        seen.add(tag);
+      }
+    }
+  }
+}
 
 // Project metadata detector: reads well-known manifests under the
 // project root and returns a compact summary for build/stack extraction.
@@ -172,6 +238,10 @@ async function detectProjectMetadata(cwd) {
     }
     const hasTypeScript = depNames.some((d) => d === 'typescript' || d.startsWith('@types/'));
     if (hasTypeScript) out.stack.push('typescript');
+    // Regex-based tool detection: covers bare-Node projects
+    // (scripts.test: "node --test"), script-invoked tooling
+    // (`npx jest`), and devDeps the manifest forgot to declare.
+    detectStackTools(scripts, out.stack);
   } catch {
     // package.json missing or unparseable — ignore
   }
@@ -424,7 +494,16 @@ export function parseExtractionResponse(text) {
     const tags = Array.isArray(raw.tags)
       ? raw.tags.filter((t) => typeof t === 'string' && t.length > 0 && t.length <= 64).slice(0, 16)
       : [];
-    out.push({ type, title, content, tags });
+    // Scope: optional, defaults to project. A candidate whose scope is
+    // any value other than 'global' or 'project' is treated as project
+    // (we never reject the whole batch for one bad scope — the type +
+    // content validation already passed and the candidate is otherwise
+    // useful). Global classification is opt-in by the model, never
+    // silent — the dispatcher's default branch handles the value the
+    // model wrote, not the absence of one.
+    const scopeRaw = raw.scope;
+    const scope = scopeRaw === 'global' ? 'global' : 'project';
+    out.push({ type, scope, title, content, tags });
     if (out.length >= MAX_CANDIDATES_PER_CALL) break;
   }
   return out;
@@ -531,6 +610,13 @@ export async function dedupeCandidates({
   candidates,
   searchMemories,
   threshold = 0.85,
+  // Optional: when a candidate carries `scope: 'global'`, dedupe
+  // against the global DB instead of the project DB. Without this,
+  // every "user prefers dark mode" candidate would walk the project
+  // title-overlap stage and never see the cross-project rows that
+  // actually own the concept.
+  globalDb = null,
+  globalProjectKey = '_global',
 }) {
   const kept = [];
   const duplicates = [];
@@ -540,23 +626,51 @@ export async function dedupeCandidates({
   // stage 1 still hit the hybrid recall in stage 2.
   // (Audit finding F-008.)
   const DEDUPE_TITLE_LIMIT = 500;
-  const existing = db
-    .prepare(
-      `SELECT id, title, content FROM memories
+
+  function loadExisting(scopeDb, scopeKey) {
+    return scopeDb
+      .prepare(
+        `SELECT id, title, content FROM memories
          WHERE project_key = ? AND status = 'active'
          ORDER BY datetime(updated_at) DESC, id DESC
          LIMIT ${DEDUPE_TITLE_LIMIT}`,
-    )
-    .all(projectKey)
-    .map((r) => ({
-      id: r.id,
-      title: r.title || '',
-      titleTokens: tokenizeTitle(r.title || ''),
-      content: r.content || '',
-    }));
+      )
+      .all(scopeKey)
+      .map((r) => ({
+        id: r.id,
+        title: r.title || '',
+        titleTokens: tokenizeTitle(r.title || ''),
+        content: r.content || '',
+      }));
+  }
+
+  // Cache per-scope: project candidates dedupe against the project
+  // corpus once; global candidates dedupe against the global corpus
+  // once. Mixing them inside one prepare would either over-fetch or
+  // miss rows; one cache per scope keeps the bound honest.
+  const existingByScope = new Map();
+  function existingFor(scopeKey, scopeDb) {
+    if (!existingByScope.has(scopeKey)) {
+      existingByScope.set(scopeKey, loadExisting(scopeDb, scopeKey));
+    }
+    return existingByScope.get(scopeKey);
+  }
 
   for (const cand of candidates) {
     const candTitleTokens = tokenizeTitle(cand.title || '');
+    // Pick the dedupe target by scope. Global candidates must not be
+    // checked against project rows, and vice versa.
+    const isGlobal = cand.scope === 'global';
+    const targetDb = isGlobal ? globalDb : db;
+    const targetKey = isGlobal ? globalProjectKey : projectKey;
+    if (!targetDb) {
+      // No DB for this scope (e.g. global DB not yet created on a
+      // fresh install). Skip dedupe rather than throwing — the save
+      // path will create the DB on first write.
+      kept.push(cand);
+      continue;
+    }
+    const existing = existingFor(targetKey, targetDb);
     // Stage 1: token overlap against every existing memory's title.
     let dup = null;
     if (candTitleTokens.length > 0) {
@@ -583,7 +697,7 @@ export async function dedupeCandidates({
     // match (rare) — so the LLM call cost stays negligible.
     let hits = [];
     try {
-      hits = await searchMemories(db, projectKey, (cand.title || cand.content || '').trim(), {
+      hits = await searchMemories(targetDb, targetKey, (cand.title || cand.content || '').trim(), {
         limit: 3,
       });
     } catch {
@@ -620,12 +734,26 @@ export async function runAutoExtract({
   existingTitles,
   saveMemory,
   searchMemories,
+  // Optional second DB for cross-project (global) candidates. The
+  // caller (handleAutoExtract) opens both stores once per Stop hook
+  // and passes the handles in. When omitted, every candidate is
+  // treated as project-scoped regardless of the model's `scope`
+  // field — the original behaviour, preserved for tests that don't
+  // exercise the global path.
+  globalDb = null,
+  globalProjectKey = '_global',
   // Injection seam for tests + future override (e.g. KIMI_MEMORY_AUTO_EXTRACT_LLM).
   callLlm = callChat,
   resolveLlmTargetImpl = resolveLlmTarget,
   now = () => Date.now(),
   // Env-driven opt-outs. Tests can override the default.
   isDisabled = () => process.env.KIMI_MEMORY_AUTO_EXTRACT === 'off',
+  // Independent opt-out for the global path. Defaults to on. Setting
+  // KIMI_MEMORY_AUTO_EXTRACT_GLOBAL=off disables the cross-project
+  // branch while leaving the project branch running, so operators
+  // who do not want the cross-project store growing automatically
+  // can keep it frozen without losing the per-project signal.
+  isGlobalDisabled = () => process.env.KIMI_MEMORY_AUTO_EXTRACT_GLOBAL === 'off',
   isConfigDisabled = (cfg) =>
     !!(cfg && cfg['kimi-memory'] && cfg['kimi-memory'].disable_auto_extract),
   // Injection seam for tests: replace the secret detector.
@@ -637,6 +765,7 @@ export async function runAutoExtract({
     saved: 0,
     duplicates: 0,
     secrets_dropped: 0,
+    global_saved: 0,
     error: null,
   };
   if (isDisabled()) {
@@ -690,11 +819,23 @@ export async function runAutoExtract({
   const candidates = parseExtractionResponse(reply);
   result.extracted = candidates.length;
 
+  // The global path is opt-out via env. When disabled, every candidate
+  // is forced to project scope so the model can still emit `scope:
+  // "global"` but the dispatcher reroutes it. This keeps the model
+  // honest (it still classifies) without writing to the cross-project
+  // store — useful for operators who prefer to promote manually.
+  const globalDisabled = isGlobalDisabled();
+  const normalizedCandidates = globalDisabled
+    ? candidates.map((c) => ({ ...c, scope: 'project' }))
+    : candidates;
+
   const { kept, duplicates } = await dedupeCandidates({
     db,
     projectKey,
-    candidates,
+    candidates: normalizedCandidates,
     searchMemories,
+    globalDb,
+    globalProjectKey,
   });
   result.duplicates = duplicates.length;
 
@@ -704,6 +845,7 @@ export async function runAutoExtract({
       projectMeta.stack && projectMeta.stack.length ? projectMeta.stack.join(', ') : 'unknown';
     deterministic.push({
       type: 'semantic',
+      scope: 'project',
       title: 'Project build/stack details',
       content: `Stack: ${stack}. Build: ${projectMeta.buildCommand || 'n/a'}. Test: ${projectMeta.testCommand || 'n/a'}. Update policy: ${projectMeta.updatePolicy || 'n/a'}.`,
       tags: ['build', 'stack', 'project'],
@@ -712,6 +854,7 @@ export async function runAutoExtract({
     if (projectMeta.updatePolicy) {
       deterministic.push({
         type: 'procedural',
+        scope: 'project',
         title: 'Dependency update policy',
         content: projectMeta.updatePolicy,
         tags: ['dependencies', 'updates', 'project'],
@@ -727,7 +870,8 @@ export async function runAutoExtract({
     // typed in the transcript, or it may have invented a key in its
     // own reply. Either way, a candidate that matches a known secret
     // shape is dropped on the floor and counted in the result so the
-    // operator can see what was suppressed.
+    // operator can see what was suppressed. Secret scan runs once
+    // and gates both the project and the global save path.
     if (secretDetector(cand.content) || secretDetector(cand.title)) {
       result.secrets_dropped += 1;
       continue;
@@ -739,7 +883,21 @@ export async function runAutoExtract({
       // ranking alone: durable facts surface first in default order,
       // snapshots still come up via FTS5 search on the next session.
       const isSnapshot = cand.type === 'context_snapshot';
-      saveMemory(db, projectKey, {
+      const isGlobal = cand.scope === 'global';
+      const targetSaveDb = isGlobal ? globalDb : db;
+      const targetSaveKey = isGlobal ? globalProjectKey : projectKey;
+      if (!targetSaveDb) {
+        // No global DB on a fresh install — keep the candidate alive
+        // for next time rather than dropping it silently. The save
+        // path will lazily create the DB on first write.
+        if (isGlobal) {
+          result.error = 'global_db_unavailable';
+          continue;
+        }
+        result.error = 'project_db_unavailable';
+        continue;
+      }
+      saveMemory(targetSaveDb, targetSaveKey, {
         type: cand.type,
         title: cand.title,
         content: cand.content,
@@ -748,6 +906,7 @@ export async function runAutoExtract({
         priority: isSnapshot ? -3 : -1, // snapshots below other auto-extract rows
         provenance: {
           source: 'auto_extract',
+          scope: isGlobal ? 'global' : 'project',
           model: target.model,
           provider: target.provider,
           cwd: cwd || null,
@@ -755,6 +914,7 @@ export async function runAutoExtract({
         },
       });
       result.saved += 1;
+      if (isGlobal) result.global_saved += 1;
     } catch (e) {
       // Never block: a single failed save is logged via result.error and
       // the next candidate proceeds.

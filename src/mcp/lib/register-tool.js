@@ -140,6 +140,7 @@ const WRITE_NAME_PATTERNS = [
   /^acl_grant$/,
   /^acl_revoke$/,
   /^acl_share_memory$/,
+  /^memory_promote_to_global$/,
   /^codegraph_build_edges$/,
   /^dream_enqueue$/,
   /^dream_generate_proposals$/,

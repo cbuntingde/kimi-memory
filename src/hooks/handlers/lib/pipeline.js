@@ -19,6 +19,7 @@ import {
   deriveProjectKey,
   ensureProjectDir,
   GLOBAL_PROJECT_KEY,
+  globalDbPath,
 } from '../../../project-key.js';
 import {
   openDb,
@@ -1020,6 +1021,19 @@ export async function handleAutoExtract(cwd, sessionId) {
   const key = deriveProjectKey(cwd);
   await ensureProjectDir(HOME, key);
   const db = openDb(path.join(HOME, 'kimi-memory', key, 'memory.sqlite'));
+  // Global DB is opened alongside the project DB so the auto-extract
+  // dispatcher can route cross-project candidates to the right store.
+  // The global DB may not exist on a fresh install — `openDb` is
+  // called with the default create flag because `saveMemory` may need
+  // to lazy-create it when the first global candidate lands. The
+  // dispatcher itself tolerates a null handle: it treats the candidate
+  // as a soft error rather than a save.
+  let globalDb = null;
+  try {
+    globalDb = openDb(globalDbPath(HOME));
+  } catch {
+    globalDb = null;
+  }
   try {
     const count = db
       .prepare(
@@ -1042,6 +1056,8 @@ export async function handleAutoExtract(cwd, sessionId) {
       cwd,
       projectKey: key,
       db,
+      globalDb,
+      globalProjectKey: GLOBAL_PROJECT_KEY,
       transcript,
       existingTitles,
       saveMemory,

@@ -34,6 +34,7 @@ import { kimiHome } from './util.js';
 import { TOOL_DEFS } from './mcp/tool-defs.js';
 
 import { register as registerMemoryCrud } from './mcp/handlers/memory-crud.js';
+import { register as registerShare } from './mcp/handlers/share.js';
 import { register as registerWorkingMemory } from './mcp/handlers/working-memory.js';
 import { register as registerConversations } from './mcp/handlers/conversations.js';
 import { register as registerEdges } from './mcp/handlers/edges.js';
@@ -83,6 +84,7 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
   // Always-on domain modules (25 tools): memory CRUD + working memory
   // + conversations + edges + maintenance + dream.
   registerMemoryCrud(server, handlers, home);
+  registerShare(server, handlers, home);
   registerWorkingMemory(server, handlers, home);
   registerConversations(server, handlers, home);
   registerEdges(server, handlers, home);

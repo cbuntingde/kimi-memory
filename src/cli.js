@@ -34,6 +34,7 @@ import { cmdDream } from './cli-cmd/dream.js';
 import { cmdDreaming } from './cli-cmd/dreaming.js';
 import { cmdConsolidate } from './cli-cmd/consolidate.js';
 import { cmdServeHttp } from './cli-cmd/serve-http.js';
+import { cmdPromoteToGlobal } from './cli-cmd/promote-to-global.js';
 
 function printUsage() {
   process.stdout.write(
@@ -62,6 +63,7 @@ function printUsage() {
       '  node src/cli.js dreaming run            [--cwd <path>] [--force] [--include ...] [--exclude ...] [--json]',
       '  node src/cli.js consolidate run    [--cwd <path>] [--json]',
       '  node src/cli.js consolidate status [--cwd <path>] [--json]',
+      '  node src/cli.js promote-to-global [--cwd <path>] --memory-id <id> [--memory-id <id> ...] [--apply] [--json]',
       '',
       'Options:',
       '  --home <dir>     override $KIMI_CODE_HOME',
@@ -111,6 +113,8 @@ async function main() {
         return await cmdConsolidate(args);
       case 'serve-http':
         return await cmdServeHttp(args);
+      case 'promote-to-global':
+        return await cmdPromoteToGlobal(args);
       default:
         printUsage();
         process.exit(1);

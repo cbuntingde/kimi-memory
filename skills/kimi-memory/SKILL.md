@@ -58,7 +58,7 @@ Pick the right scope for every fact you save or recall:
 
 The full catalog (durable memory, similarity + edges, working memory, sessions, ACL/visibility, tier/persona, codegraph, maintenance, dream) lives in `references/tools.md`. Quick reference:
 
-- **Durable memory**: `memory_save`, `memory_recall`, `memory_list`, `memory_get`, `memory_update`, `memory_delete`, `memory_save_bulk`, `memory_status`, `memory_reinforce`.
+- **Durable memory**: `memory_save`, `memory_recall`, `memory_list`, `memory_get`, `memory_update`, `memory_delete`, `memory_save_bulk`, `memory_status`, `memory_reinforce`, `memory_promote_to_global`.
 - **Similarity + edges**: `memory_similar`, `memory_link`, `memory_unlink`, `memory_edges`, `memory_merge`.
 - **Working memory**: `working_memory_set`, `working_memory_get`, `working_memory_clear`.
 - **Sessions**: `conversation_list`, `conversation_get`, `conversation_search`, `conversation_ingest`.
@@ -73,6 +73,10 @@ Defaults: `memory_save` / `memory_update` / `memory_delete` write to `scope: "pr
 3. If the user states something durable: call `memory_save` with the right scope. Echo the returned `operation`, `scope`, and `memory.id`.
 4. Before answering a recall-style question: `memory_recall` (default `scope: "all"`).
 5. When the topic moves on: update or clear the working-memory slot.
+
+### Auto-extract can emit global candidates
+
+The Stop-hook auto-extract (`src/extract.js:118-…`) reads the conversation and asks the configured model for durable facts. Each candidate carries a `type` (`semantic` / `episodic` / `procedural` / `context_snapshot`) plus an optional `scope` field. When the model writes `scope: "global"`, the dispatcher routes that row to `$KIMI_CODE_HOME/kimi-memory/_global/memory.sqlite` instead of the project DB. Set `KIMI_MEMORY_AUTO_EXTRACT_GLOBAL=off` to demote every global candidate back to project scope without changing the model's classification. When a global candidate lands, it is visible from any project the next session opens.
 
 ### Recall accuracy (v17+)
 

@@ -54,7 +54,10 @@ export function classifyEvent(parsed) {
 }
 
 function contentText(content) {
-  if (typeof content === 'string') return content;
+  if (typeof content === 'string') {
+    const cleaned = stripSystemReminders(content);
+    return cleaned || null;
+  }
   if (!Array.isArray(content)) return null;
   const text = content
     .map((part) => {
@@ -63,8 +66,34 @@ function contentText(content) {
       return part.text || part.content || '';
     })
     .join('');
-  return text || null;
+  if (!text) return null;
+  const cleaned = stripSystemReminders(text);
+  return cleaned || null;
 }
+
+// Strip agent-injected `<system-reminder>…</system-reminder>` blocks
+// from a piece of text. The host runtime injects these blocks into
+// user prompts as tooling guidance (todo list reminders, hook results,
+// session reminders, etc.); they are not the user's own words and must
+// not contaminate durable memories, focus rows, or auto-extract input.
+//
+// Stripping happens after every text-yielding step in `extractSummary`
+// so the conversation_events.summary column carries clean user text.
+// If the entire body was a reminder block, return '' so the caller
+// treats the row as text-empty (Fix 2's readSessionUserPrompts will
+// then drop it via the empty-after-trim filter).
+//
+// The regex matches both complete `<system-reminder>...</system-reminder>`
+// blocks and unclosed leading/trailing fragments, which the runtime
+// occasionally emits. Multi-line blocks are handled by the `s` flag.
+// Non-greedy so two adjacent reminder blocks don't merge into one.
+function stripSystemReminders(text) {
+  if (typeof text !== 'string' || !text) return text;
+  // Pre-compute once; the regex is module-scoped to avoid re-allocation.
+  return text.replace(SYSTEM_REMINDER_RE, '').trim();
+}
+
+const SYSTEM_REMINDER_RE = /<system-reminder\b[^>]*>[\s\S]*?(?:<\/system-reminder>|$)/gi;
 
 export function extractSummary(parsed) {
   if (!parsed || typeof parsed !== 'object') return null;
@@ -82,7 +111,7 @@ export function extractSummary(parsed) {
   }
   // Try common text paths used by agent protocols.
   const fromMessage = parsed.message;
-  if (typeof fromMessage === 'string') return fromMessage;
+  if (typeof fromMessage === 'string') return stripSystemReminders(fromMessage);
   if (fromMessage && typeof fromMessage === 'object') {
     const text = pickString(
       contentText(fromMessage.content),
@@ -92,16 +121,16 @@ export function extractSummary(parsed) {
         ? fromMessage.parts.map((p) => (typeof p === 'string' ? p : (p && p.text) || '')).join('')
         : null,
     );
-    if (text) return text;
+    if (text) return stripSystemReminders(text);
   }
   const fromContent = parsed.content;
-  if (typeof fromContent === 'string') return fromContent;
+  if (typeof fromContent === 'string') return stripSystemReminders(fromContent);
   if (Array.isArray(fromContent)) {
     const text = contentText(fromContent);
     if (text) return text;
   }
   const fromText = pickString(parsed.text, parsed.summary, parsed.delta);
-  if (fromText) return fromText;
+  if (fromText) return stripSystemReminders(fromText);
   if (parsed.tool_call) {
     const t = parsed.tool_call;
     return `[tool_call] ${t.name || t.tool || 'unknown'}(${truncate(safeStringify(t.args || t.arguments || t.input), 240)})`;

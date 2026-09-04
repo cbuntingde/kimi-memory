@@ -7,6 +7,127 @@ prior version is rejected / migrated by the schema upgrade on first open.
 
 ## [Unreleased]
 
+### Changed — `detectProjectMetadata` now regex-scans scripts for stack tools
+
+The auto-extracted "Project build/stack details" memory used to label any
+Node-only repo (no `packageManager` field, no `typescript` dep) as
+`Stack: unknown` — useless for the agent. `src/extract.js` now runs a
+regex scan over every script body in `package.json` against a fixed
+table of well-known tools:
+
+- Test runners: `node --test` → `node (test runner)`, `jest`, `vitest`,
+  `mocha`, `ava`, `tap`
+- TypeScript variants: `tsc` → `typescript (compiler)`, `tsx`, `ts-node`
+- Bundlers: `vite`, `webpack`, `rollup`, `esbuild`, `parcel`, `turbo`,
+  `nx`
+- Linters / formatters: `eslint`, `prettier`
+
+A single tag is emitted per tool even when multiple scripts reference it
+(`lint`, `lint:fix`, `pretest` can all reference `eslint` without
+duplicating the tag in the surfaced memory). Script-invoked tooling
+(`npx jest`, `pnpm dlx eslint`) is matched by the same regex — the tool
+name appears anywhere in the script body.
+
+The devDependency-based `typescript` tag is preserved alongside the new
+`typescript (compiler)` regex tag — they are distinct facts (dep declared
+vs. compiler invoked) and may both apply.
+
+### Fixed — `<system-reminder>` blocks no longer leak into durable memory
+
+`extractSummary` (`src/wire.js`) now strips agent-injected
+`<system-reminder>...</system-reminder>` blocks from extracted user-prompt
+text before storing it in `conversation_events.summary`. The reminder text
+is tooling guidance from the host runtime (todo list reminders, hook
+results, session reminders); it is not the user's own words and was
+silently contaminating focus rows, auto-extract input, and recall hits.
+
+The regex matches both complete blocks (`<system-reminder>...</system-reminder>`)
+and unclosed trailing fragments (rare but observed). When the entire
+payload was a reminder block, `extractSummary` returns `null` so the
+caller treats the row as text-empty. Fix 2's `readSessionUserPrompts`
+then drops it via the empty-after-trim filter, and `captureSessionFocus`
+reports `no_user_prompt_text` instead of writing a contaminated row.
+
+### Added — `KIMI_MEMORY_AUTO_EXTRACT_GLOBAL` env var documented
+
+The cross-project opt-out flag for the auto-extract dispatcher (Fix 1)
+is now documented in the README's Configuration table alongside the
+other env vars.
+
+### Added — `memory_promote_to_global` MCP tool
+
+New always-on MCP tool (`src/mcp/handlers/share.js`, registered in
+`src/server.js`, defined in `src/mcp/tool-defs.js`). Inputs: `cwd` +
+`memory_ids` (1-500 ids). Behaviour: each id is validated, duplicates are
+collapsed, and the persist-layer `promoteMemoryToGlobal` runs the move
+(see CHANGELOG entry above). The handler defensively re-queries the
+global DB after the move and surfaces any row that did not land as a
+`skipped` entry with reason `global_write_missing`.
+
+The tool is intentionally separate from `acl_share_memory` (which
+targets the deprecated `_shared` pool and is gated behind
+`KIMI_MEMORY_LEGACY_SUBSYSTEMS`). `memory_promote_to_global` targets the
+always-on `_global` store, never the ACL pool. The slash command
+`commands/promote.md` walks through the dry-run + apply flow.
+
+`tests/06-manifest.test.js` and `kimi.plugin.json` longDescription both
+bump from 50 → 51 tools to keep the count honest.
+
+### Added — `promoteMemoryToGlobal` persist function + `promote-to-global` CLI/slash command
+
+The new persist-layer function `promoteMemoryToGlobal(db, projectKey, ids, { kimiHomeDir })` (`src/persist/share.js:299-…`) moves one or more rows from the project DB into the cross-project `_global/memory.sqlite` store. The source row is removed; the global row keeps the same id so callers holding the id don't break. The move is a two-phase commit with compensation (writes hit the global DB first, then the source DB deletes; if the source-DB step fails, the global writes are undone).
+
+Defence-in-depth: secret-shape re-scan (`looksLikeSecret`) runs on every candidate before the move. Secret-shaped rows land in the `skipped` list with `reason: 'secret_detected'` rather than being moved; the source row stays in the project DB. Idempotent: re-running with the same ids returns `skipped: [{id, reason: 'not_found'}]` for the rows that already moved.
+
+CLI surface (`src/cli-cmd/promote-to-global.js`, wired into `src/cli.js`): dry run by default, `--apply` to perform the move, `--memory-id` repeatable, `--memory-ids <csv>` shorthand, `--json` output. Slash command at `commands/promote.md`.
+
+### Changed — Auto-extract routes global candidates to the cross-project store
+
+The Stop-hook auto-extract (`src/extract.js:118-…`) previously saved every
+candidate to the active project's DB. The dispatcher now branches on a new
+optional `scope` field the model emits per candidate:
+
+- `scope: "global"` — user preferences, environment facts, reusable
+  procedures. Routes to `$KIMI_CODE_HOME/kimi-memory/_global/memory.sqlite`
+  and becomes visible from any project.
+- `scope: "project"` (default if omitted) — project conventions, current
+  state, build/stack facts. Continues to land in the per-project DB.
+
+The classification rule is added to `EXTRACT_SYSTEM_PROMPT`. Parsing
+(`parseExtractionResponse`, `src/extract.js:396-…`) accepts the new
+optional `scope` field; unknown values fall back to `project` rather than
+rejecting the whole batch. Dedup (`dedupeCandidates`,
+`src/extract.js:547-…`) walks the per-scope corpus so a "user prefers
+dark mode" candidate dedups against the global DB, not the project DB.
+
+Operators who want to freeze the cross-project store without disabling
+the per-project pass can set `KIMI_MEMORY_AUTO_EXTRACT_GLOBAL=off`; the
+dispatcher reroutes every global candidate to project scope. The result
+object gains a `global_saved` count so the hook log records what landed
+where.
+
+### Changed — Permissive session-focus: payload fallback + dedicated empty-text skip
+
+`readSessionUserPrompts` (`src/session-focus.js:73-118`) used to drop every
+user-role event whose `summary` was null or empty, which silently skipped
+sessions where the wire-ingest LLM call had failed or where the user prompt
+was a tool-only command with no text body. The new shape:
+
+- SQL no longer filters by `summary != ''`; all user-role rows are read.
+- Each row's `prompt` is `summary` first; if summary is empty, the row
+  falls back to `extractSummary(JSON.parse(payload))` against the stored
+  raw payload — the same extractor `wire.js` uses at ingest time.
+- Rows whose final prompt is empty after trim are dropped post-fetch so
+  the caller still sees a clean oldest→newest list.
+
+`captureSessionFocus` (`src/session-focus.js`) now splits the old
+`below_threshold` skip into two unambiguous reasons:
+
+- `below_threshold` — zero user-role events in the session.
+- `no_user_prompt_text` — user events exist but none carry any text body.
+
+Both are visible in the hook diagnostic log (`focus=skip:<reason>`).
+
 ### Fixed — Missing imports in `src/hooks/handlers/` broke every hook spawn
 
 Two files in the hook split were missing imports that were always

@@ -32,6 +32,7 @@
 // `{ skipped, written, updated, reason, id?, title? }`.
 
 import { nowIso } from './util.js';
+import { extractSummary } from './wire.js';
 
 // Slice a string on a UTF-16 code-point boundary so a surrogate pair
 // is never split in half. The previous shape used `s.slice(0, N)`
@@ -66,19 +67,29 @@ export function sessionFocusTitle(firstPrompt) {
 }
 
 // Fetch the most recent user prompts for a session, oldest → newest.
-// Reads from `conversation_events` (populated by the wire ingest)
-// and falls back to [] when there are no user-role rows with a
-// non-empty summary. Cheap; the ingest pass only writes events with
-// summaries when the parser can extract one.
+// Reads from `conversation_events` (populated by the wire ingest).
+//
+// Summary extraction: the wire ingest populates `summary` via
+// `extractSummary(parsed)` for textual events; non-textual events
+// (tool calls, system) leave `summary` null. The previous shape
+// dropped every row with an empty summary, which silently skipped
+// sessions where the LLM call that produced summaries had failed or
+// when the user prompt was a tool-only command with no text body.
+// The permissive path:
+//   1. SQL filter no longer rejects empty-summary rows.
+//   2. Each row's prompt text is `summary` first; if summary is empty,
+//      we re-run `extractSummary(JSON.parse(payload))` against the
+//      stored raw payload as a body fallback.
+//   3. After trim, rows whose final prompt is empty are dropped
+//      post-fetch so the caller still sees a clean oldest→newest list.
 export function readSessionUserPrompts(db, projectKey, sessionId, { limit = 5 } = {}) {
   if (!db || !projectKey || !sessionId) return [];
   let rows;
   try {
     rows = db
       .prepare(
-        `SELECT line_no, summary FROM conversation_events
+        `SELECT line_no, summary, payload FROM conversation_events
          WHERE project_key = ? AND session_id = ? AND role = 'user'
-           AND summary IS NOT NULL AND summary != ''
          ORDER BY line_no DESC LIMIT ?`,
       )
       .all(projectKey, sessionId, limit);
@@ -87,10 +98,24 @@ export function readSessionUserPrompts(db, projectKey, sessionId, { limit = 5 } 
   }
   // Reverse so the caller gets oldest → newest (matches the
   // conversation's natural reading order).
-  return rows.reverse().map((r) => ({
-    line_no: r.line_no,
-    prompt: (r.summary || '').replace(/\s+/g, ' ').trim(),
-  }));
+  const mapped = rows.reverse().map((r) => {
+    const summaryText = (r.summary || '').replace(/\s+/g, ' ').trim();
+    if (summaryText) {
+      return { line_no: r.line_no, prompt: summaryText, source: 'summary' };
+    }
+    let payloadText = '';
+    try {
+      const parsed = JSON.parse(r.payload);
+      const extracted = extractSummary(parsed);
+      if (typeof extracted === 'string') {
+        payloadText = extracted.replace(/\s+/g, ' ').trim();
+      }
+    } catch {
+      /* malformed payload — fall through to empty prompt */
+    }
+    return { line_no: r.line_no, prompt: payloadText, source: payloadText ? 'payload' : 'empty' };
+  });
+  return mapped.filter((r) => r.prompt.length > 0);
 }
 
 // Build the body of the focus memory. List the last few prompts so
@@ -150,11 +175,31 @@ export async function captureSessionFocus({
   }
   const prompts = readSessionUserPrompts(db, projectKey, sessionId, { limit: 5 });
   if (prompts.length < minPrompts) {
+    // Two distinct cases used to share `below_threshold`:
+    //   (a) zero user prompts in the session at all
+    //   (b) user prompts exist but none carry any text body
+    // Splitting them keeps the diagnostic line unambiguous for the
+    // operator scanning hook logs.
+    const rawCount = (() => {
+      try {
+        return db
+          .prepare(
+            `SELECT COUNT(*) AS n FROM conversation_events
+             WHERE project_key = ? AND session_id = ? AND role = 'user'`,
+          )
+          .get(projectKey, sessionId).n;
+      } catch {
+        return 0;
+      }
+    })();
     return {
-      skipped: 'below_threshold',
+      skipped: rawCount > 0 ? 'no_user_prompt_text' : 'below_threshold',
       written: 0,
       updated: 0,
-      reason: `prompts=${prompts.length} min=${minPrompts}`,
+      reason:
+        rawCount > 0
+          ? `prompts_with_text=${prompts.length} raw_user_events=${rawCount}`
+          : `prompts=${prompts.length} min=${minPrompts}`,
     };
   }
   const title = sessionFocusTitle(prompts[prompts.length - 1].prompt);

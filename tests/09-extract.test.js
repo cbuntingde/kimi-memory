@@ -76,6 +76,35 @@ test('parseExtractionResponse: rejects unknown types (still strict)', () => {
   assert.equal(out[0].type, 'context_snapshot');
 });
 
+test('parseExtractionResponse: scope="global" candidate is preserved with global flag', () => {
+  const text = `[{"type":"semantic","scope":"global","title":"user prefers dark mode","content":"the user always works in dark mode","tags":["user-preference","theme"]}]`;
+  const out = parseExtractionResponse(text);
+  assert.equal(out.length, 1);
+  assert.equal(out[0].scope, 'global');
+  assert.equal(out[0].type, 'semantic');
+});
+
+test('parseExtractionResponse: scope omitted defaults to project', () => {
+  const text = `[{"type":"semantic","title":"project convention","content":"uses tabs","tags":["style"]}]`;
+  const out = parseExtractionResponse(text);
+  assert.equal(out.length, 1);
+  assert.equal(out[0].scope, 'project');
+});
+
+test('parseExtractionResponse: unknown scope value falls back to project (no batch rejection)', () => {
+  // The model occasionally invents scope values like "shared" or
+  // "cross". Treat any non-{project,global} value as project so a
+  // single bad scope doesn't drop an otherwise-valid candidate.
+  const text = `[
+    {"type":"semantic","scope":"shared","title":"a","content":"valid","tags":[]},
+    {"type":"semantic","scope":"global","title":"b","content":"valid","tags":[]}
+  ]`;
+  const out = parseExtractionResponse(text);
+  assert.equal(out.length, 2);
+  assert.equal(out[0].scope, 'project', 'unknown scope falls back to project');
+  assert.equal(out[1].scope, 'global');
+});
+
 test('parseExtractionResponse: caps at MAX_CANDIDATES_PER_CALL (6)', () => {
   const arr = [];
   for (let i = 0; i < 10; i++)
@@ -631,6 +660,145 @@ test('detectProjectMetadata: returns null when no manifests found', async () => 
   }
 });
 
+test('detectProjectMetadata: bare-Node project (node --test) is detected without devDeps', async () => {
+  // The motivating case: a Node-only repo with no packageManager field,
+  // no typescript dep, and `scripts.test: "node --test --test-reporter=spec
+  // tests/*.test.js"`. Pre-fix this landed as `Stack: unknown` —
+  // useless for the agent. Post-fix the regex scan surfaces
+  // `node (test runner)`.
+  const home = mkTempHome();
+  const projectDir = path.join(home, 'proj');
+  await fs.mkdir(projectDir, { recursive: true });
+  await writeRaw(
+    path.join(projectDir, 'package.json'),
+    JSON.stringify({
+      name: 'bare-node',
+      scripts: {
+        test: 'node --test --test-reporter=spec tests/*.test.js',
+        start: 'node index.js',
+      },
+    }),
+  );
+  try {
+    const meta = await detectProjectMetadata(projectDir);
+    assert.ok(meta);
+    assert.ok(
+      meta.stack.includes('node (test runner)'),
+      `expected 'node (test runner)' in stack, got: ${meta.stack.join(', ')}`,
+    );
+    assert.equal(meta.testCommand, 'node --test --test-reporter=spec tests/*.test.js');
+  } finally {
+    rmRf(home);
+  }
+});
+
+test('detectProjectMetadata: tsc in scripts.build fires the typescript (compiler) tag without a typescript dep', async () => {
+  // The devDependencies check (typescript dep present) is a separate
+  // signal; the regex scan fires even when the dep is missing or only
+  // a peer of a build script.
+  const home = mkTempHome();
+  const projectDir = path.join(home, 'proj');
+  await fs.mkdir(projectDir, { recursive: true });
+  await writeRaw(
+    path.join(projectDir, 'package.json'),
+    JSON.stringify({
+      name: 'tsc-only',
+      scripts: { build: 'tsc -p tsconfig.json', test: 'node --test' },
+      // No `typescript` in devDependencies.
+    }),
+  );
+  try {
+    const meta = await detectProjectMetadata(projectDir);
+    assert.ok(meta);
+    assert.ok(meta.stack.includes('typescript (compiler)'));
+    assert.ok(meta.stack.includes('node (test runner)'));
+  } finally {
+    rmRf(home);
+  }
+});
+
+test('detectProjectMetadata: script-invoked tooling (npx jest) fires the regex tag', async () => {
+  // The detector should not require the tool to appear as a top-level
+  // invocation. `npx jest` and `pnpm vitest run` are common shapes that
+  // still need to land in the stack memory.
+  const home = mkTempHome();
+  const projectDir = path.join(home, 'proj');
+  await fs.mkdir(projectDir, { recursive: true });
+  await writeRaw(
+    path.join(projectDir, 'package.json'),
+    JSON.stringify({
+      name: 'npx-tooling',
+      scripts: { test: 'npx jest --runInBand', lint: 'pnpm dlx eslint .' },
+    }),
+  );
+  try {
+    const meta = await detectProjectMetadata(projectDir);
+    assert.ok(meta);
+    assert.ok(meta.stack.includes('jest'), `expected jest in stack, got: ${meta.stack.join(', ')}`);
+    assert.ok(
+      meta.stack.includes('eslint'),
+      `expected eslint in stack, got: ${meta.stack.join(', ')}`,
+    );
+  } finally {
+    rmRf(home);
+  }
+});
+
+test('detectProjectMetadata: each tag emitted at most once even when multiple scripts mention the same tool', async () => {
+  // `lint`, `lint:fix`, and `pretest` may all reference the same tool.
+  // Dedupe so the surfaced memory row doesn't carry `eslint eslint eslint`.
+  const home = mkTempHome();
+  const projectDir = path.join(home, 'proj');
+  await fs.mkdir(projectDir, { recursive: true });
+  await writeRaw(
+    path.join(projectDir, 'package.json'),
+    JSON.stringify({
+      name: 'dup-tool',
+      scripts: {
+        lint: 'eslint .',
+        'lint:fix': 'eslint . --fix',
+        pretest: 'eslint .',
+      },
+    }),
+  );
+  try {
+    const meta = await detectProjectMetadata(projectDir);
+    assert.ok(meta);
+    const eslintHits = meta.stack.filter((s) => s === 'eslint').length;
+    assert.equal(eslintHits, 1, `eslint should appear once, got ${eslintHits}`);
+  } finally {
+    rmRf(home);
+  }
+});
+
+test('detectProjectMetadata: typescript dep + tsc script produce two distinct tags (typescript + typescript (compiler))', async () => {
+  // Both signals are useful: `typescript` says the package is declared
+  // as a dep; `typescript (compiler)` says it is actively invoked from
+  // a script. They are not the same fact.
+  const home = mkTempHome();
+  const projectDir = path.join(home, 'proj');
+  await fs.mkdir(projectDir, { recursive: true });
+  await writeRaw(
+    path.join(projectDir, 'package.json'),
+    JSON.stringify({
+      name: 'ts-with-dep',
+      scripts: { build: 'tsc -b', test: 'node --test' },
+      devDependencies: { typescript: '^5.0.0' },
+    }),
+  );
+  try {
+    const meta = await detectProjectMetadata(projectDir);
+    assert.ok(meta);
+    assert.ok(meta.stack.includes('typescript'), 'dep-based typescript tag');
+    assert.ok(
+      meta.stack.includes('typescript (compiler)'),
+      'regex-based typescript (compiler) tag',
+    );
+  } finally {
+    rmRf(home);
+  }
+});
+
 test('buildExtractionPrompt: includes projectMeta JSON', () => {
   const prompt = buildExtractionPrompt('hello', [], {
     stack: ['node'],
@@ -696,6 +864,217 @@ test('runAutoExtract: saves deterministic build/stack memories from manifests', 
       closeDb();
     }
   } finally {
+    rmRf(home);
+  }
+});
+
+test('runAutoExtract: global candidate routes to the _global DB, project candidate stays in the project DB', async () => {
+  // Wire a config so runAutoExtract passes the provider-config gate.
+  const home = mkTempHome();
+  try {
+    writeRaw(
+      `${home}/config.toml`,
+      `
+      default_model = "x/m"
+      [providers.x]
+      type="openai"
+      api_key="k"
+      base_url="https://example/v1"
+      [models."x/m"]
+      provider = "x"
+      model = "m"
+    `,
+    );
+    const key = deriveProjectKey('C:/test/extract-global');
+    const projectDb = openDb(projectDbPath(home, key));
+    const globalDbPathLocal = path.join(home, 'kimi-memory', '_global', 'memory.sqlite');
+    await fs.mkdir(path.dirname(globalDbPathLocal), { recursive: true });
+    const globalDb = openDb(globalDbPathLocal);
+    try {
+      const fakeReply = JSON.stringify([
+        {
+          type: 'semantic',
+          scope: 'global',
+          title: 'user prefers dark mode',
+          content: 'the user always works in dark mode across all projects',
+          tags: ['user-preference', 'theme'],
+        },
+        {
+          type: 'procedural',
+          scope: 'project',
+          title: 'run jest before commit',
+          content: 'project-local test workflow',
+          tags: ['test'],
+        },
+      ]);
+      const r = await runAutoExtract({
+        homeDir: home,
+        cwd: 'C:/test',
+        projectKey: key,
+        db: projectDb,
+        globalDb,
+        globalProjectKey: '_global',
+        transcript: 'USER: I prefer dark mode\nUSER: run jest first\nASSISTANT: noted.',
+        saveMemory,
+        searchMemories,
+        callLlm: async () => fakeReply,
+      });
+      assert.equal(r.skipped, null);
+      assert.equal(r.extracted, 2);
+      assert.equal(r.saved, 2);
+      assert.equal(r.global_saved, 1, 'one global candidate was routed to the _global DB');
+      // Project DB has only the project-scoped candidate.
+      const projectRows = listMemories(projectDb, key, {});
+      assert.equal(projectRows.length, 1);
+      assert.equal(projectRows[0].title, 'run jest before commit');
+      // Global DB has only the cross-project candidate.
+      const globalRows = listMemories(globalDb, '_global', {});
+      assert.equal(globalRows.length, 1);
+      assert.equal(globalRows[0].title, 'user prefers dark mode');
+      assert.equal(globalRows[0].provenance.scope, 'global');
+    } finally {
+      closeDb();
+    }
+  } finally {
+    rmRf(home);
+  }
+});
+
+test('runAutoExtract: dedup of a global candidate checks the global DB, not the project DB', async () => {
+  // A "user prefers dark mode" row already exists in the global DB.
+  // The model emits the same fact again; the dispatcher must dedup
+  // it against the global corpus and skip the save.
+  const home = mkTempHome();
+  try {
+    writeRaw(
+      `${home}/config.toml`,
+      `
+      default_model = "x/m"
+      [providers.x]
+      type="openai"
+      api_key="k"
+      base_url="https://example/v1"
+      [models."x/m"]
+      provider = "x"
+      model = "m"
+    `,
+    );
+    const key = deriveProjectKey('C:/test/extract-global-dedup');
+    const projectDb = openDb(projectDbPath(home, key));
+    const globalDbPathLocal = path.join(home, 'kimi-memory', '_global', 'memory.sqlite');
+    await fs.mkdir(path.dirname(globalDbPathLocal), { recursive: true });
+    const globalDb = openDb(globalDbPathLocal);
+    try {
+      // Seed the global DB with the fact.
+      saveMemory(globalDb, '_global', {
+        type: 'semantic',
+        title: 'user prefers dark mode',
+        content: 'cross-project user preference',
+        tags: ['user-preference'],
+        provenance: { source: 'memory_save', scope: 'global' },
+      });
+      const fakeReply = JSON.stringify([
+        {
+          type: 'semantic',
+          scope: 'global',
+          title: 'user prefers dark mode',
+          content: 'the user prefers dark mode',
+          tags: ['user-preference'],
+        },
+      ]);
+      const r = await runAutoExtract({
+        homeDir: home,
+        cwd: 'C:/test',
+        projectKey: key,
+        db: projectDb,
+        globalDb,
+        globalProjectKey: '_global',
+        transcript: 'USER: I prefer dark mode',
+        saveMemory,
+        searchMemories,
+        callLlm: async () => fakeReply,
+      });
+      assert.equal(r.extracted, 1);
+      assert.equal(r.duplicates, 1, 'dedup hit on the global DB');
+      assert.equal(r.saved, 0);
+      assert.equal(r.global_saved, 0);
+      // The project DB is untouched.
+      assert.equal(listMemories(projectDb, key, {}).length, 0);
+      // The global DB still has only the original row.
+      assert.equal(listMemories(globalDb, '_global', {}).length, 1);
+    } finally {
+      closeDb();
+    }
+  } finally {
+    rmRf(home);
+  }
+});
+
+test('runAutoExtract: KIMI_MEMORY_AUTO_EXTRACT_GLOBAL=off reroutes global candidates to project scope', async () => {
+  // The opt-out lets operators freeze the cross-project store while
+  // keeping the project store running. The model still classifies;
+  // the dispatcher just demotes every global candidate.
+  const home = mkTempHome();
+  const prev = process.env.KIMI_MEMORY_AUTO_EXTRACT_GLOBAL;
+  process.env.KIMI_MEMORY_AUTO_EXTRACT_GLOBAL = 'off';
+  try {
+    writeRaw(
+      `${home}/config.toml`,
+      `
+      default_model = "x/m"
+      [providers.x]
+      type="openai"
+      api_key="k"
+      base_url="https://example/v1"
+      [models."x/m"]
+      provider = "x"
+      model = "m"
+    `,
+    );
+    const key = deriveProjectKey('C:/test/extract-global-off');
+    const projectDb = openDb(projectDbPath(home, key));
+    const globalDbPathLocal = path.join(home, 'kimi-memory', '_global', 'memory.sqlite');
+    await fs.mkdir(path.dirname(globalDbPathLocal), { recursive: true });
+    const globalDb = openDb(globalDbPathLocal);
+    try {
+      const fakeReply = JSON.stringify([
+        {
+          type: 'semantic',
+          scope: 'global',
+          title: 'user prefers dark mode',
+          content: 'cross-project user preference',
+          tags: ['user-preference'],
+        },
+        {
+          type: 'semantic',
+          scope: 'project',
+          title: 'project convention',
+          content: 'uses tabs',
+          tags: ['style'],
+        },
+      ]);
+      const r = await runAutoExtract({
+        homeDir: home,
+        cwd: 'C:/test',
+        projectKey: key,
+        db: projectDb,
+        globalDb,
+        globalProjectKey: '_global',
+        transcript: 'USER: I prefer dark mode\nUSER: tabs please',
+        saveMemory,
+        searchMemories,
+        callLlm: async () => fakeReply,
+      });
+      assert.equal(r.saved, 2);
+      assert.equal(r.global_saved, 0, 'no global rows when the opt-out is set');
+      assert.equal(listMemories(projectDb, key, {}).length, 2);
+      assert.equal(listMemories(globalDb, '_global', {}).length, 0);
+    } finally {
+      closeDb();
+    }
+  } finally {
+    if (prev == null) delete process.env.KIMI_MEMORY_AUTO_EXTRACT_GLOBAL;
+    else process.env.KIMI_MEMORY_AUTO_EXTRACT_GLOBAL = prev;
     rmRf(home);
   }
 });

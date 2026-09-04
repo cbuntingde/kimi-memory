@@ -258,10 +258,11 @@ test('memory_prune tool is registered, wired, and documented', () => {
   // The exact count is governed by the regex match above; this hardcode
   // exists to flag a description that claims a different number than the
   // TOOL_DEFS array. Bump this when a new tool is added. Accepts both
-  // the legacy `Tools (50):` phrasing and the post-deprecation
-  // `Tools (50 total; ...):` phrasing that splits the 50 into
-  // always-on + deprecated groups. (50 reflects v14 wiki removal — was 55.)
-  assert.match(long, /Tools \(50(?:\s+total[^)]*)?\)/, 'longDescription must claim 50 tools');
+  // the legacy `Tools (N):` phrasing and the post-deprecation
+  // `Tools (N total; ...):` phrasing that splits the N into
+  // always-on + deprecated groups. (51 reflects v18 adding
+  // memory_promote_to_global — was 50.)
+  assert.match(long, /Tools \(51(?:\s+total[^)]*)?\)/, 'longDescription must claim 51 tools');
   // The slash command exists and links to the tool.
   const pruneCmd = readFileSync(path.join(root, 'commands', 'prune.md'), 'utf8');
   assert.match(pruneCmd, /memory_prune\(/);

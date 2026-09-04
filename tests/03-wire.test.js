@@ -55,6 +55,90 @@ test('extractSummary understands current Kimi wire event shapes', () => {
   assert.match(extractSummary(tool), /^\[tool_call\] Read/);
 });
 
+test('extractSummary strips <system-reminder> blocks from user-prompt text', () => {
+  // The host runtime injects <system-reminder>...</system-reminder> blocks
+  // before the user's actual words. Without stripping, those reminders leak
+  // into the conversation_events.summary column and from there into
+  // durable memories (focus rows, auto-extract input, recall hits). The
+  // fix is to drop the reminder block before returning the text.
+  const cleanUser = {
+    type: 'context.append_message',
+    message: {
+      role: 'user',
+      content: [
+        {
+          type: 'text',
+          text: '<system-reminder>\nThe TodoList tool has not been updated recently.\n</system-reminder>\n\nself review',
+        },
+      ],
+    },
+  };
+  assert.equal(extractSummary(cleanUser), 'self review', 'reminder prefix is stripped');
+
+  // Reminder-only payload: stripping leaves empty text → caller treats
+  // the row as text-empty.
+  const reminderOnly = {
+    type: 'context.append_message',
+    message: {
+      role: 'user',
+      content: [
+        {
+          type: 'text',
+          text: '<system-reminder>\njust a reminder, no user text\n</system-reminder>',
+        },
+      ],
+    },
+  };
+  assert.equal(extractSummary(reminderOnly), null);
+
+  // Reminder embedded in the middle of user text.
+  const midText = {
+    type: 'context.append_message',
+    message: {
+      role: 'user',
+      content: [
+        {
+          type: 'text',
+          text: 'before <system-reminder>note</system-reminder> after',
+        },
+      ],
+    },
+  };
+  assert.equal(extractSummary(midText), 'before  after', 'embedded reminder is removed');
+
+  // Multiple reminders concatenated.
+  const many = {
+    type: 'context.append_message',
+    message: {
+      role: 'user',
+      content: [
+        {
+          type: 'text',
+          text: '<system-reminder>first</system-reminder>USER<system-reminder>second</system-reminder>',
+        },
+      ],
+    },
+  };
+  assert.equal(
+    extractSummary(many),
+    'USER',
+    'non-greedy match keeps the user text between two reminders',
+  );
+
+  // String-shaped message: the fall-through `typeof fromMessage === "string"`
+  // branch must strip reminders too.
+  const stringMsg = { message: '<system-reminder>r</system-reminder>actual prompt' };
+  assert.equal(extractSummary(stringMsg), 'actual prompt');
+
+  // Unclosed reminder block (rare but observed) — strip up to end of text.
+  const unclosed = { message: 'actual <system-reminder>trailing junk with no closing tag' };
+  assert.equal(
+    extractSummary(unclosed),
+    'actual',
+    'unclosed reminder block is stripped to end of text',
+  );
+});
+
 test('extractCreatedAt preserves numeric Kimi timestamps', () => {
   assert.equal(extractCreatedAt({ time: 1785180915985 }), '2026-07-27T19:35:15.985Z');
   assert.equal(extractCreatedAt({ time: 1785180915 }), '2026-07-27T19:35:15.000Z');

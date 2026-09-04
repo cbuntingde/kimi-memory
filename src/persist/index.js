@@ -55,6 +55,7 @@ export {
   validTiers,
   isValidTier,
   shareMemory,
+  promoteMemoryToGlobal,
   setMemoryTier,
   promoteMemory,
   demoteMemory,

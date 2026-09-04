@@ -5,8 +5,9 @@
 // (CRUD, search) import these Sets directly.
 import { nowIso, hashId, shortId } from '../util.js';
 import { looksLikeSecret } from '../extract.js';
-import { openSharedDb } from './connection.js';
+import { openSharedDb, openDb } from './connection.js';
 import { rowToMemory, getMemory } from './memories.js';
+import { globalDbPath } from '../project-key.js';
 import crypto from 'node:crypto';
 
 // v10 ACL / visibility vocabulary. Five visibility levels mirroring
@@ -292,6 +293,229 @@ export function shareMemory(db, projectKey, ids, opts = {}) {
     throw e;
   }
   return { moved: 0, updated };
+}
+
+// Move one or more project memories into the cross-project _global
+// store at $KIMI_CODE_HOME/kimi-memory/_global/memory.sqlite. The
+// source row is removed from the project DB; the row is rewritten
+// into the global DB with project_key='_global' (the id is preserved
+// so callers holding the id don't break). The global DB is lazy-
+// created on first write.
+//
+// The move is a two-phase commit with compensation: the global-DB
+// INSERTs run in their own transaction first, then the source-DB
+// DELETEs run in a second transaction. If the source-DB transaction
+// fails after the global writes committed, the global writes are
+// undone in a compensation pass so the operation is effectively
+// atomic from the caller's view. The shape mirrors shareMemory's
+// toSharedPool=true branch — same node:sqlite one-handle-per-db
+// limitation forces the explicit compensation.
+//
+// Differences from shareMemory(toSharedPool=true):
+//   * Target DB is _global/memory.sqlite, not _shared/memory.sqlite.
+//   * project_key on the moved row becomes '_global'.
+//   * ACL grant tables on the source DB are not touched (global rows
+//     are not ACL-gated).
+//   * shared_with on the moved row is cleared (a principal-grant list
+//     on a project row does not apply after the move).
+//
+// Returns { moved: [{id, new_global_id}], skipped: [{id, reason}] }
+// where:
+//   - moved[i].id is the original project id
+//   - moved[i].new_global_id is the same id, now keyed under _global
+//   - skipped entries cover ids that did not exist in projectKey or
+//     rows that matched a secret shape (defence-in-depth even though
+//     saveMemory already gated the original write).
+//
+// Idempotent: re-running with the same ids is a no-op for rows that
+// were already promoted (they no longer exist in projectKey, so the
+// lookup misses and the id lands in `skipped` with reason='not_found').
+// Idempotency is intentional; the MCP wrapper returns the moved list
+// so callers can tell what changed.
+export function promoteMemoryToGlobal(db, projectKey, ids, { kimiHomeDir, nowOverride } = {}) {
+  if (!Array.isArray(ids) || ids.length === 0) return { moved: [], skipped: [] };
+  if (!kimiHomeDir) {
+    throw new Error('promoteMemoryToGlobal: kimiHomeDir is required');
+  }
+  // Defence-in-depth: refuse to promote a row whose title or content
+  // matches a known credential shape. The save-side assertNoSecret
+  // already blocks the original write, but a row may have been saved
+  // under an older scanner revision or imported via the legacy bulk
+  // path. Re-checking here keeps the cross-DB promotion path clean.
+  const idSet = new Set(ids);
+  const placeholders = [...idSet].map(() => '?').join(',');
+  let candidates;
+  try {
+    candidates = db
+      .prepare(
+        `SELECT id, title, content FROM memories
+         WHERE project_key = ? AND id IN (${placeholders})`,
+      )
+      .all(projectKey, ...idSet);
+  } catch (e) {
+    throw new Error(`promoteMemoryToGlobal: failed to read candidates: ${e && e.message}`);
+  }
+  const foundById = new Map(candidates.map((r) => [r.id, r]));
+  const skipped = [];
+  for (const id of ids) {
+    const r = foundById.get(id);
+    if (!r) {
+      skipped.push({ id, reason: 'not_found' });
+      continue;
+    }
+    if (looksLikeSecret(r.title || '') || looksLikeSecret(r.content || '')) {
+      skipped.push({ id, reason: 'secret_detected' });
+    }
+  }
+  const movableIds = ids.filter((id) => foundById.has(id) && !skipped.find((s) => s.id === id));
+  if (movableIds.length === 0) return { moved: [], skipped };
+
+  const globalDb = openDb(globalDbPath(kimiHomeDir));
+  const now = typeof nowOverride === 'function' ? nowOverride : nowIso;
+  // Phase 1: write into the global DB inside a transaction.
+  const writtenGlobalIds = [];
+  globalDb.exec('BEGIN');
+  try {
+    for (const id of movableIds) {
+      const row = db
+        .prepare('SELECT * FROM memories WHERE id=? AND project_key=?')
+        .get(id, projectKey);
+      if (!row) {
+        // Race: row was deleted between the read above and now. Skip.
+        skipped.push({ id, reason: 'not_found' });
+        continue;
+      }
+      try {
+        globalDb
+          .prepare(
+            `INSERT OR IGNORE INTO memories (
+              id, project_key, type, title, content, tags, metadata, provenance,
+              confidence, status, priority, supersedes, superseded_by,
+              created_at, updated_at, expires_at,
+              embedding, embedding_model, embedding_dim, embedded_at,
+              access_count, last_accessed_at,
+              stability_days, last_rehearsed_at,
+              last_embed_error,
+              visibility, shared_with,
+              team_id, agent_id, user_id, session_id, task_id,
+              tier, persona_id
+            ) VALUES (?, '_global', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          )
+          .run(
+            row.id,
+            row.type,
+            row.title,
+            row.content,
+            row.tags,
+            row.metadata,
+            JSON.stringify({
+              ...(safeParseProvenance(row.provenance) || {}),
+              promoted_from: projectKey,
+              promoted_at: now(),
+            }),
+            row.confidence,
+            row.status,
+            row.priority,
+            row.supersedes,
+            row.superseded_by,
+            row.created_at,
+            now(),
+            row.expires_at,
+            row.embedding,
+            row.embedding_model,
+            row.embedding_dim,
+            row.embedded_at,
+            row.access_count,
+            row.last_accessed_at,
+            row.stability_days,
+            row.last_rehearsed_at,
+            row.last_embed_error,
+            // Global rows are always visible to the user; ACL grants
+            // from the project DB do not apply.
+            'private',
+            JSON.stringify([]),
+            row.team_id,
+            row.agent_id,
+            row.user_id,
+            row.session_id,
+            row.task_id,
+            row.tier,
+            row.persona_id,
+          );
+      } catch (e) {
+        throw new Error(
+          `promoteMemoryToGlobal: failed to insert ${id} into _global: ${e && e.message}`,
+        );
+      }
+      // Mirror into FTS5 on the global DB.
+      const tagTokens = (() => {
+        try {
+          const tagArr = JSON.parse(row.tags || '[]');
+          return Array.isArray(tagArr) ? tagArr.join(' ') : '';
+        } catch {
+          return '';
+        }
+      })();
+      globalDb.prepare('DELETE FROM memories_fts WHERE id=?').run(id);
+      globalDb
+        .prepare(
+          'INSERT INTO memories_fts (id, project_key, type, title, content, tags) VALUES (?, ?, ?, ?, ?, ?)',
+        )
+        .run(id, '_global', row.type, row.title || '', row.content || '', tagTokens);
+      writtenGlobalIds.push(id);
+    }
+    globalDb.exec('COMMIT');
+  } catch (e) {
+    try {
+      globalDb.exec('ROLLBACK');
+    } catch {
+      /* ignore */
+    }
+    throw e;
+  }
+  // Phase 2: source-DB deletes. Compensate on failure.
+  const moved = [];
+  db.exec('BEGIN');
+  try {
+    for (const id of writtenGlobalIds) {
+      db.prepare('DELETE FROM memories WHERE id=? AND project_key=?').run(id, projectKey);
+      db.prepare('DELETE FROM memories_fts WHERE id=?').run(id);
+      moved.push({ id, new_global_id: id });
+    }
+    db.exec('COMMIT');
+  } catch (e) {
+    try {
+      db.exec('ROLLBACK');
+    } catch {
+      /* ignore */
+    }
+    // Compensate: undo the global writes for ids that did make it in.
+    try {
+      globalDb.exec('BEGIN');
+      for (const id of writtenGlobalIds) {
+        globalDb.prepare("DELETE FROM memories WHERE id=? AND project_key='_global'").run(id);
+        globalDb.prepare('DELETE FROM memories_fts WHERE id=?').run(id);
+      }
+      globalDb.exec('COMMIT');
+    } catch {
+      try {
+        globalDb.exec('ROLLBACK');
+      } catch {
+        /* ignore */
+      }
+    }
+    throw e;
+  }
+  return { moved, skipped };
+}
+
+function safeParseProvenance(value) {
+  if (!value) return null;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return null;
+  }
 }
 
 // v10: tier (Chat Memory L0→L1→L2→L3) management. Every transition
