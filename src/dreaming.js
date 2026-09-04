@@ -295,7 +295,7 @@ async function runConsolidatePass(db, projectKey, saveMemory, linkMemory, mergeM
       db,
       projectKey,
       saveMemory,
-      memoryLink,
+      memoryLink: linkMemory,
       mergeMemory,
       mode: 'direct',
     });
