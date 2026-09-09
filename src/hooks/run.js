@@ -21,6 +21,7 @@ import {
   handleStopFailure,
 } from './handlers/stop.js';
 import { handlePostToolUse } from './handlers/post-tool-use.js';
+import { handlePostToolUseFailure } from './handlers/post-tool-use-failure.js';
 import { logHookDiag } from '../diagnostics.js';
 import {
   buildRecallQuery,
@@ -47,6 +48,7 @@ const HANDLERS = {
   Interrupt: handleInterrupt,
   StopFailure: handleStopFailure,
   PostToolUse: handlePostToolUse,
+  PostToolUseFailure: handlePostToolUseFailure,
 };
 
 async function main() {
