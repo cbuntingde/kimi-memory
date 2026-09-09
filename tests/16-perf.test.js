@@ -41,7 +41,11 @@ const BUDGETS = {
   recall_5k_perType_ms: 500,
   list_5k_ms: 250,
   bulk_save_1k_ms: 3_000,
-  single_save_ms: 100,
+  // single_save_ms was 100; bumped to 150 after Windows CI flakes
+  // (103ms observed 2026-09-09 in PR #5). The file-level comment
+  // already calls out that budgets can be bumped per host; 150ms
+  // keeps ~50% headroom while still catching a 1.5x regression.
+  single_save_ms: 150,
   count_5k_ms: 50,
 };
 
