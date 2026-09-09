@@ -62,6 +62,12 @@
       "matcher": "",
       "command": "node ./hooks/post-tool-use.js",
       "timeout": 5
+    },
+    {
+      "event": "PostToolUseFailure",
+      "matcher": "",
+      "command": "node ./hooks/post-tool-use-failure.js",
+      "timeout": 5
     }
   ],
   "commands": "./commands/",
