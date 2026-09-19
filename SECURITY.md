@@ -57,13 +57,18 @@ finding that meets the bar for public tracking.
 - It does not encrypt the SQLite files at rest. The databases live in
   the user's home directory under their existing OS-level protections.
 - It does not verify the integrity of the embedding model it
-  downloads. The model pins to the Hugging Face Hub revision named in
-  `src/embedding.js` (default `main`) and is loaded straight into
+  downloads. There is no hash check, signature check, or pinned
+  digest. The model pins to the Hugging Face Hub revision named by
+  `KIMI_MEMORY_EMBEDDING_REVISION` and is loaded straight into
   `onnxruntime-node`; the local cache is reused on subsequent calls.
-  Operators on hardened networks (air-gapped, MITM-prone WiFi, CI
-  runners) **must** pin a specific commit SHA via
-  `KIMI_MEMORY_EMBEDDING_REVISION=<40-char-hex>` before the first
-  embed call. See `src/embedding.js` for the exact knob.
+  The only integrity control available is to pin that revision to an
+  immutable **commit SHA** (`KIMI_MEMORY_EMBEDDING_REVISION=<40-char-hex>`)
+  before the first embed call. A branch name or tag — including the
+  default `main` — is a _movable_ ref and guarantees nothing. The
+  plugin warns on stderr at first load when the revision is unpinned
+  or is a movable ref. Operators on hardened networks (air-gapped,
+  MITM-prone WiFi, CI runners) should pin a commit SHA. See
+  `src/embedding.js#describeEmbeddingIntegrity`.
 
 ## Outbound calls (and how to turn them off)
 

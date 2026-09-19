@@ -55,11 +55,11 @@ Unless noted, a value of `off` disables the feature and the default is
 
 ### Embeddings
 
-| Variable                         | Default | What it does                                                                                                                                                                                       |
-| -------------------------------- | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `KIMI_MEMORY_EMBEDDINGS`         | `on`    | Set to `off` to skip the helper-model download; recall falls back to keyword search.                                                                                                               |
-| `KIMI_MEMORY_EMBED_TIMEOUT_MS`   | `4000`  | Wall-clock cap for one embed call.                                                                                                                                                                 |
-| `KIMI_MEMORY_EMBEDDING_REVISION` | `main`  | Hugging Face Hub revision to pin the model to. Set to a 40-char commit SHA before first embed call to make the supply chain deterministic; the default trusts whatever is on `main` at first load. |
+| Variable                         | Default | What it does                                                                                                                                                                                                                                                                                                                                        |
+| -------------------------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `KIMI_MEMORY_EMBEDDINGS`         | `on`    | Set to `off` to skip the helper-model download; recall falls back to keyword search.                                                                                                                                                                                                                                                                |
+| `KIMI_MEMORY_EMBED_TIMEOUT_MS`   | `4000`  | Wall-clock cap for one embed call.                                                                                                                                                                                                                                                                                                                  |
+| `KIMI_MEMORY_EMBEDDING_REVISION` | `main`  | Hugging Face Hub revision to pin the model to. Set to a full 40-char commit SHA (immutable, content-addressed) before first embed call to make the supply chain deterministic. A branch or tag — including the default `main` — is a movable ref that pins nothing; the plugin warns on stderr at first load when the value is unpinned or movable. |
 
 ### Recall
 

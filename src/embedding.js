@@ -51,15 +51,34 @@ export const EMBEDDING_MODEL = 'Xenova/all-MiniLM-L6-v2';
 // `onnxruntime-node`; a compromised HF Hub account or a MITM on the
 // download would yield arbitrary ONNX execution on first session.
 //
+// The only integrity control available without re-implementing the
+// Hugging Face download path is to pin the revision to an immutable
+// commit SHA. A commit SHA is content-addressed, so pinning one fixes
+// the bytes for good. Branch names and tags are *movable* — pinning
+// `main` or `v1` looks like a pin but guarantees nothing, which is the
+// silent failure this module guards against.
+//
 // Operators on hardened networks (air-gapped, MITM-prone coffee-shop
 // WiFi, CI runners) MUST pin a specific git SHA via
 // `KIMI_MEMORY_EMBEDDING_REVISION=<40-char-hex>` before the first
 // embed call. Once the model lands in the local cache
 // (`env.cacheDir`), subsequent calls do not re-download.
-function getEmbeddingRevision() {
+const COMMIT_SHA_RE = /^[0-9a-f]{40}$/i;
+
+// Classify the configured revision. `pinned` is true only for a
+// 40-char hex commit SHA; every other accepted value is a movable ref
+// that cannot provide an integrity guarantee. Pure function so it is
+// unit-testable without loading the model.
+export function describeEmbeddingIntegrity() {
   const v = process.env.KIMI_MEMORY_EMBEDDING_REVISION;
-  if (typeof v === 'string' && v.trim().length > 0) return v.trim();
-  return 'main';
+  const raw = typeof v === 'string' && v.trim().length > 0 ? v.trim() : null;
+  if (raw === null) {
+    return { revision: 'main', pinned: false, reason: 'unset_defaults_to_main' };
+  }
+  if (COMMIT_SHA_RE.test(raw)) {
+    return { revision: raw, pinned: true, reason: 'commit_sha' };
+  }
+  return { revision: raw, pinned: false, reason: 'mutable_ref' };
 }
 
 // Default wall-clock cap for one embed call. Picked at 4s so the
@@ -96,15 +115,17 @@ async function getPipeline() {
       // Node-side: disable browser cache, allow remote model download from HF Hub.
       env.allowLocalModels = false;
       env.useBrowserCache = false;
-      const revision = getEmbeddingRevision();
+      const integrity = describeEmbeddingIntegrity();
       const pipe = await pipeline('feature-extraction', EMBEDDING_MODEL, {
         quantized: true,
-        revision,
+        revision: integrity.revision,
       });
       pipelineLoaded = true;
       lastError = null;
-      // Tell the user the download happened on this first load.
-      noticeDownloadOnce(EMBEDDING_MODEL, revision, env.cacheDir || null);
+      // Tell the user the download happened on this first load, and
+      // say plainly whether the revision is pinned to an immutable
+      // commit SHA or is a trust-on-first-use ref.
+      noticeDownloadOnce(EMBEDDING_MODEL, integrity, env.cacheDir || null);
       return pipe;
     })();
   }
@@ -182,17 +203,35 @@ function warnOnce(msg) {
 // this, but a user who never reads the README would otherwise be
 // surprised by an outbound HTTPS request to Hugging Face Hub the
 // moment they save their first memory. (Audit fix.)
+//
+// Also states the integrity posture plainly: whether the revision is
+// pinned to an immutable commit SHA, or is trust-on-first-use. A
+// branch/tag pin looks like a pin but is movable, so `reason:
+// 'mutable_ref'` gets its own line rather than reading as "pinned".
 let downloadNoticed = false;
-function noticeDownloadOnce(modelId, revision, cacheDir) {
+function noticeDownloadOnce(modelId, integrity, cacheDir) {
   if (downloadNoticed) return;
   downloadNoticed = true;
   try {
     const cache = cacheDir ? ` (cache: ${cacheDir})` : '';
-    const rev = revision && revision !== 'main' ? ` @ ${revision}` : '';
+    const rev =
+      integrity.revision && integrity.revision !== 'main' ? ` @ ${integrity.revision}` : '';
     process.stderr.write(
-      `[kimi-memory] first call downloaded embedding model ${modelId}${rev} (~25 MB) from Hugging Face Hub${cache}; subsequent calls use the local cache. ` +
-        `Set KIMI_MEMORY_EMBEDDING_REVISION=<sha> to pin a specific commit; the default tracks \`main\`.\n`,
+      `[kimi-memory] first call downloaded embedding model ${modelId}${rev} (~25 MB) from Hugging Face Hub${cache}; subsequent calls use the local cache.\n`,
     );
+    if (integrity.pinned) {
+      process.stderr.write(
+        `[kimi-memory] embedding model revision is pinned to commit ${integrity.revision} (immutable).\n`,
+      );
+    } else if (integrity.reason === 'mutable_ref') {
+      process.stderr.write(
+        `[kimi-memory] WARNING: KIMI_MEMORY_EMBEDDING_REVISION="${integrity.revision}" is a movable ref (branch/tag/short-sha), not a 40-char commit SHA. It pinpoints nothing and gives no integrity guarantee. Set it to a full commit SHA, or unset it to accept the trust-on-first-use default.\n`,
+      );
+    } else {
+      process.stderr.write(
+        `[kimi-memory] embedding model revision is unpinned (tracking \`main\`, trust-on-first-use). Set KIMI_MEMORY_EMBEDDING_REVISION=<40-char-commit-sha> to pin it.\n`,
+      );
+    }
   } catch {
     /* ignore */
   }
