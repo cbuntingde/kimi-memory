@@ -56,6 +56,14 @@ finding that meets the bar for public tracking.
   ACL rows are advisory, not enforced on the MCP server.
 - It does not encrypt the SQLite files at rest. The databases live in
   the user's home directory under their existing OS-level protections.
+- It does not verify the integrity of the embedding model it
+  downloads. The model pins to the Hugging Face Hub revision named in
+  `src/embedding.js` (default `main`) and is loaded straight into
+  `onnxruntime-node`; the local cache is reused on subsequent calls.
+  Operators on hardened networks (air-gapped, MITM-prone WiFi, CI
+  runners) **must** pin a specific commit SHA via
+  `KIMI_MEMORY_EMBEDDING_REVISION=<40-char-hex>` before the first
+  embed call. See `src/embedding.js` for the exact knob.
 
 ## Outbound calls (and how to turn them off)
 
@@ -66,7 +74,11 @@ keeps under its own retention policy.
 1. **Embedding encoder download** (`KIMI_MEMORY_EMBEDDINGS=on`,
    default on). The MiniLM model (~25 MB) downloads lazily from
    Hugging Face on first use and is cached locally under the
-   transformers cache directory. Disable with
+   transformers cache directory. The default tracks the `main`
+   branch of `Xenova/all-MiniLM-L6-v2`, which means every fresh
+   install trusts whatever is on `main` at first load. Pin a specific
+   40-char commit SHA via `KIMI_MEMORY_EMBEDDING_REVISION=<sha>` to
+   make the supply chain deterministic. Disable with
    `KIMI_MEMORY_EMBEDDINGS=off`; recall falls back to keyword search.
 2. **Auto-extract LLM call** (`KIMI_MEMORY_AUTO_EXTRACT=on`,
    default on). At every Stop / SessionEnd / SessionStart the plugin
@@ -102,6 +114,38 @@ are refused before the request is built — see
   user input reaches a query via string concatenation.
 - Hook stdin is capped at 256 KB per the `readStdin` call in
   `src/hooks/run.js`.
+- Inbound HTTP bodies to the proxy are bounded by size (1 MB default,
+  `readJson(req, limit)`) and by nesting depth (64 levels, via the
+  `maxJsonDepth` helper in `src/proxy/server.js`). A pathological
+  `[[[[...]]]]` body is rejected with a 400 before reaching
+  `JSON.parse`, so V8's call-stack limit cannot be tripped by an
+  adversarial caller.
+
+## Trust boundaries that need operator awareness
+
+A few subsystems ship with sensible defaults for the single-user,
+local-machine case but have non-obvious failure modes that operators
+on hardened setups need to opt out of:
+
+- **Re-clone auto-reset.** When `KIMI_MEMORY_AUTO_RESET_ON_RECLONE=on`
+  (default on), every SessionStart and UserPromptSubmit reads the
+  canonical project root's birthtime. If that birthtime is newer
+  than the project's `first_seen_at` by more than 60 s and the
+  directory is younger than 7 days, every per-row table for that
+  project is wiped in one transaction and the prior incarnation's
+  memories are gone. The trust boundary is the agent's `cwd` — an
+  attacker who can write a `touch -d "future"` to a directory the
+  user later `cd`'s into can trigger the reset. On a hostile
+  multi-tenant box, set `KIMI_MEMORY_AUTO_RESET_ON_RECLONE=off` and
+  call `memory_reset_project` manually.
+- **Loopback proxy bypass.** `KIMI_MEMORY_PROXY_AUTH=off` lets the
+  proxy start without bearer auth on a loopback bind. Any local
+  process that can reach `127.0.0.1:<port>` then has full access to
+  the tool surface, including the destructive subset. This is the
+  documented "dev convenience" path; on a shared host (multi-user
+  workstation, shared CI runner, containerized agent with another
+  local user) leave `KIMI_MEMORY_PROXY_AUTH` at its default (on, with
+  a token) or bind to a Unix socket instead.
 
 ## Dependency hygiene
 

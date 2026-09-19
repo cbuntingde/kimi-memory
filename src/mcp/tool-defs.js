@@ -8,6 +8,22 @@
 //
 // Re-exported from src/server.js so the proxy can read it without
 // importing the orchestrator directly.
+//
+// **This array is the schema table, NOT the live registry.** The MCP
+// wire schema (the `tools/list` response and the proxy `/tools`
+// endpoint) is built from the Map populated by `registerTool()`
+// inside each per-domain handler. The legacy subsystem gate
+// (`KIMI_MEMORY_LEGACY_SUBSYSTEMS=off`) causes `registerAcl`,
+// `registerTier`, and `registerCodegraph` to short-circuit, so
+// legacy tools do NOT appear on the wire even though their
+// definitions are present in this array. To exclude legacy tools
+// from this array as well, use `filterActiveToolDefs(TOOL_DEFS)`.
+//
+// `LEGACY_TOOL_NAMES` below is the canonical list of tool names that
+// the `KIMI_MEMORY_LEGACY_SUBSYSTEMS` gate hides. Keep it in sync
+// with the names registered by handlers/acl.js, handlers/tier.js,
+// and handlers/codegraph.js; tests/06-manifest.test.js asserts the
+// list matches.
 
 import { z } from 'zod';
 import { VISIBILITY_LEVELS } from '../vocabulary.js';
@@ -907,3 +923,47 @@ export const TOOL_DEFS = [
 export const TOOL_DEFS_BY_NAME = Object.freeze(
   Object.fromEntries(TOOL_DEFS.map((d) => [d.name, d])),
 );
+
+// Canonical list of tool names hidden by the
+// `KIMI_MEMORY_LEGACY_SUBSYSTEMS=off` gate. The gate is checked at
+// `register()` time inside each per-domain handler, so the wire
+// schema (MCP `tools/list` and the proxy `/tools` endpoint) already
+// excludes these names — this set is the schema-table counterpart,
+// useful for documentation generators and any code path that needs
+// the schema-time view rather than the live registry.
+export const LEGACY_TOOL_NAMES = Object.freeze(
+  new Set([
+    // ACL / visibility (5)
+    'acl_grant',
+    'acl_revoke',
+    'acl_list',
+    'acl_share_memory',
+    'acl_resolve_principal',
+    // Tier / persona (4)
+    'memory_set_tier',
+    'memory_promote',
+    'memory_demote',
+    'memory_tier_history',
+    // Codegraph (6)
+    'codegraph_extract',
+    'codegraph_build_edges',
+    'codegraph_query_symbol',
+    'codegraph_impact_path',
+    'codegraph_callers',
+    'codegraph_callees',
+  ]),
+);
+
+// Returns a frozen array of TOOL_DEFS with legacy tools filtered out
+// when the `KIMI_MEMORY_LEGACY_SUBSYSTEMS` env var is set to 'off'.
+// Use this anywhere the schema-time view of the tool surface matters
+// (docs, generated schemas, tests that want the wire-equivalent
+// list). The handler modules keep using TOOL_DEFS directly because
+// they look up definitions by name regardless of whether the live
+// register() call will wire them.
+export function filterActiveToolDefs(defs = TOOL_DEFS) {
+  if (process.env.KIMI_MEMORY_LEGACY_SUBSYSTEMS === 'off') {
+    return Object.freeze(defs.filter((d) => !LEGACY_TOOL_NAMES.has(d.name)));
+  }
+  return Object.freeze(defs.slice());
+}

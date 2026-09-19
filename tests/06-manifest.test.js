@@ -7,7 +7,12 @@ import assert from 'node:assert/strict';
 import path from 'node:path';
 import { existsSync, readdirSync, readFileSync } from 'node:fs';
 import { pluginRoot } from './_helpers.js';
-import { TOOL_DEFS, TOOL_DEFS_BY_NAME } from '../src/mcp/tool-defs.js';
+import {
+  TOOL_DEFS,
+  TOOL_DEFS_BY_NAME,
+  LEGACY_TOOL_NAMES,
+  filterActiveToolDefs,
+} from '../src/mcp/tool-defs.js';
 
 const root = pluginRoot();
 const manifest = JSON.parse(readFileSync(path.join(root, 'kimi.plugin.json'), 'utf8'));
@@ -15,13 +20,12 @@ const pkg = JSON.parse(readFileSync(path.join(root, 'package.json'), 'utf8'));
 const lock = JSON.parse(readFileSync(path.join(root, 'package-lock.json'), 'utf8'));
 const gitignore = readFileSync(path.join(root, '.gitignore'), 'utf8');
 
-// The tools gated behind KIMI_MEMORY_LEGACY_SUBSYSTEMS=off. Gating is
-// decided by the handler module — each gated register() body returns
-// early when the env var is off — not by a field on the definition, so
-// there is no `deprecated` property to key off and the list has to be
-// pinned here. Every name is asserted against TOOL_DEFS_BY_NAME below,
-// so renaming a tool in src/ fails the test instead of silently
-// shrinking the gated set and skewing the derived always-on count.
+// The tools gated behind KIMI_MEMORY_LEGACY_SUBSYSTEMS=off. Source of
+// truth is LEGACY_TOOL_NAMES in src/mcp/tool-defs.js, kept in sync with
+// the names registered by handlers/acl.js, handlers/tier.js, and
+// handlers/codegraph.js. The names are also pinned here so renaming a
+// tool in src/ fails the test instead of silently shrinking the gated
+// set and skewing the derived always-on count.
 const GATED_TOOL_NAMES = [
   'acl_grant',
   'acl_revoke',
@@ -50,6 +54,51 @@ test('manifest has the required high-value fields', () => {
   assert.ok(manifest.skills);
   assert.ok(manifest.commands);
   assert.equal(manifest.sessionStart.skill, 'kimi-memory');
+});
+
+test('LEGACY_TOOL_NAMES (single source of truth) matches GATED_TOOL_NAMES', () => {
+  // The handler-side gate (register() returns early) and the
+  // schema-side set (filterActiveToolDefs()) must agree, otherwise
+  // a tool could appear on the wire-schema surface while being
+  // unwireable, or vice versa. Pin both lists to the same names.
+  for (const name of GATED_TOOL_NAMES) {
+    assert.ok(
+      LEGACY_TOOL_NAMES.has(name),
+      `${name} is in GATED_TOOL_NAMES but missing from LEGACY_TOOL_NAMES`,
+    );
+  }
+  for (const name of LEGACY_TOOL_NAMES) {
+    assert.ok(
+      GATED_TOOL_NAMES.includes(name),
+      `${name} is in LEGACY_TOOL_NAMES but missing from GATED_TOOL_NAMES`,
+    );
+  }
+});
+
+test('filterActiveToolDefs honours KIMI_MEMORY_LEGACY_SUBSYSTEMS=off', () => {
+  const previous = process.env.KIMI_MEMORY_LEGACY_SUBSYSTEMS;
+  try {
+    delete process.env.KIMI_MEMORY_LEGACY_SUBSYSTEMS;
+    const all = filterActiveToolDefs();
+    assert.equal(all.length, TOOL_DEFS.length, 'default returns every entry');
+
+    process.env.KIMI_MEMORY_LEGACY_SUBSYSTEMS = 'off';
+    const filtered = filterActiveToolDefs();
+    for (const name of LEGACY_TOOL_NAMES) {
+      assert.ok(
+        !filtered.some((d) => d.name === name),
+        `${name} must be excluded when the gate is off`,
+      );
+    }
+    assert.equal(
+      filtered.length,
+      TOOL_DEFS.length - LEGACY_TOOL_NAMES.size,
+      'filtered length matches the always-on set',
+    );
+  } finally {
+    if (previous === undefined) delete process.env.KIMI_MEMORY_LEGACY_SUBSYSTEMS;
+    else process.env.KIMI_MEMORY_LEGACY_SUBSYSTEMS = previous;
+  }
 });
 
 test('every hook command points at an existing file', () => {

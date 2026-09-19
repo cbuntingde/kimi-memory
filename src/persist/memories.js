@@ -118,6 +118,26 @@ function safeParseJson(text, fallback, isShape) {
   return parsed.value;
 }
 
+// One-shot stderr notice when the secret-scan gate is bypassed. The
+// notice fires on the first persistence call with the gate off, not
+// at module load — so a process which never touches the gate never
+// sees the warning. Reset by `resetSecretScanNoticeForTests`.
+let secretScanOffNoticed = false;
+function noticeSecretScanOff() {
+  if (secretScanOffNoticed) return;
+  secretScanOffNoticed = true;
+  try {
+    process.stderr.write(
+      '[kimi-memory] WARNING: KIMI_MEMORY_SECRET_SCAN=off — credentials will be persisted to the project SQLite store without a shape check. Unset the env var to re-enable the gate.\n',
+    );
+  } catch {
+    /* ignore */
+  }
+}
+export function resetSecretScanNoticeForTests() {
+  secretScanOffNoticed = false;
+}
+
 // Defense in depth: refuse to persist a memory whose title or content
 // matches a known credential shape. The auto-extract path already
 // scrubs candidates before this point, but `memory_save` and
@@ -137,7 +157,18 @@ function safeParseJson(text, fallback, isShape) {
 // project SQLite verbatim and bypass the memory_save gate.
 // (Production-readiness review finding F-1.)
 export function assertNoSecret(input) {
-  if (process.env.KIMI_MEMORY_SECRET_SCAN === 'off') return;
+  if (process.env.KIMI_MEMORY_SECRET_SCAN === 'off') {
+    // Visible-once warning: a misconfigured CI environment, a dev
+    // container inheriting `~/.bashrc` env, or a hook that sets the
+    // var globally would otherwise silently persist API keys pasted
+    // by the user. The redaction pipeline in extract.js catches them
+    // on the LLM leg, but they would still land in the durable
+    // SQLite store. The notice fires on every call — slightly noisy,
+    // but cheap, and the cost of NOT noticing a misconfigured gate
+    // is an API key in the durable store.
+    noticeSecretScanOff();
+    return;
+  }
   // Tags and metadata are checked too — the previous version only
   // scanned title and content, leaving a small gap for credentials
   // stashed in tag names or structured metadata.
