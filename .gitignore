@@ -1,0 +1,79 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+build/
+coverage/
+*.tsbuildinfo
+
+# Local config / secrets
+.env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+*.local
+
+# Logs
+*.log
+logs/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# OS / editor scratch
+.DS_Store
+Thumbs.db
+desktop.ini
+ehthumbs.db
+ehthumbs_view.db
+*.swp
+*.swo
+*.swn
+*.bak
+*.tmp
+*~
+\#*\#
+.idea/
+.vscode/
+*.sublime-project
+*.sublime-workspace
+
+# Runtime diagnostics (written by hooks)
+_diagnostics/
+
+# Kimi Code runtime state (sessions, plans, etc.) — created if anyone
+# runs `kimi` from this checkout. Plugin lives in users' $KIMI_CODE_HOME,
+# not at the repo root, so any appearance here is scratch.
+.kimi/
+.kimi-code/
+
+# Tooling artifacts
+.craftsman/
+.cache/
+.worktrees/
+ships/
+*.tgz
+*.tar.gz
+
+# Internal planning / AI-shared docs. The public surface is README.md.
+# AGENTS.md is deliberately NOT ignored: README.md, CHANGELOG.md and
+# skills/kimi-memory/references/tools.md all reference it as the
+# authoritative code-layout and environment-variable table, so it has to
+# ship with the plugin.
+plans/
+todo/
+todo.md
+TODO.md
+ROADMAP.md
+.audit/
+.audit-logs/
+research/
+
+# Local debug scratch — hook dev traces. See AGENTS.md "Re-clone auto-reset"
+# for where these come from; rerun a hook harness to regenerate.
+.tmp-hook/
+_trace.js

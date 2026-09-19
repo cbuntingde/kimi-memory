@@ -1,0 +1,634 @@
+// Visibility / tier vocabulary + share + tier management.
+//
+// The vocabulary itself lives in ../vocabulary.js — it used to live here,
+// which meant memories.js imported it from this module while this module
+// imported rowToMemory/getMemory from memories.js: a real import cycle.
+// The values are re-exported below so existing importers keep working.
+import { nowIso, hashId, shortId } from '../util.js';
+import { looksLikeSecret } from '../secrets.js';
+import { openSharedDb, openDb } from './connection.js';
+import { rowToMemory, getMemory } from './memories.js';
+import { globalDbPath } from '../project-key.js';
+import { VISIBILITY_SET, TIER_SET } from '../vocabulary.js';
+import crypto from 'node:crypto';
+
+// v10 ACL / visibility vocabulary. Five visibility levels mirroring
+// TencentDB-Agent-Memory's `AssetVisibility` enum. saveMemory falls back
+// to 'private' when the input is missing or out-of-vocabulary, so a save
+// never produces a row that bypasses the principal gate.
+export const VISIBILITY_VALUES = VISIBILITY_SET;
+
+export function validVisibilityLevels() {
+  return [...VISIBILITY_VALUES];
+}
+
+// v10 tier model (Chat Memory L0→L1→L2→L3). The four levels mirror
+// TencentDB-Agent-Memory's distillation pipeline:
+//   L0 — raw save (a memory just landed; no promotion yet)
+//   L1 — Stop-hook auto-extract promoted it to working state
+//   L2 — access pattern promoted it to durable state
+//   L3 — explicitly promoted by the agent or operator (curated)
+// Every new save lands at L0; promote / demote move it along the
+// chain with an audit row in persona_promotions.
+const TIER_VALUES = TIER_SET;
+
+export function validTiers() {
+  return [...TIER_VALUES];
+}
+
+export function isValidTier(v) {
+  return TIER_VALUES.has(v);
+}
+
+// Internal-but-exported handle so the memories module can validate
+// input tier values without re-declaring the vocabulary. The valid
+// public API is `validTiers()` / `isValidTier()`; the constant is
+// exposed only for cross-module consistency checks.
+export const TIER_VALUES_INTERNAL = TIER_VALUES;
+
+// Promote one or more memories to a new visibility level. Two modes:
+//
+//   toSharedPool: false (default)
+//     Update the row in-place. The memory stays in its project DB but
+//     `visibility` and `shared_with` change so the read paths can see
+//     it through the new ACL gate. `sharedWith` is a JSON-encoded list
+//     of principal descriptors (e.g. ['user:alice','role:editor']).
+//
+//   toSharedPool: true
+//     Move the row out of the project DB into the cross-project shared
+//     DB at _shared/memory.sqlite with project_key='_shared'. The row
+//     keeps the same id so callers holding the id don't break. FTS5
+//     rows are re-created on the target DB and dropped on the source.
+//
+// Returns { moved, updated }. `moved` is the count of rows physically
+// relocated (toSharedPool=true path). `updated` is the count of rows
+// whose visibility was rewritten in place. They sum to the number of
+// ids the call acted on; ids that did not exist in `projectKey` are
+// silently skipped (idempotent — re-running with the same ids is a
+// no-op). Throws on an invalid visibility level; the caller is
+// expected to validate input before invoking.
+export function shareMemory(db, projectKey, ids, opts = {}) {
+  if (!Array.isArray(ids) || ids.length === 0) return { moved: 0, updated: 0 };
+  const visibility = opts.visibility;
+  if (!VISIBILITY_VALUES.has(visibility)) {
+    throw new Error(`invalid visibility: ${visibility}`);
+  }
+  const sharedWith = Array.isArray(opts.sharedWith) ? opts.sharedWith : [];
+  const toSharedPool = !!opts.toSharedPool;
+  const kimiHomeDir = opts.kimiHomeDir;
+
+  if (toSharedPool) {
+    if (!kimiHomeDir) {
+      throw new Error('shareMemory: toSharedPool=true requires kimiHomeDir');
+    }
+    // Defence-in-depth: refuse to promote a row whose title or content
+    // matches a known credential shape. The save-side `assertNoSecret`
+    // already blocks the original write, but a row could have been
+    // saved under an older scanner revision, or the operator may have
+    // imported via the legacy bulk path. Re-checking here keeps the
+    // README's "the check is enforced at the lowest layer" claim true
+    // for the cross-DB promotion path too.
+    const idSet = new Set(ids);
+    const candidates = db
+      .prepare(
+        `SELECT id, title, content FROM memories WHERE project_key = ? AND id IN (${[...idSet]
+          .map(() => '?')
+          .join(',')})`,
+      )
+      .all(projectKey, ...idSet);
+    // Honour the same opt-out `assertNoSecret` does. The error message
+    // below has always told the operator to set KIMI_MEMORY_SECRET_SCAN=off,
+    // but this path never read the variable — so the advertised escape
+    // hatch did nothing and the promotion failed anyway.
+    if (process.env.KIMI_MEMORY_SECRET_SCAN !== 'off') {
+      for (const r of candidates) {
+        if (looksLikeSecret(r.title || '') || looksLikeSecret(r.content || '')) {
+          const err = new Error(
+            `secret_detected: refusing to share memory ${r.id} — title or content matches a known credential shape. Remove the secret and retry, or set KIMI_MEMORY_SECRET_SCAN=off to bypass.`,
+          );
+          err.code = 'KIMI_MEMORY_SECRET_DETECTED';
+          throw err;
+        }
+      }
+    }
+
+    const sharedDb = openSharedDb(kimiHomeDir);
+    // Two-phase commit with compensation: the shared-DB writes run
+    // inside their own transaction *first*, then the source-DB
+    // deletes run inside a second transaction. If the source-DB
+    // transaction fails after the shared writes committed, we undo
+    // the shared writes in a third compensation pass so the
+    // operation is effectively atomic from the caller's view.
+    //
+    // node:sqlite uses one native connection per dbPath, so the two
+    // databases cannot share a transaction; explicit compensation
+    // is the only way to keep both stores consistent on the failure
+    // path. The compensating delete is idempotent (memories_acl on
+    // the shared DB has no FK to memories, so an interrupted undo
+    // leaves the shared DB rows orphaned but harmless — the next
+    // shareMemory call for the same id no-ops via INSERT OR IGNORE).
+    // (Audit fix — the previous shape interleaved shared + source
+    // writes inside a single source transaction with no
+    // compensation; a mid-loop failure left the shared DB with
+    // rows whose source rows still existed.)
+    const now = nowIso();
+    let moved = 0;
+    const sharedWrittenIds = [];
+    sharedDb.exec('BEGIN');
+    try {
+      for (const id of ids) {
+        const row = db
+          .prepare('SELECT * FROM memories WHERE id=? AND project_key=?')
+          .get(id, projectKey);
+        if (!row) continue;
+        let rowAfterMove = row;
+        try {
+          const ins = sharedDb
+            .prepare(
+              `INSERT OR IGNORE INTO memories (
+                id, project_key, type, title, content, tags, metadata, provenance,
+                confidence, status, priority, supersedes, superseded_by,
+                created_at, updated_at, expires_at,
+                embedding, embedding_model, embedding_dim, embedded_at,
+                access_count, last_accessed_at,
+                stability_days, last_rehearsed_at,
+                last_embed_error,
+                visibility, shared_with,
+                team_id, agent_id, user_id, session_id, task_id,
+                tier, persona_id
+              ) VALUES (?, '_shared', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+            )
+            .run(
+              row.id,
+              row.type,
+              row.title,
+              row.content,
+              row.tags,
+              row.metadata,
+              row.provenance,
+              row.confidence,
+              row.status,
+              row.priority,
+              row.supersedes,
+              row.superseded_by,
+              row.created_at,
+              now,
+              row.expires_at,
+              row.embedding,
+              row.embedding_model,
+              row.embedding_dim,
+              row.embedded_at,
+              row.access_count,
+              row.last_accessed_at,
+              row.stability_days,
+              row.last_rehearsed_at,
+              row.last_embed_error,
+              visibility,
+              JSON.stringify(sharedWith),
+              row.team_id,
+              row.agent_id,
+              row.user_id,
+              row.session_id,
+              row.task_id,
+              row.tier,
+              row.persona_id,
+            );
+          if (ins.changes === 0) {
+            const existing = sharedDb
+              .prepare(
+                "SELECT type, title, content, tags FROM memories WHERE id=? AND project_key='_shared'",
+              )
+              .get(id);
+            if (!existing) {
+              throw new Error(
+                `shareMemory: insert OR IGNORE produced no row and no existing row for ${id}`,
+              );
+            }
+            rowAfterMove = existing;
+          } else {
+            rowAfterMove = row;
+          }
+        } catch (e) {
+          throw new Error(
+            `shareMemory: failed to insert into shared DB for ${id}: ${e && e.message}`,
+          );
+        }
+        const ftsSrc = rowAfterMove;
+        let tagTokens = '';
+        try {
+          const tagArr = JSON.parse(ftsSrc.tags || '[]');
+          tagTokens = Array.isArray(tagArr) ? tagArr.join(' ') : '';
+        } catch {
+          /* ignore */
+        }
+        sharedDb.prepare('DELETE FROM memories_fts WHERE id=?').run(id);
+        sharedDb
+          .prepare(
+            'INSERT INTO memories_fts (id, project_key, type, title, content, tags) VALUES (?, ?, ?, ?, ?, ?)',
+          )
+          .run(id, '_shared', ftsSrc.type, ftsSrc.title || '', ftsSrc.content || '', tagTokens);
+        sharedWrittenIds.push(id);
+      }
+      sharedDb.exec('COMMIT');
+    } catch (e) {
+      try {
+        sharedDb.exec('ROLLBACK');
+      } catch {
+        /* ignore */
+      }
+      throw e;
+    }
+    // Phase 2: source-DB deletes. On COMMIT failure, compensate by
+    // undoing the shared writes so the caller observes atomicity.
+    db.exec('BEGIN');
+    try {
+      for (const id of sharedWrittenIds) {
+        db.prepare('DELETE FROM memories WHERE id=? AND project_key=?').run(id, projectKey);
+        db.prepare('DELETE FROM memories_fts WHERE id=?').run(id);
+        moved += 1;
+      }
+      db.exec('COMMIT');
+    } catch (e) {
+      try {
+        db.exec('ROLLBACK');
+      } catch {
+        /* ignore */
+      }
+      // Compensate the shared DB writes.
+      try {
+        sharedDb.exec('BEGIN');
+        for (const id of sharedWrittenIds) {
+          sharedDb.prepare("DELETE FROM memories WHERE id=? AND project_key='_shared'").run(id);
+          sharedDb.prepare('DELETE FROM memories_fts WHERE id=?').run(id);
+        }
+        sharedDb.exec('COMMIT');
+      } catch {
+        try {
+          sharedDb.exec('ROLLBACK');
+        } catch {
+          /* ignore */
+        }
+      }
+      throw e;
+    }
+    return { moved, updated: 0 };
+  }
+
+  // In-place update path: rewrite visibility + shared_with on every id
+  // that exists in the source DB. Ids that don't exist are skipped
+  // silently so the call is idempotent (re-running with the same ids
+  // is a no-op).
+  const now = nowIso();
+  let updated = 0;
+  const stmt = db.prepare(
+    `UPDATE memories SET visibility = ?, shared_with = ?, updated_at = ?
+     WHERE id = ? AND project_key = ?`,
+  );
+  db.exec('BEGIN');
+  try {
+    for (const id of ids) {
+      const r = stmt.run(visibility, JSON.stringify(sharedWith), now, id, projectKey);
+      if (r.changes > 0) updated += 1;
+    }
+    db.exec('COMMIT');
+  } catch (e) {
+    try {
+      db.exec('ROLLBACK');
+    } catch {
+      /* ignore */
+    }
+    throw e;
+  }
+  return { moved: 0, updated };
+}
+
+// Move one or more project memories into the cross-project _global
+// store at $KIMI_CODE_HOME/kimi-memory/_global/memory.sqlite. The
+// source row is removed from the project DB; the row is rewritten
+// into the global DB with project_key='_global' (the id is preserved
+// so callers holding the id don't break). The global DB is lazy-
+// created on first write.
+//
+// The move is a two-phase commit with compensation: the global-DB
+// INSERTs run in their own transaction first, then the source-DB
+// DELETEs run in a second transaction. If the source-DB transaction
+// fails after the global writes committed, the global writes are
+// undone in a compensation pass so the operation is effectively
+// atomic from the caller's view. The shape mirrors shareMemory's
+// toSharedPool=true branch — same node:sqlite one-handle-per-db
+// limitation forces the explicit compensation.
+//
+// Differences from shareMemory(toSharedPool=true):
+//   * Target DB is _global/memory.sqlite, not _shared/memory.sqlite.
+//   * project_key on the moved row becomes '_global'.
+//   * ACL grant tables on the source DB are not touched (global rows
+//     are not ACL-gated).
+//   * shared_with on the moved row is cleared (a principal-grant list
+//     on a project row does not apply after the move).
+//
+// Returns { moved: [{id, new_global_id}], skipped: [{id, reason}] }
+// where:
+//   - moved[i].id is the original project id
+//   - moved[i].new_global_id is the same id, now keyed under _global
+//   - skipped entries cover ids that did not exist in projectKey or
+//     rows that matched a secret shape (defence-in-depth even though
+//     saveMemory already gated the original write).
+//
+// Idempotent: re-running with the same ids is a no-op for rows that
+// were already promoted (they no longer exist in projectKey, so the
+// lookup misses and the id lands in `skipped` with reason='not_found').
+// Idempotency is intentional; the MCP wrapper returns the moved list
+// so callers can tell what changed.
+export function promoteMemoryToGlobal(db, projectKey, ids, { kimiHomeDir, nowOverride } = {}) {
+  if (!Array.isArray(ids) || ids.length === 0) return { moved: [], skipped: [] };
+  if (!kimiHomeDir) {
+    throw new Error('promoteMemoryToGlobal: kimiHomeDir is required');
+  }
+  // Defence-in-depth: refuse to promote a row whose title or content
+  // matches a known credential shape. The save-side assertNoSecret
+  // already blocks the original write, but a row may have been saved
+  // under an older scanner revision or imported via the legacy bulk
+  // path. Re-checking here keeps the cross-DB promotion path clean.
+  const idSet = new Set(ids);
+  const placeholders = [...idSet].map(() => '?').join(',');
+  let candidates;
+  try {
+    candidates = db
+      .prepare(
+        `SELECT id, title, content FROM memories
+         WHERE project_key = ? AND id IN (${placeholders})`,
+      )
+      .all(projectKey, ...idSet);
+  } catch (e) {
+    throw new Error(`promoteMemoryToGlobal: failed to read candidates: ${e && e.message}`);
+  }
+  const foundById = new Map(candidates.map((r) => [r.id, r]));
+  const skipped = [];
+  for (const id of ids) {
+    const r = foundById.get(id);
+    if (!r) {
+      skipped.push({ id, reason: 'not_found' });
+      continue;
+    }
+    if (looksLikeSecret(r.title || '') || looksLikeSecret(r.content || '')) {
+      skipped.push({ id, reason: 'secret_detected' });
+    }
+  }
+  const movableIds = ids.filter((id) => foundById.has(id) && !skipped.find((s) => s.id === id));
+  if (movableIds.length === 0) return { moved: [], skipped };
+
+  const globalDb = openDb(globalDbPath(kimiHomeDir));
+  const now = typeof nowOverride === 'function' ? nowOverride : nowIso;
+  // Phase 1: write into the global DB inside a transaction.
+  const writtenGlobalIds = [];
+  globalDb.exec('BEGIN');
+  try {
+    for (const id of movableIds) {
+      const row = db
+        .prepare('SELECT * FROM memories WHERE id=? AND project_key=?')
+        .get(id, projectKey);
+      if (!row) {
+        // Race: row was deleted between the read above and now. Skip.
+        skipped.push({ id, reason: 'not_found' });
+        continue;
+      }
+      try {
+        globalDb
+          .prepare(
+            `INSERT OR IGNORE INTO memories (
+              id, project_key, type, title, content, tags, metadata, provenance,
+              confidence, status, priority, supersedes, superseded_by,
+              created_at, updated_at, expires_at,
+              embedding, embedding_model, embedding_dim, embedded_at,
+              access_count, last_accessed_at,
+              stability_days, last_rehearsed_at,
+              last_embed_error,
+              visibility, shared_with,
+              team_id, agent_id, user_id, session_id, task_id,
+              tier, persona_id
+            ) VALUES (?, '_global', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          )
+          .run(
+            row.id,
+            row.type,
+            row.title,
+            row.content,
+            row.tags,
+            row.metadata,
+            JSON.stringify({
+              ...(safeParseProvenance(row.provenance) || {}),
+              promoted_from: projectKey,
+              promoted_at: now(),
+            }),
+            row.confidence,
+            row.status,
+            row.priority,
+            row.supersedes,
+            row.superseded_by,
+            row.created_at,
+            now(),
+            row.expires_at,
+            row.embedding,
+            row.embedding_model,
+            row.embedding_dim,
+            row.embedded_at,
+            row.access_count,
+            row.last_accessed_at,
+            row.stability_days,
+            row.last_rehearsed_at,
+            row.last_embed_error,
+            // Global rows are always visible to the user; ACL grants
+            // from the project DB do not apply.
+            'private',
+            JSON.stringify([]),
+            row.team_id,
+            row.agent_id,
+            row.user_id,
+            row.session_id,
+            row.task_id,
+            row.tier,
+            row.persona_id,
+          );
+      } catch (e) {
+        throw new Error(
+          `promoteMemoryToGlobal: failed to insert ${id} into _global: ${e && e.message}`,
+        );
+      }
+      // Mirror into FTS5 on the global DB.
+      const tagTokens = (() => {
+        try {
+          const tagArr = JSON.parse(row.tags || '[]');
+          return Array.isArray(tagArr) ? tagArr.join(' ') : '';
+        } catch {
+          return '';
+        }
+      })();
+      globalDb.prepare('DELETE FROM memories_fts WHERE id=?').run(id);
+      globalDb
+        .prepare(
+          'INSERT INTO memories_fts (id, project_key, type, title, content, tags) VALUES (?, ?, ?, ?, ?, ?)',
+        )
+        .run(id, '_global', row.type, row.title || '', row.content || '', tagTokens);
+      writtenGlobalIds.push(id);
+    }
+    globalDb.exec('COMMIT');
+  } catch (e) {
+    try {
+      globalDb.exec('ROLLBACK');
+    } catch {
+      /* ignore */
+    }
+    throw e;
+  }
+  // Phase 2: source-DB deletes. Compensate on failure.
+  const moved = [];
+  db.exec('BEGIN');
+  try {
+    for (const id of writtenGlobalIds) {
+      db.prepare('DELETE FROM memories WHERE id=? AND project_key=?').run(id, projectKey);
+      db.prepare('DELETE FROM memories_fts WHERE id=?').run(id);
+      moved.push({ id, new_global_id: id });
+    }
+    db.exec('COMMIT');
+  } catch (e) {
+    try {
+      db.exec('ROLLBACK');
+    } catch {
+      /* ignore */
+    }
+    // Compensate: undo the global writes for ids that did make it in.
+    try {
+      globalDb.exec('BEGIN');
+      for (const id of writtenGlobalIds) {
+        globalDb.prepare("DELETE FROM memories WHERE id=? AND project_key='_global'").run(id);
+        globalDb.prepare('DELETE FROM memories_fts WHERE id=?').run(id);
+      }
+      globalDb.exec('COMMIT');
+    } catch {
+      try {
+        globalDb.exec('ROLLBACK');
+      } catch {
+        /* ignore */
+      }
+    }
+    throw e;
+  }
+  return { moved, skipped };
+}
+
+function safeParseProvenance(value) {
+  if (!value) return null;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return null;
+  }
+}
+
+// v10: tier (Chat Memory L0→L1→L2→L3) management. Every transition
+// writes a row to persona_promotions so memory_tier_history can
+// reconstruct the lineage. promote/demote compute the next tier from
+// the current one (L0→L1→L2→L3 in either direction); setMemoryTier is
+// the explicit override.
+//
+// All three return { memory, transition } where transition is the
+// audit row, or { memory: null } when the memory is missing / soft-
+// deleted. Throws on invalid tier input; the caller is expected to
+// validate before invoking.
+
+function recordPromotion(db, memoryId, fromTier, toTier, reason) {
+  // Mix ms + ns + a random int into the id stamp so two transitions
+  // in the same second produce different ids. Same pattern as
+  // recordSkillInvocation. INSERT OR IGNORE keeps the PRIMARY KEY
+  // safety net for the rare ms-collision case.
+  // (Audit finding B2-6.)
+  const stamp = `${nowIso()}:${Date.now() % 1e9}:${crypto.randomUUID()}`;
+  const id = shortId(hashId('promo', memoryId, fromTier, toTier, reason || '', stamp), 16);
+  db.prepare(
+    `INSERT OR IGNORE INTO persona_promotions (id, memory_id, from_tier, to_tier, reason, at)
+     VALUES (?, ?, ?, ?, ?, ?)`,
+  ).run(id, memoryId, fromTier, toTier, reason || null, nowIso());
+  return {
+    id,
+    memory_id: memoryId,
+    from_tier: fromTier,
+    to_tier: toTier,
+    reason: reason || null,
+    at: nowIso(),
+  };
+}
+
+export function setMemoryTier(db, projectKey, memoryId, targetTier, { reason } = {}) {
+  if (!TIER_VALUES.has(targetTier)) {
+    throw new Error(`invalid tier: ${targetTier}`);
+  }
+  const row = db
+    .prepare("SELECT id, tier FROM memories WHERE id=? AND project_key=? AND status='active'")
+    .get(memoryId, projectKey);
+  if (!row) return { memory: null, transition: null };
+  if (row.tier === targetTier) {
+    return {
+      memory: getMemory(db, projectKey, memoryId),
+      transition: null,
+    };
+  }
+  db.prepare(`UPDATE memories SET tier = ?, updated_at = ? WHERE id = ? AND project_key = ?`).run(
+    targetTier,
+    nowIso(),
+    memoryId,
+    projectKey,
+  );
+  const transition = recordPromotion(db, memoryId, row.tier, targetTier, reason);
+  return {
+    memory: getMemory(db, projectKey, memoryId),
+    transition,
+  };
+}
+
+// Promote one tier up (capped at L3). Returns { memory, transition }.
+export function promoteMemory(db, projectKey, memoryId, { reason } = {}) {
+  const row = db
+    .prepare("SELECT tier FROM memories WHERE id=? AND project_key=? AND status='active'")
+    .get(memoryId, projectKey);
+  if (!row) return { memory: null, transition: null };
+  const order = ['L0', 'L1', 'L2', 'L3'];
+  const idx = order.indexOf(row.tier);
+  if (idx < 0 || idx === order.length - 1) {
+    return {
+      memory: getMemory(db, projectKey, memoryId),
+      transition: null,
+    };
+  }
+  return setMemoryTier(db, projectKey, memoryId, order[idx + 1], { reason });
+}
+
+// Demote one tier down (floor at L0). Returns { memory, transition }.
+export function demoteMemory(db, projectKey, memoryId, { reason } = {}) {
+  const row = db
+    .prepare("SELECT tier FROM memories WHERE id=? AND project_key=? AND status='active'")
+    .get(memoryId, projectKey);
+  if (!row) return { memory: null, transition: null };
+  const order = ['L0', 'L1', 'L2', 'L3'];
+  const idx = order.indexOf(row.tier);
+  if (idx <= 0) {
+    return {
+      memory: getMemory(db, projectKey, memoryId),
+      transition: null,
+    };
+  }
+  return setMemoryTier(db, projectKey, memoryId, order[idx - 1], { reason });
+}
+
+// Return the audit log of tier transitions for a memory, oldest-first.
+export function listTierHistory(db, projectKey, memoryId, { limit = 200 } = {}) {
+  const rows = db
+    .prepare(
+      `SELECT id, memory_id, from_tier, to_tier, reason, at
+       FROM persona_promotions
+       WHERE memory_id = ?
+       ORDER BY datetime(at) ASC, id ASC
+       LIMIT ?`,
+    )
+    .all(memoryId, Math.max(1, Math.min(500, limit)));
+  return rows;
+}

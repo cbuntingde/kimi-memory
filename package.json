@@ -1,0 +1,37 @@
+{
+  "name": "kimi-memory",
+  "version": "0.6.0",
+  "description": "Kimi Code plugin: three-layer local memory (global user, per-project durable + working, per-project session archives) plus an integrated advisor subsystem for reflective prompts, with memory_prune for orphan-project cleanup. Exposed via MCP tools, lifecycle hooks, and slash commands.",
+  "license": "MIT",
+  "type": "module",
+  "engines": {
+    "node": ">=24.0.0",
+    "npm": ">=10.0.0"
+  },
+  "bin": {
+    "kimi-memory": "src/cli.js"
+  },
+  "scripts": {
+    "start": "node src/mcp/launcher.js",
+    "test": "node --test --test-reporter=spec tests/*.test.js",
+    "check": "node scripts/check-syntax.js",
+    "backfill-embeddings": "node src/backfill.js",
+    "format:check": "prettier --check ."
+  },
+  "dependencies": {
+    "@huggingface/transformers": "^4.2.0",
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^3.25.76"
+  },
+  "devDependencies": {
+    "prettier": "^3.3.0"
+  },
+  "overrides": {
+    "sharp": "^0.35.0",
+    "adm-zip": "^0.6.0"
+  },
+  "allowScripts": {
+    "onnxruntime-node@1.24.3": true,
+    "protobufjs@7.6.5": true
+  }
+}
