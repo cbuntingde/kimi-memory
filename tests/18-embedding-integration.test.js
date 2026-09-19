@@ -1,7 +1,7 @@
 // Integration test for the real MiniLM embedding pipeline. Gated on
 // KIMI_MEMORY_INTEGRATION_EMBED=1 so the default `npm test` stays
-// fast (no Hugging Face download). Enable in CI by either exporting
-// the env var or running `npm run test:integration`.
+// fast (no Hugging Face download). Enable with
+// `KIMI_MEMORY_INTEGRATION_EMBED=1 npm test`.
 //
 // What this test exercises that the unit suite cannot:
 //   - The Xenova/all-MiniLM-L6-v2 model download + load path.

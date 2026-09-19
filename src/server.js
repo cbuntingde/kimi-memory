@@ -81,8 +81,8 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
   // src/proxy/server.js dispatchTool().
   const handlers = new Map();
 
-  // Always-on domain modules (25 tools): memory CRUD + working memory
-  // + conversations + edges + maintenance + dream.
+  // Always-on domain modules (37 tools): memory CRUD + share + working
+  // memory + conversations + edges + maintenance + dreaming + dream.
   registerMemoryCrud(server, handlers, home);
   registerShare(server, handlers, home);
   registerWorkingMemory(server, handlers, home);
@@ -91,7 +91,7 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
   registerMaintenance(server, handlers, home);
   registerDreaming(server, handlers, home);
   registerDream(server, handlers, home);
-  // Legacy subsystems (20 tools): ACL/visibility, tier/persona,
+  // Legacy subsystems (15 tools): ACL/visibility, tier/persona,
   // codegraph. Each module self-gates on
   // KIMI_MEMORY_LEGACY_SUBSYSTEMS and returns early when the env var
   // is 'off'. The wiki group was removed in v14 (no gate needed —

@@ -6,7 +6,7 @@
 git clone https://github.com/cbuntingde/kimi-memory
 cd kimi-memory
 npm install
-npm test                 # full suite, embeddings off (~3s)
+npm test                 # full suite, embeddings off (~25s)
 npm run check            # node --check on every source file
 npm run format:check     # prettier --check
 ```
