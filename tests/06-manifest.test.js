@@ -147,7 +147,7 @@ test('plugin manifest reflects the merged memory + advisor displayName', () => {
 });
 
 test('manifest version matches package.json and package-lock.json', () => {
-  assert.equal(manifest.version, '0.6.0');
+  assert.equal(manifest.version, '0.7.0');
   assert.equal(pkg.version, manifest.version);
   assert.equal(lock.packages[''].version, manifest.version);
 });

@@ -5,7 +5,65 @@ All notable changes to `kimi-memory` are recorded here. Versions follow
 the global DB is not touched; "Breaking" notes mean a stored row from a
 prior version is rejected / migrated by the schema upgrade on first open.
 
-## [Unreleased]
+## [0.7.0] — 2026-09-19
+
+### Fixed — two earlier audit findings that never actually landed
+
+The `2026-09-09` audit filed two MUST findings and marked both `landed`.
+Neither fix was in the tree when `0.6.0` was pushed; the audit's
+"tests pass" signal was green because the existing tests did not exercise
+the paths it claimed to fix. Both are now fixed, each with a regression
+test that fails without the fix (`tests/54-f1-f2-audit-fixes.test.js`).
+
+- **`persona_promotions.from_tier` recorded the post-transition tier.**
+  The audit read the previous tier _after_ the `UPDATE`; inside a
+  transaction that sees the new value, so every auto-tier transition
+  logged its destination as both `from_tier` and `to_tier`. The read now
+  happens before the update (`src/auto-gc.js#transitionIds`).
+- **The proxy accepted unbounded JSON nesting.** `readJson` handed the
+  raw body straight to `JSON.parse`, so a deeply nested array could hit
+  V8's call-stack limit. A `maxJsonDepth` guard now rejects bodies nested
+  deeper than 64 levels with a 400 before parsing
+  (`src/proxy/server.js`).
+
+### Fixed — hook hard-timeout was a flat ceiling
+
+The dispatcher enforced a single 8 s timeout for every event, while
+`kimi.plugin.json` gives five events only 5 s each — so cleanup ran after
+the runtime had already killed the process, and slower events were
+aborted early. The ceiling is now per-event and always at least 1 s under
+the manifest budget (`src/hooks/run.js`, `tests/55-hook-timeout.test.js`).
+
+### Fixed — fresh databases paid two redundant table rebuilds
+
+`SCHEMA_SQL` was missing `'conclusion'` and `'skill'` from the
+`memories.type` CHECK, so the migrations that add those types never
+short-circuited on a new database and rebuilt `memories` +
+`memories_fts` twice. The CHECK now lists every type
+(`src/persist/connection.js`).
+
+### Fixed — `npm ci --ignore-scripts` left the ONNX runtime unbuilt
+
+`onnxruntime-node` ships a prebuilt native binary unpacked by its
+`postinstall`, which `--ignore-scripts` skips, so the first embed call
+after a fresh install failed with a missing module. The launcher now
+re-runs the install lifecycle for the two packages that need it
+(`npm rebuild onnxruntime-node protobufjs`) while keeping the rest of the
+tree scripts-off (`src/mcp/launcher.js`).
+
+### Added — `KIMI_MEMORY_EMBEDDING_REVISION`, with an unpinned-model warning
+
+The embedding model downloads from Hugging Face Hub on first use with no
+hash check. Pinning the revision to a full commit SHA is the only
+available integrity control, so the plugin now warns on stderr when the
+revision is unpinned or is a movable ref (a branch or tag)
+(`src/embedding.js#describeEmbeddingIntegrity`).
+
+### Added — a warning when the secret-scan gate is off
+
+`KIMI_MEMORY_SECRET_SCAN=off` bypasses the credential-shape gate
+silently, and the README tells operators how to set it. It now logs a
+one-shot stderr warning on first use (`src/persist/memories.js`).
 
 ### Security — credential detection, archive redaction, path containment
 
