@@ -835,7 +835,15 @@ CREATE TABLE IF NOT EXISTS schema_meta (
 CREATE TABLE IF NOT EXISTS memories (
   id            TEXT PRIMARY KEY,
   project_key   TEXT NOT NULL,
-  type          TEXT NOT NULL CHECK (type IN ('working','episodic','semantic','procedural','context_snapshot')),
+  -- The type CHECK must include every value added by migrations so a
+  -- fresh DB does not pay an unnecessary probe-then-rebuild pass for
+  -- 'conclusion' (v5) or 'skill' (v10). 'context_snapshot' (v16) is
+  -- already here. SQLite cannot ALTER a CHECK, so each migration that
+  -- adds a new type must rebuild the memories + memories_fts tables —
+  -- keeping the union up to date here eliminates that cost on the
+  -- happy path. See migrateAddConclusionType / migrateAddSkillType
+  -- in the MIGRATIONS array for the rebuild shape.
+  type          TEXT NOT NULL CHECK (type IN ('working','episodic','semantic','procedural','conclusion','skill','context_snapshot')),
   title         TEXT,
   content       TEXT NOT NULL,
   tags          TEXT NOT NULL DEFAULT '[]',  -- JSON array

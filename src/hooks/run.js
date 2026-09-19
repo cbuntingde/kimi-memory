@@ -38,6 +38,35 @@ import {
 // directly because module-load ordering would otherwise init EVENT
 // before the shim has had a chance to set KM_HOOK_EVENT.
 const HOME = kimiHome();
+const EVENT = process.env.KM_HOOK_EVENT || 'unknown';
+
+// Per-event hard timeouts (ms). Each value MUST be strictly shorter
+// than the `timeout` field on the matching hook in kimi.plugin.json:
+// the dispatcher enforces its own ceiling so it can release SQLite
+// handles and exit cleanly *while the process is still alive*. If
+// the dispatcher fires AFTER the manifest budget, the runtime has
+// already killed the process and the cleanup runs against a corpse.
+//
+// Manifest budgets (kimi.plugin.json):
+//   PreCompact, Interrupt, StopFailure, PostToolUse, PostToolUseFailure  →  5 s
+//   SessionStart, UserPromptSubmit                                       → 10 s
+//   Stop, SessionEnd                                                     → 15 s
+//
+// Dispatcher ceiling = manifest budget − 1 s safety margin.
+const HOOK_TIMEOUTS_MS = {
+  PreCompact: 4000,
+  Interrupt: 4000,
+  StopFailure: 4000,
+  PostToolUse: 4000,
+  PostToolUseFailure: 4000,
+  SessionStart: 9000,
+  UserPromptSubmit: 9000,
+  Stop: 14000,
+  SessionEnd: 14000,
+};
+function hookTimeoutMs(event) {
+  return HOOK_TIMEOUTS_MS[event] || 4000;
+}
 
 const HANDLERS = {
   SessionStart: handleSessionStart,
@@ -52,7 +81,6 @@ const HANDLERS = {
 };
 
 async function main() {
-  const EVENT = process.env.KM_HOOK_EVENT || 'unknown';
   setContext({ home: HOME, event: EVENT });
   const stdin = await readStdin(256 * 1024);
   // Truncation observability: when the Kimi runtime hands us a payload
@@ -105,23 +133,26 @@ async function main() {
 }
 
 // Hard-timeout guard: if anything blocks, release cached SQLite
-// handles (so any pending WAL writes flush) and exit cleanly after 8s.
-// Shorter than the manifest-level hook timeouts (10-15s) on purpose —
-// a slow hook that runs past 8s is most likely stuck on I/O we cannot
-// recover from.
-const t = setTimeout(() => {
-  try {
-    process.stderr.write(`[kimi-memory:hook:${_EVENT || 'unknown'}] timeout, exiting\n`);
-  } catch {
-    /* ignore */
-  }
-  try {
-    closeDb();
-  } catch {
-    /* ignore */
-  }
-  process.exit(0);
-}, 8000);
+// handles (so any pending WAL writes flush) and exit cleanly. The
+// ceiling is per-event (HOOK_TIMEOUTS_MS above) and is strictly less
+// than the manifest budget for that event so the cleanup runs before
+// the runtime force-kills us.
+const t = setTimeout(
+  () => {
+    try {
+      process.stderr.write(`[kimi-memory:hook:${EVENT}] timeout, exiting\n`);
+    } catch {
+      /* ignore */
+    }
+    try {
+      closeDb();
+    } catch {
+      /* ignore */
+    }
+    process.exit(0);
+  },
+  hookTimeoutMs(EVENT),
+);
 t.unref?.();
 
 // Only run the dispatcher when this module is loaded as a hook (i.e.

@@ -43,6 +43,25 @@ import { logEmbeddingError } from './diagnostics.js';
 export const EMBEDDING_DIM = 384;
 export const EMBEDDING_MODEL = 'Xenova/all-MiniLM-L6-v2';
 
+// Hugging Face Hub revision for the embedding model. Default is
+// `main`, which is the upstream-recommended choice for transformers.js
+// >=4 (no @v1 suffix). **This means every fresh install trusts
+// whatever is on `main` of `Xenova/all-MiniLM-L6-v2` at the time of
+// the first embed call.** The model file is loaded straight into
+// `onnxruntime-node`; a compromised HF Hub account or a MITM on the
+// download would yield arbitrary ONNX execution on first session.
+//
+// Operators on hardened networks (air-gapped, MITM-prone coffee-shop
+// WiFi, CI runners) MUST pin a specific git SHA via
+// `KIMI_MEMORY_EMBEDDING_REVISION=<40-char-hex>` before the first
+// embed call. Once the model lands in the local cache
+// (`env.cacheDir`), subsequent calls do not re-download.
+function getEmbeddingRevision() {
+  const v = process.env.KIMI_MEMORY_EMBEDDING_REVISION;
+  if (typeof v === 'string' && v.trim().length > 0) return v.trim();
+  return 'main';
+}
+
 // Default wall-clock cap for one embed call. Picked at 4s so the
 // persist layer (which is given 5s by the hook runner) can write the
 // `last_embed_error` row before the hook is forced to exit.
@@ -77,11 +96,15 @@ async function getPipeline() {
       // Node-side: disable browser cache, allow remote model download from HF Hub.
       env.allowLocalModels = false;
       env.useBrowserCache = false;
-      const pipe = await pipeline('feature-extraction', EMBEDDING_MODEL, { quantized: true });
+      const revision = getEmbeddingRevision();
+      const pipe = await pipeline('feature-extraction', EMBEDDING_MODEL, {
+        quantized: true,
+        revision,
+      });
       pipelineLoaded = true;
       lastError = null;
       // Tell the user the download happened on this first load.
-      noticeDownloadOnce(EMBEDDING_MODEL, env.cacheDir || null);
+      noticeDownloadOnce(EMBEDDING_MODEL, revision, env.cacheDir || null);
       return pipe;
     })();
   }
@@ -160,13 +183,15 @@ function warnOnce(msg) {
 // surprised by an outbound HTTPS request to Hugging Face Hub the
 // moment they save their first memory. (Audit fix.)
 let downloadNoticed = false;
-function noticeDownloadOnce(modelId, cacheDir) {
+function noticeDownloadOnce(modelId, revision, cacheDir) {
   if (downloadNoticed) return;
   downloadNoticed = true;
   try {
     const cache = cacheDir ? ` (cache: ${cacheDir})` : '';
+    const rev = revision && revision !== 'main' ? ` @ ${revision}` : '';
     process.stderr.write(
-      `[kimi-memory] first call downloaded embedding model ${modelId} (~25 MB) from Hugging Face Hub${cache}; subsequent calls use the local cache.\n`,
+      `[kimi-memory] first call downloaded embedding model ${modelId}${rev} (~25 MB) from Hugging Face Hub${cache}; subsequent calls use the local cache. ` +
+        `Set KIMI_MEMORY_EMBEDDING_REVISION=<sha> to pin a specific commit; the default tracks \`main\`.\n`,
     );
   } catch {
     /* ignore */

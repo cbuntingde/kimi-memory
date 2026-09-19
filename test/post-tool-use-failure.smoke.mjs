@@ -16,7 +16,13 @@ process.env.KIMI_MEMORY_HOME = TMP_HOME;
 process.env.HOME = TMP_HOME;
 
 const cwd = process.cwd();
-const projectRoot = 'C:/Chris-Dev/kimi-code';
+// Use a synthetic project root anchored under TMP_HOME so the smoke
+// test is portable: it derives a project key from any absolute path,
+// and we want one that does not collide with a real checkout on the
+// operator's machine. The previous shape hard-coded the maintainer's
+// local path (`C:/Chris-Dev/kimi-code`), which silently changed the
+// project key on every other machine that ran this file.
+const projectRoot = path.join(TMP_HOME, 'smoke-project-root');
 
 const { handlePostToolUseFailure } = await import(
   pathToFileURL(path.join(cwd, 'src/hooks/handlers/post-tool-use-failure.js')).href
