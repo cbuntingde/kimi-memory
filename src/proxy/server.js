@@ -164,7 +164,28 @@ export async function startProxy({
         if (err) return reject(err);
         try {
           const body = Buffer.concat(chunks).toString('utf8');
-          resolve(body.length === 0 ? {} : JSON.parse(body));
+          if (body.length === 0) {
+            resolve({});
+            return;
+          }
+          // Reject bodies nested deeper than the configured limit
+          // BEFORE handing the string to JSON.parse. A pathological
+          // body of `[[[[...]]]]` 10k levels deep otherwise hits V8's
+          // call-stack limit inside the parser and either throws
+          // `RangeError: Maximum call stack size exceeded` (older
+          // Node) or crashes the request handler (newer Node). The
+          // helper is exported (maxJsonDepth) so the behaviour can
+          // be unit-tested without spinning up the HTTP server.
+          const depthCheck = maxJsonDepth(body, 64);
+          if (!depthCheck.ok) {
+            reject(
+              new Error(
+                `request body too deep (${depthCheck.depth} nesting levels > 64)`,
+              ),
+            );
+            return;
+          }
+          resolve(JSON.parse(body));
         } catch (e) {
           reject(e);
         }
@@ -472,4 +493,51 @@ export function nonLoopbackToolGuard(toolName, { host } = {}) {
     .filter(Boolean);
   if (allowed.includes(toolName)) return null;
   return `tool ${toolName} is not allowed on a non-loopback bind (host=${bindHost}). Set KIMI_MEMORY_PROXY_ALLOW_TOOLS=${toolName} to opt in.`;
+}
+
+// Pre-flight depth check for inbound JSON bodies. Walks the raw
+// string and counts the maximum nesting depth of `[`/`{` minus
+// `]`/`}`, ignoring those that appear inside JSON strings (so a
+// quoted `"[[["` is not mis-counted) and skipping escaped quotes.
+// A pathological body of `[[[[...]]]]` 10k levels deep otherwise
+// reaches V8's call-stack limit inside JSON.parse and either
+// throws `RangeError: Maximum call stack size exceeded` (older
+// Node) or crashes the request handler (newer Node). The HTTP
+// transport calls this from readJson() before handing the string
+// to the parser; exported so the behaviour is unit-testable
+// without spinning up the server.
+export function maxJsonDepth(body, maxLevels = 64) {
+  let depth = 0;
+  let max = 0;
+  let inString = false;
+  let escape = false;
+  for (let i = 0; i < body.length; i += 1) {
+    const ch = body[i];
+    if (escape) {
+      escape = false;
+      continue;
+    }
+    if (inString) {
+      if (ch === '\\') {
+        escape = true;
+        continue;
+      }
+      if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+      continue;
+    }
+    if (ch === '{' || ch === '[') {
+      depth += 1;
+      if (depth > max) max = depth;
+      if (max > maxLevels) {
+        return { ok: false, depth: max };
+      }
+    } else if (ch === '}' || ch === ']') {
+      depth -= 1;
+    }
+  }
+  return { ok: true, depth: max };
 }

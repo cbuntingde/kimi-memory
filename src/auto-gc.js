@@ -443,27 +443,32 @@ export function runAutoTier(db, projectKey, { now = new Date() } = {}) {
     const updStmt = db.prepare(
       `UPDATE memories SET tier = ?, updated_at = ? WHERE id = ? AND project_key = ? AND tier != ?`,
     );
+    const prevStmt = db.prepare(
+      `SELECT tier FROM memories WHERE id = ? AND project_key = ?`,
+    );
     for (const id of ids) {
+      // Read the previous tier BEFORE the UPDATE. Within the same
+      // transaction, a SELECT issued after an UPDATE sees the
+      // post-update value, which would make persona_promotions
+      // record the destination tier as both from_tier and to_tier
+      // for every transition. The UPDATE's guard clause
+      // (`tier != ?`) still skips no-op rows, so a row that is
+      // already at the target tier produces 0 changes and we skip
+      // the audit row in that case too.
+      const prev = prevStmt.get(id, projectKey);
       const r = updStmt.run(toTier, ts, id, projectKey, toTier);
       if (r.changes > 0) {
-        // Re-read what the row looked like just before this transition
-        // would have applied so the audit log captures the *actual*
-        // from_tier. The UPDATE used a guard (`tier != ?`) so a row
-        // that was already at the target tier produces 0 changes and
-        // we skip the audit row.
-        const prev = db
-          .prepare(`SELECT tier FROM memories WHERE id=? AND project_key=?`)
-          .get(id, projectKey);
+        const fromTier = prev ? prev.tier : '?';
         // Build a deterministic-but-unique id for this audit row.
         // Mix ms + ns + Math.random so two transitions in the same
         // millisecond still produce distinct ids; the share.js
         // path uses a similar recipe.
         const stamp = `${nowIso()}:${Date.now() % 1e9}:${Math.random()}`;
-        const pid = `promo:${stamp}:${id}:${prev ? prev.tier : '?'}->${toTier}`
+        const pid = `promo:${stamp}:${id}:${fromTier}->${toTier}`
           .replace(/[^A-Za-z0-9_:>/-]/g, '_')
           .slice(0, 64);
         try {
-          insertPromoStmt.run(pid, id, prev ? prev.tier : '?', toTier, reason, ts);
+          insertPromoStmt.run(pid, id, fromTier, toTier, reason, ts);
         } catch {
           /* UNIQUE collision on rapid millisecond writes; ignore */
         }
