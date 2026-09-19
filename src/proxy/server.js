@@ -178,11 +178,7 @@ export async function startProxy({
           // be unit-tested without spinning up the HTTP server.
           const depthCheck = maxJsonDepth(body, 64);
           if (!depthCheck.ok) {
-            reject(
-              new Error(
-                `request body too deep (${depthCheck.depth} nesting levels > 64)`,
-              ),
-            );
+            reject(new Error(`request body too deep (${depthCheck.depth} nesting levels > 64)`));
             return;
           }
           resolve(JSON.parse(body));

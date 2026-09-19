@@ -443,9 +443,7 @@ export function runAutoTier(db, projectKey, { now = new Date() } = {}) {
     const updStmt = db.prepare(
       `UPDATE memories SET tier = ?, updated_at = ? WHERE id = ? AND project_key = ? AND tier != ?`,
     );
-    const prevStmt = db.prepare(
-      `SELECT tier FROM memories WHERE id = ? AND project_key = ?`,
-    );
+    const prevStmt = db.prepare(`SELECT tier FROM memories WHERE id = ? AND project_key = ?`);
     for (const id of ids) {
       // Read the previous tier BEFORE the UPDATE. Within the same
       // transaction, a SELECT issued after an UPDATE sees the

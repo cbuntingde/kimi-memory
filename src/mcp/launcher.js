@@ -58,22 +58,20 @@ if (requiredPackages.some((file) => !existsSync(path.join(pluginRoot, 'node_modu
   // Re-run the postinstall lifecycle for the two packages whose
   // prebuilt native binaries were skipped by `--ignore-scripts`.
   // Hard-coded names — no user input reaches this call.
-  const rebuildResult = spawnSync(
-    npm,
-    ['rebuild', 'onnxruntime-node', 'protobufjs'],
-    {
-      cwd: pluginRoot,
-      stdio: ['ignore', 'ignore', 'inherit'],
-      shell: process.platform === 'win32',
-    },
-  );
+  const rebuildResult = spawnSync(npm, ['rebuild', 'onnxruntime-node', 'protobufjs'], {
+    cwd: pluginRoot,
+    stdio: ['ignore', 'ignore', 'inherit'],
+    shell: process.platform === 'win32',
+  });
 
   if (rebuildResult.error) {
     process.stderr.write(`[kimi-memory] native rebuild failed: ${rebuildResult.error.message}\n`);
     process.exit(1);
   }
   if (rebuildResult.status !== 0) {
-    process.stderr.write(`[kimi-memory] native rebuild exited with status ${rebuildResult.status}\n`);
+    process.stderr.write(
+      `[kimi-memory] native rebuild exited with status ${rebuildResult.status}\n`,
+    );
     process.exit(rebuildResult.status || 1);
   }
 }

@@ -202,13 +202,13 @@ test('F2: maxJsonDepth accepts an empty body', () => {
 
 test('F2: maxJsonDepth accepts exactly the limit (64 levels)', () => {
   // 64 nested arrays — depth climbs to 64, which is `maxLevels`.
-  const body = '['.repeat(64) + ']' .repeat(64);
+  const body = '['.repeat(64) + ']'.repeat(64);
   const ok = maxJsonDepth(body, 64);
   assert.equal(ok.ok, true, `body at the limit must pass; depth=${ok.depth}`);
 });
 
 test('F2: maxJsonDepth rejects a body nested one level past the limit', () => {
-  const body = '['.repeat(65) + ']' .repeat(65);
+  const body = '['.repeat(65) + ']'.repeat(65);
   const ok = maxJsonDepth(body, 64);
   assert.equal(ok.ok, false, 'body one level past the limit must fail');
   assert.ok(ok.depth > 64, `reporter should expose the actual depth; got ${ok.depth}`);
@@ -216,7 +216,7 @@ test('F2: maxJsonDepth rejects a body nested one level past the limit', () => {
 
 test('F2: maxJsonDepth rejects a deeply nested pathological body', () => {
   // 10k levels — would otherwise blow V8's call stack inside JSON.parse.
-  const body = '['.repeat(10000) + ']' .repeat(10000);
+  const body = '['.repeat(10000) + ']'.repeat(10000);
   const ok = maxJsonDepth(body, 64);
   assert.equal(ok.ok, false);
 });
@@ -227,7 +227,11 @@ test('F2: maxJsonDepth ignores bracket characters inside JSON strings', () => {
   // has zero real nesting depth.
   const body = '{"k":"[[[[[[[[[[[[[[[[[[[[[[[[[[[[[[]]]]]]]]]]]]]]]]]]]]]]]]]]]]]]"}';
   const ok = maxJsonDepth(body, 64);
-  assert.equal(ok.ok, true, `string-internal brackets must not count as nesting; depth=${ok.depth}`);
+  assert.equal(
+    ok.ok,
+    true,
+    `string-internal brackets must not count as nesting; depth=${ok.depth}`,
+  );
 });
 
 test('F2: maxJsonDepth handles escaped quotes inside strings', () => {

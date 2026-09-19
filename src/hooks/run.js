@@ -137,22 +137,19 @@ async function main() {
 // ceiling is per-event (HOOK_TIMEOUTS_MS above) and is strictly less
 // than the manifest budget for that event so the cleanup runs before
 // the runtime force-kills us.
-const t = setTimeout(
-  () => {
-    try {
-      process.stderr.write(`[kimi-memory:hook:${EVENT}] timeout, exiting\n`);
-    } catch {
-      /* ignore */
-    }
-    try {
-      closeDb();
-    } catch {
-      /* ignore */
-    }
-    process.exit(0);
-  },
-  hookTimeoutMs(EVENT),
-);
+const t = setTimeout(() => {
+  try {
+    process.stderr.write(`[kimi-memory:hook:${EVENT}] timeout, exiting\n`);
+  } catch {
+    /* ignore */
+  }
+  try {
+    closeDb();
+  } catch {
+    /* ignore */
+  }
+  process.exit(0);
+}, hookTimeoutMs(EVENT));
 t.unref?.();
 
 // Only run the dispatcher when this module is loaded as a hook (i.e.
