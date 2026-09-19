@@ -198,19 +198,6 @@ export async function logPersistError(operation, error, context = {}) {
   await appendLog(record);
 }
 
-export async function logConversationIngestError(projectKey, sessionId, error, context = {}) {
-  const record = {
-    timestamp: nowIso(),
-    type: 'conversation_ingest_error',
-    project_key: projectKey,
-    session_id: sessionId,
-    error_code: error?.code || error?.name || 'unknown',
-    error_message: scrubError(error),
-    context: scrubContext(context),
-  };
-  await appendLog(record);
-}
-
 export async function logAutoExtractRetry(projectKey, attempt, delayMs, reason) {
   const record = {
     timestamp: nowIso(),
@@ -245,17 +232,6 @@ export async function logConfigValidationError(error, context = {}) {
     error_message: scrubError(error),
     field: context.field || null,
     context: scrubContext(context),
-  };
-  await appendLog(record);
-}
-
-export async function logPerformanceMetric(name, durationMs, context = {}) {
-  const record = {
-    timestamp: nowIso(),
-    type: 'perf_metric',
-    metric_name: name,
-    duration_ms: durationMs,
-    context,
   };
   await appendLog(record);
 }

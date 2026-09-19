@@ -116,7 +116,6 @@ export async function ensureProjectDir(kimiHomeDir, projectKey) {
 // queries never accidentally hit the global database.
 export const GLOBAL_PROJECT_KEY = '_global';
 export const GLOBAL_DIR_NAME = '_global';
-export const GLOBAL_SCOPE = 'global';
 
 export function globalDataDir(kimiHomeDir) {
   return path.join(kimiHomeDir, 'kimi-memory', GLOBAL_DIR_NAME);

@@ -22,7 +22,6 @@ export function setContext({ home, event }) {
 export const STATUS_RECENT_MEMORIES = 4;
 export const STATUS_RECENT_WM_SLOTS = 5;
 export const STATUS_RECENT_GLOBAL = 4;
-export const PROMPT_RECALL_LIMIT = 4;
 export const PROMPT_TOKEN_LIMIT = 6;
 
 // ---- Recall tuning (UserPromptSubmit hook) ----
@@ -93,6 +92,5 @@ export const AUTO_GC_THROTTLE_HOURS = 6;
 // 2026-08-02: previous bounds (min=6 events, latency=5min) made the
 // extract skip almost every real-world session.
 export const EXTRACT_MIN_EVENTS = 4;
-export const EXTRACT_MIN_AGE_MS = 0;
 export const EXTRACT_MAX_LATENCY_MS =
   Number(process.env.KIMI_MEMORY_EXTRACT_MAX_LATENCY_MS) || 30 * 60 * 1000;

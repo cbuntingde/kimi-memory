@@ -30,7 +30,6 @@ import {
   buildSessionThread,
   formatConsolidateSegment,
   setContext,
-  EVENT as _EVENT,
 } from './handlers/_helpers.js';
 
 // HOME is set once per process. EVENT is set per dispatch from the

@@ -188,10 +188,6 @@ export function asString(v, fallback = '') {
   return typeof v === 'string' ? v : fallback;
 }
 
-export function asArray(v) {
-  return Array.isArray(v) ? v : [];
-}
-
 // Truncate to `n` characters, appending an ellipsis when anything was
 // dropped. Non-strings pass through untouched so callers can feed it a
 // possibly-undefined value.
@@ -239,11 +235,6 @@ export const PATH_REGEX = /(?:[a-zA-Z]:)?[\\/][^\s"',;]+[\\/][^\s"',;]+/g;
 // Shell verbs recognised by the tool-call trigger layer.
 export const SHELL_VERB_REGEX =
   /\b(pnpm|npm|yarn|bun|node|npx|tsx|ts-node|python|pip|cargo|go|make|cmake|gradle|mvn|docker|kubectl|git|curl|wget|brew|apt|systemctl)\b/g;
-
-export function projectKeyFromCwd(cwd) {
-  if (!cwd) return null;
-  return createHash('sha256').update(path.resolve(cwd)).digest('hex').slice(0, 16);
-}
 
 // Sanitize an exception for return to a remote caller. Strips
 // absolute-path fragments, host:port fragments, and long stack dumps

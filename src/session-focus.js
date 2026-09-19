@@ -255,12 +255,6 @@ export function recordSessionFocusResult(projectKey, result) {
   _lastResultByKey.set(projectKey, { at: Date.now(), result });
 }
 
-export function takeLastSessionFocusResult(projectKey) {
-  if (!projectKey) return null;
-  const v = _lastResultByKey.get(projectKey);
-  return v || null;
-}
-
 export function _resetSessionFocusRegistryForTests() {
   _lastResultByKey.clear();
 }

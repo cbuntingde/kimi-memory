@@ -500,12 +500,6 @@ export function humanInterval(ms) {
   return `${d}d`;
 }
 
-// ---------- Diagnostic logging ----------
-
-export async function logDreamingDiag(level, message, context = {}) {
-  await logHookDiag('dreaming', level, message, context).catch(() => {});
-}
-
 // Re-export from dream.js so callers (especially the hook layer) can
 // read the staged job status without depending on two modules.
 export { buildDreamStatus };

@@ -48,12 +48,6 @@ export function resolveProjectRoot(input) {
   return { ok: false, error: 'project cwd is required' };
 }
 
-export function coerceString(v, max = 200000) {
-  if (typeof v !== 'string') return null;
-  if (v.length === 0 || v.length > max) return null;
-  return v;
-}
-
 export function validateType(v) {
   if (!TYPES.has(v)) return { ok: false, error: `type must be one of: ${[...TYPES].join(', ')}` };
   return { ok: true, value: v };

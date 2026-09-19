@@ -26,14 +26,6 @@ import { nowIso, hashId, shortId } from './util.js';
 export const CODEGRAPH_KINDS = ['imports', 'calls', 'defines'];
 const CODEGRAPH_KIND_SET = new Set(CODEGRAPH_KINDS);
 
-export function validCodegraphKinds() {
-  return [...CODEGRAPH_KIND_SET];
-}
-
-export function isValidCodegraphKind(kind) {
-  return CODEGRAPH_KIND_SET.has(kind);
-}
-
 /**
  * Extract function / class / const / method symbols + ES `import … from`
  * lines from a JavaScript or Python source body. The return shape is

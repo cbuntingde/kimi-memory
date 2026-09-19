@@ -248,12 +248,6 @@ export async function embedText(text) {
   return embedRaw(text);
 }
 
-// Synchronous availability probe. Useful for hooks / CLI / tests that
-// want to skip embedding work without paying the model-load latency.
-export function embeddingsAvailable() {
-  return pipelineLoaded;
-}
-
 // Synchronous read of the most recent embedding error. Returns null
 // when no error has been observed. Persist layer uses this when a
 // row is left in `embedding_status: 'pending'` to attribute the cause.

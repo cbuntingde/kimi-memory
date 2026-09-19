@@ -40,12 +40,6 @@ export function isValidTier(v) {
   return TIER_VALUES.has(v);
 }
 
-// Internal-but-exported handle so the memories module can validate
-// input tier values without re-declaring the vocabulary. The valid
-// public API is `validTiers()` / `isValidTier()`; the constant is
-// exposed only for cross-module consistency checks.
-export const TIER_VALUES_INTERNAL = TIER_VALUES;
-
 // Promote one or more memories to a new visibility level. Two modes:
 //
 //   toSharedPool: false (default)

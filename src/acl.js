@@ -11,31 +11,13 @@
 // and CLI subcommands.
 
 import { nowIso } from './util.js';
-import {
-  VISIBILITY_LEVELS,
-  VISIBILITY_SET,
-  PRINCIPAL_KINDS,
-  PRINCIPAL_KIND_SET,
-} from './vocabulary.js';
+import { VISIBILITY_LEVELS, PRINCIPAL_KINDS, PRINCIPAL_KIND_SET } from './vocabulary.js';
 
 // Five visibility levels mirroring TencentDB-Agent-Memory's
 // `AssetVisibility` enum, and the memories_acl principal kinds. Both
 // vocabularies live in ./vocabulary.js so the schema CHECK constraint,
 // the Set-based validators, and the MCP tool schemas cannot disagree.
 export { VISIBILITY_LEVELS, PRINCIPAL_KINDS };
-
-/**
- * Validate a visibility string. Returns the canonical string on
- * success or throws with a friendly message on failure. Accepts
- * `undefined` and returns `'private'` so callers can pass raw input.
- */
-export function validateVisibility(v) {
-  if (v == null || v === '') return 'private';
-  if (!VISIBILITY_SET.has(v)) {
-    throw new Error(`invalid visibility: ${v} (must be one of: ${VISIBILITY_LEVELS.join(', ')})`);
-  }
-  return v;
-}
 
 /**
  * Validate a principal kind string. Throws on invalid input.

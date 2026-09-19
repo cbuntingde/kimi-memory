@@ -276,12 +276,6 @@ export function recordWorkLogResult(projectKey, result) {
   _lastResultByKey.set(projectKey, { at: Date.now(), result });
 }
 
-export function takeLastWorkLogResult(projectKey) {
-  if (!projectKey) return null;
-  const v = _lastResultByKey.get(projectKey);
-  return v || null;
-}
-
 export function _resetWorkLogRegistryForTests() {
   _lastResultByKey.clear();
 }
