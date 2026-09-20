@@ -652,11 +652,31 @@ const MIGRATIONS = [
     // canonical flag gets the column stamped so legacy rows survive the
     // migration without a manual step. Idempotent — re-running on a
     // fully-stamped DB updates 0 rows.
-    db.exec(
-      'UPDATE memories SET is_session_focus = 1 ' +
-        "WHERE is_session_focus = 0 AND type = 'working' " +
-        'AND instr(metadata, \'"session_focus":true\') > 0',
-    );
+    //
+    // The loop re-runs on every open, so this pass cannot be removed
+    // without dropping the reconcile for rows an older build wrote
+    // without the column. It does not have to WRITE on every open, though:
+    // the probe below turns the steady state from "a full scan plus an
+    // UPDATE" into the scan alone, so a healthy open takes no write
+    // transaction at all — no WAL frame appended and no lock taken, on a
+    // startup path that every hook and MCP call walks. The scan itself is
+    // not avoidable here — EXPLAIN QUERY PLAN reports SCAN memories,
+    // because idx_memories_session_focus leads with project_key and this
+    // predicate names no project.
+    const needsSessionFocusBackfill = db
+      .prepare(
+        'SELECT 1 FROM memories ' +
+          "WHERE is_session_focus = 0 AND type = 'working' " +
+          'AND instr(metadata, \'"session_focus":true\') > 0 LIMIT 1',
+      )
+      .get();
+    if (needsSessionFocusBackfill) {
+      db.exec(
+        'UPDATE memories SET is_session_focus = 1 ' +
+          "WHERE is_session_focus = 0 AND type = 'working' " +
+          'AND instr(metadata, \'"session_focus":true\') > 0',
+      );
+    }
     const idx = db
       .prepare(
         "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_memories_session_focus'",
@@ -1062,13 +1082,27 @@ export function openDb(dbPath) {
   let db;
   try {
     db = new DatabaseSync(dbPath, { readOnly: false, create: true });
+    // Raise this connection's busy timeout first, before any statement
+    // that takes a file lock. It is per-connection state that touches no
+    // file, so it neither mutates the DB nor weakens the version gate
+    // below; it just has to precede the statements that DO take locks.
+    // The one that benefits in practice is the version read directly
+    // underneath: against a connection holding an EXCLUSIVE lock it now
+    // retries for the timeout instead of failing at once (measured: a
+    // contended read with busy_timeout=1500 returns after ~2.3 s, with no
+    // busy timeout it fails in ~0 ms). The `journal_mode = WAL` switch is
+    // NOT covered — SQLite deliberately bypasses the busy handler for a
+    // journal-mode change and still returns SQLITE_BUSY immediately — so a
+    // hook that collides with a header rewrite keeps its fail-open path.
+    db.exec(`PRAGMA busy_timeout = ${resolveBusyTimeoutMs()};`);
     // Schema-version gate. `PRAGMA user_version` is the authoritative
     // marker of which migration generation built this file; the
     // schema_meta row is kept alongside it for continuity and for
     // observers that already read it. Read the marker before any other
-    // PRAGMA so a build older than the file it is opening refuses
-    // without mutating it — `journal_mode = WAL` is itself a persistent
-    // change to the file header, so the check has to come first.
+    // mutating statement so a build older than the file it is opening
+    // refuses without changing it — `journal_mode = WAL` is itself a
+    // persistent change to the file header, so the check has to come
+    // first.
     const userVersion = readUserVersion(db);
     if (userVersion > SCHEMA_VERSION) {
       throw new Error(
@@ -1081,14 +1115,6 @@ export function openDb(dbPath) {
     db.exec('PRAGMA journal_mode = WAL;');
     db.exec('PRAGMA foreign_keys = ON;');
     db.exec('PRAGMA synchronous = NORMAL;');
-    // The hook runner and the MCP server are separate processes that
-    // both write to the same DB. WAL allows concurrent readers + a
-    // single writer, but a second writer must wait for the first to
-    // commit; without a busy_timeout SQLite returns SQLITE_BUSY
-    // immediately. Default 30s for the long-lived processes; the hook
-    // shim overrides it via KIMI_MEMORY_BUSY_TIMEOUT_MS to fit its
-    // shorter budget.
-    db.exec(`PRAGMA busy_timeout = ${resolveBusyTimeoutMs()};`);
     db.exec(SCHEMA_SQL);
     // Conservative gating variant. Every entry in MIGRATIONS is
     // idempotent, so re-running the loop on a file that is already at

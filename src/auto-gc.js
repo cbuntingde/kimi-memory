@@ -183,21 +183,29 @@ export function runAutoPrune(db, projectKey, { now = new Date() } = {}) {
   // (FTS first, then memories) and overwrote pruned_deleted with
   // the second, hiding the FTS count. (Audit finding F-006 / B2-7.)
   //
-  // (Audit finding F-004 — collect the candidate IDs first, sweep
-  // FTS by those IDs, then delete from `memories`. The prior shape
-  // deleted `memories` before FTS, leaving the FTS subquery empty
-  // and stale FTS rows behind. Same helper reused for superseded,
-  // embed_failed, and cold.)
+  // (Audit finding F-004 — the FTS sweep resolves its subquery against the
+  // `memories` rows, so it has to run BEFORE the delete that removes them:
+  // issued afterwards it matches nothing and leaves stale FTS rows. Both
+  // statements now share one SAVEPOINT, so the FTS row and its `memories`
+  // row are a single unit — a failure in the second delete can no longer
+  // strand a live memory that MATCH recall and codegraph matching cannot
+  // find again. Same helper reused for superseded, embed_failed, and cold.)
   const deleteExpiredPair = (label, memoryWhere, ...args) => {
-    const ids = db.prepare(`SELECT id FROM memories WHERE ${memoryWhere}`).all(...args);
-    if (ids.length === 0) return 0;
-    const placeholders = ids.map(() => '?').join(',');
-    safeDelete(
-      `${label}_fts`,
-      `DELETE FROM memories_fts WHERE id IN (${placeholders})`,
-      ...ids.map((row) => row.id),
-    );
-    return safeDelete(`${label}_mem`, `DELETE FROM memories WHERE ${memoryWhere}`, ...args);
+    try {
+      return withSavepoint(db, `auto_prune_${label}`, () => {
+        try {
+          db.prepare(
+            `DELETE FROM memories_fts WHERE id IN (SELECT id FROM memories WHERE ${memoryWhere})`,
+          ).run(...args);
+        } catch {
+          /* a schema without the memories_fts mirror still prunes the row */
+        }
+        return db.prepare(`DELETE FROM memories WHERE ${memoryWhere}`).run(...args).changes || 0;
+      });
+    } catch (e) {
+      result.error = e && e.message ? e.message : String(e);
+      return 0;
+    }
   };
 
   result.pruned_deleted = deleteExpiredPair(

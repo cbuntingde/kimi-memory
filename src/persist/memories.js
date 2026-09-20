@@ -379,12 +379,28 @@ export function saveMemory(db, projectKey, input) {
     // silently reset to 0 by the next routine save, re-enabling the
     // full scan this column exists to avoid. Behaviour is unchanged for
     // the canonical `{"session_focus":true}` shape.
+    //
+    // The UPDATE below only rewrites the column when the caller actually
+    // supplied metadata — the same presence contract `supersedes` and
+    // `expires_at` use, and the same condition (`!= null`) that decides
+    // whether the metadata column itself is written. Before this the
+    // flag was derived from the caller's metadata unconditionally, so a
+    // partial re-save that omitted metadata (saveMemory(db, key, {id,
+    // priority})) wrote is_session_focus = 0 while the stored metadata
+    // still said `{"session_focus":true}` — a row that contradicted
+    // itself, and the "where we left off" line silently disappeared from
+    // the SessionStart render for good.
     const metaForFocus = safeParseJson(
       metadata,
       {},
       (v) => v && typeof v === 'object' && !Array.isArray(v),
     );
     const isSessionFocus = metaForFocus.session_focus === true ? 1 : 0;
+    // Presence flag for the session-focus column, bound in the UPDATE
+    // below. A key omitted (undefined) or explicitly null both leave the
+    // stored metadata column untouched via COALESCE, so the column has
+    // to keep the stored flag in exactly those cases.
+    const hasMetadata = input.metadata != null;
     // `supersedes` needs the same presence flag the expires_at binding
     // below uses, with one wrinkle: `input.supersede` can resolve a
     // prior row's id into `supersedesId` even when the caller never
@@ -414,7 +430,7 @@ export function saveMemory(db, projectKey, input) {
           task_id = CASE WHEN ? THEN ? ELSE task_id END,
           tier = COALESCE(?, tier),
           persona_id = CASE WHEN ? THEN ? ELSE persona_id END,
-          is_session_focus = ?,
+          is_session_focus = CASE WHEN ? THEN ? ELSE is_session_focus END,
           updated_at = ?,
           last_rehearsed_at = ?
         WHERE id = ?
@@ -463,6 +479,7 @@ export function saveMemory(db, projectKey, input) {
         input.tier ?? null,
         input.persona_id !== undefined ? 1 : 0,
         input.persona_id ?? null,
+        hasMetadata ? 1 : 0,
         isSessionFocus,
         now,
         now,

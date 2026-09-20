@@ -5,6 +5,163 @@ All notable changes to `kimi-memory` are recorded here. Versions follow
 the global DB is not touched; "Breaking" notes mean a stored row from a
 prior version is rejected / migrated by the schema upgrade on first open.
 
+## [Unreleased]
+
+A second-pass audit of the 0.7.0 tree: eleven fixes, each with a failing
+reproduction first and a regression test left behind. The two recurring
+themes are inputs that reach a boundary unvalidated (the proxy, the DNS
+name behind a base URL, the `offset` on a list call) and writes that are
+not the single unit they claim to be (a save that clears a column it was
+never asked to touch, two savepoints where one was needed).
+
+### Security — `[__proto__]` in `config.toml` polluted `Object.prototype`
+
+`parseToml` built its section tree by assigning through `node[key]` on
+plain objects, so a `[__proto__]` header made `node` become
+`Object.prototype` and every following line wrote an own property onto it
+— process-wide, from a file on disk, on a path that runs on every
+auto-extract pass. Chain-walking names (`__proto__`, `constructor`,
+`prototype`) are now dropped and every write goes through
+`Object.defineProperty`, which cannot reach a setter inherited from the
+chain (`src/toml.js`, `tests/70-toml-prototype-pollution.test.js`).
+
+### Security — the HTTP proxy dispatched around the tool's own schema
+
+The tool registry handed the proxy the bare post-resolve callback, which
+it called directly, so the SDK's `safeParseAsync` step never ran on an
+HTTP body. Undeclared keys survived (a smuggled `scope: "global"` reached
+`openScopeDb` on a tool whose schema has no `scope`, and wrote to the
+cross-project store) and no declared cap applied (`memory_diagnostics
+{limit: 1000000}` selected the whole log instead of the schema's 500).
+The registry now stores `{ schema, fn }` — the raw shape wrapped in
+`z.object()` so it is actually parseable — and dispatchTool parses every
+body before dispatch. A rejected body is a 400, an unknown tool is still
+a 404, and an `isError` tool-result is no longer returned as 200
+(`src/mcp/lib/register-tool.js`, `src/proxy/server.js`,
+`tests/71-proxy-schema-validation.test.js`).
+
+The non-loopback destructive-tool set also gained the three tools it was
+missing: `memory_promote_to_global` (moves rows out of the project DB),
+`dream_apply_job` (soft-supersedes live sources) and `dreaming`
+(`sub: "run", force: true` runs GC and defeats the debounce).
+
+### Security — the base-URL guard judged one name, not the address
+
+`guardLlmBaseUrl` is synchronous and offline by contract, so it only
+refused literal private IPs and the bare name `localhost`: a NAME that
+resolves to loopback (`127.0.0.1.nip.io`, `localtest.me`) passed, and so
+did the CGNAT (`100.64/10`) and benchmarking (`198.18/15`) blocks, both
+of which route to internal services on real networks. The two blocks are
+now in the IPv4 table, and `resolveLlmTarget` resolves the host at the
+single network boundary — refusing an unresolvable name, `localhost`, or
+any address the name maps to that is loopback / private / link-local
+(`src/extract.js`). That resolution is bounded at 2 s and an expiry is
+refused like an NXDOMAIN, because it runs on the Stop path _before_ the
+ingest-state write (`src/hooks/handlers/stop.js:100-105`) with the LLM leg
+behind it already spending ~9 s of the 14 s ceiling: an unbounded
+`getaddrinfo` — which has no timeout of its own — would cost the session
+cursor rather than just the extraction.
+
+### Fixed — a partial save cleared the session-focus marker
+
+`saveMemory` derived `is_session_focus` from the caller's metadata and
+wrote it unconditionally, so a patch that named no metadata
+(`saveMemory(db, key, { id, priority })`) flipped an existing session-focus
+row from 1 to 0 while its stored metadata still said
+`{"session_focus":true}` — a row that contradicted itself, and the "where
+we left off" line vanished from every later render. The column now uses
+the same presence flag the neighbouring nullable columns use, keyed on
+whether metadata was actually supplied (`src/persist/memories.js`).
+
+### Fixed — `resetProject` could never succeed on a large project
+
+The FTS sweep built one SQL placeholder per memory row, which hits
+SQLite's 32766-bound-variable ceiling — the whole reset threw and rolled
+back, even though the dry run succeeded, so `memory_reset_project
+--confirm` (and the re-clone auto-reset command that tells the user to
+run it) failed on exactly the projects it exists for. It is now a single
+parameterised subquery (`src/persist/project.js`).
+
+### Fixed — auto-prune could strand a memory with no search index
+
+`deleteExpiredPair` used two `safeDelete` calls, i.e. two savepoints, so
+the FTS row committed while its `memories` row was still pending. A
+failure in the second delete (or a crash between them) left a live memory
+that `memories_fts MATCH` recall and codegraph matching can never find
+again. Both statements now share one savepoint, and the sweep runs before
+the delete that empties its subquery (`src/auto-gc.js`).
+
+### Fixed — the hook crashed instead of failing open on a closed pipe
+
+A closed stdout pipe arrives asynchronously as an `'error'` event, so the
+`try { process.stdout.write() } catch {}` around every write never saw it:
+the event was unhandled, Node printed a stack and the process exited 1 —
+the opposite of the file's own fail-open contract. The dispatcher now
+installs a stream error listener at module scope
+(`src/hooks/run.js`).
+
+### Fixed — an overflowing embed timeout aborted every embed call
+
+`KIMI_MEMORY_EMBED_TIMEOUT_MS` accepted any digit string, so a value above
+2^31-1 overflowed Node's timer, warned, and fired after ~1 ms: every embed
+call aborted with `embed_timeout` and recall silently degraded to
+FTS-only. The value is clamped to the largest accepted delay
+(`src/embedding.js`).
+
+### Fixed — PEM block redaction was quadratic; an unbounded `offset`
+
+`PEM_BLOCK_RE` used a lazy `[\s\S]*?` body, so every unclosed
+`-----BEGIN … PRIVATE KEY-----` retried a match from its own position to
+the end of the text. Measured through `redactSecrets` on a tail of
+unclosed headers — the shape a key repeatedly echoed across a session
+produces — 512 KB cost ~273 ms, 1.25 MB ~1724 ms and 2.5 MB ~6978 ms:
+five times the input for twenty-five times the work, on a path reached
+from a raw wire line with no size limit, under a 14 s Stop budget.
+
+Capping the body does not fix it. A bounded lazy quantifier loses V8's
+literal-lookahead fast path, so 512 KB measured 2814 ms _with_ the cap,
+and a "no `-----END` in the text, skip the pass" pre-check only covers the
+zero-marker case: one stray `-----END` at the end of the text still cost
+3355 ms, and four spread through it 1292 ms (14.7 s and 13.5 s at 2.5 MB).
+
+The block pass is now a linear `indexOf` scanner, not a regex: every
+well-formed `-----END … PRIVATE KEY-----` footer is located once in a
+forward pass and one forward-only pointer walks that list as the BEGIN
+positions advance, so no position is ever rescanned for a second header.
+The same three shapes now measure ~26 ms, ~24 ms and ~13 ms at 512 KB and
+~125 ms at 2.5 MB — ~5x the work for 5x the input — with `looksLikeSecret`
+(which runs on every write) at ~4 ms on 2.5 MB. The 64 KiB body cap stays
+as defence in depth so one stray `BEGIN` cannot swallow a distant `END`,
+and the scanner claims exactly the spans the capped regex claimed, so no
+shape loses scrub coverage (`src/secrets.js`).
+
+`validateOffset` accepted any finite non-negative number, so
+`memory_list {offset: 1e30}` handed node:sqlite a value it rejects with a
+raw `ERR_SQLITE_ERROR` datatype mismatch. It is now clamped to 1e9
+(`src/validation.js`).
+
+### Fixed — read-only opens re-ran the v12 reconcile as a write
+
+The migration loop is re-entrant by design (the v12 pass re-derives
+`is_session_focus` for rows an older build wrote without it), so every
+open ran an unconditional `UPDATE memories SET is_session_focus = 1 …`.
+An existence probe now short-circuits it, so a steady-state open — and
+any read-only open — does no work (`src/persist/connection.js`).
+
+### Fixed — `busy_timeout` was set after the version read
+
+The connection raised `PRAGMA busy_timeout` after the schema-version read
+and after the WAL switch, so the version read ran at SQLite's 0 ms
+default: against a connection holding an exclusive lock it failed
+immediately instead of waiting, and a hook turns that into a dropped
+event. The pragma now runs first — it is per-connection state that
+touches no file, so it neither mutates the DB nor weakens the version
+gate (`src/persist/connection.js`). Measured: a contended version read
+with `busy_timeout=1500` now returns after ~2.3 s where it failed in
+~0 ms. The WAL switch itself is not covered by this — SQLite bypasses the
+busy handler for a journal-mode change — so that half of the finding is
+bounded but not eliminated.
+
 ## [0.7.0] — 2026-09-19
 
 ### Fixed — two earlier audit findings that never actually landed

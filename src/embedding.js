@@ -90,7 +90,12 @@ function getEmbedTimeoutMs() {
   const v = process.env.KIMI_MEMORY_EMBED_TIMEOUT_MS;
   if (v && /^\d+$/.test(v)) {
     const n = parseInt(v, 10);
-    if (Number.isFinite(n) && n > 0) return n;
+    // Ceiling as well as floor. A value above 2^31-1 overflows Node's
+    // timer: setTimeout emits a TimeoutOverflowWarning and clamps to
+    // 1 ms, so every embed call aborted instantly with embed_timeout and
+    // recall silently degraded to FTS-only for as long as the override
+    // was set. The cap is the largest delay setTimeout accepts.
+    if (Number.isFinite(n) && n > 0) return Math.min(n, 2147483647);
   }
   return DEFAULT_EMBED_TIMEOUT_MS;
 }

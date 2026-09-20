@@ -75,10 +75,11 @@ export function makeServer({ kimiHomeDir, pluginRootDir, logger } = {}) {
   const { version: pkgVersion } = require('../package.json');
   const server = new McpServer({ name: 'kimi-memory', version: pkgVersion });
 
-  // Per-tool handlers populate this Map<name, async fn> as they
+  // Per-tool handlers populate this Map<name, {schema, fn}> as they
   // register. The proxy reads it directly instead of reaching into
   // the SDK's private `_registeredTools` / `_tools` fields — see
-  // src/proxy/server.js dispatchTool().
+  // src/proxy/server.js dispatchTool(). The schema travels alongside the
+  // handler so the HTTP path can run the same parse the SDK would.
   const handlers = new Map();
 
   // Always-on domain modules (37 tools): memory CRUD + share + working

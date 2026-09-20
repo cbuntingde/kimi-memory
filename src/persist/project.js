@@ -572,20 +572,15 @@ export function resetProject(db, projectKey, { canonicalRoot = '' } = {}) {
     project_path_preserved: false,
   };
   // node:sqlite does not expose a `db.transaction()` helper, so we run
-  // BEGIN / COMMIT manually and roll back on any error. The DELETEs are
-  // per-row and the UPDATE is a single statement, so the transaction
-  // wraps at most a few hundred rows; the round-trip is sub-ms.
+  // BEGIN / COMMIT manually and roll back on any error. Every statement is
+  // scoped to project_key, so the transaction touches one project's rows
+  // and nothing else: cheap on a small project, and on a large one the
+  // work is bounded by that project's own row count (33k memories measure
+  // ~0.5 s). That cost is the price of the all-or-nothing reset the dry
+  // run promises — the previous row-per-placeholder FTS sweep could not
+  // complete at that size at all.
   db.exec('BEGIN');
   try {
-    // Capture the project's memory ids BEFORE the DELETE below. The FTS5
-    // mirror only carries an `id` column (no project_key lookup the delete
-    // can use as a filter in the same statement), so the ids have to be
-    // read while the rows still exist — selecting them afterwards always
-    // returns an empty set. (Audit fix M3 — corrected.)
-    const memIds = db
-      .prepare('SELECT id FROM memories WHERE project_key=?')
-      .all(projectKey)
-      .map((r) => r.id);
     // memories_acl and persona_promotions have no project_key column (see
     // the schema in connection.js): a row is keyed on memory_id alone, so
     // "belongs to this project" means "its memory_id names a memories row
@@ -608,13 +603,19 @@ export function resetProject(db, projectKey, { canonicalRoot = '' } = {}) {
     summary.skill_invocations_deleted = db
       .prepare('DELETE FROM skill_invocations WHERE project_key=?')
       .run(projectKey).changes;
+    // The FTS5 mirror carries `id` but no column to scope a project by, so
+    // it is swept with the same subquery as the two ACL / tier deletes
+    // above — and, like them, before the memories DELETE empties the
+    // subquery's source. The previous shape listed one placeholder per row,
+    // which hits SQLite's 32766-variable ceiling on a large project: the
+    // whole reset threw and rolled back, so `--confirm` could never succeed
+    // even though the dry run did. One parameter now, however many rows.
+    db.prepare(
+      'DELETE FROM memories_fts WHERE id IN (SELECT id FROM memories WHERE project_key=?)',
+    ).run(projectKey);
     summary.memories_deleted = db
       .prepare('DELETE FROM memories WHERE project_key=?')
       .run(projectKey).changes;
-    if (memIds.length > 0) {
-      const placeholders = memIds.map(() => '?').join(',');
-      db.prepare(`DELETE FROM memories_fts WHERE id IN (${placeholders})`).run(...memIds);
-    }
     summary.working_memory_deleted = db
       .prepare('DELETE FROM working_memory WHERE project_key=?')
       .run(projectKey).changes;

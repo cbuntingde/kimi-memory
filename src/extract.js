@@ -18,6 +18,7 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { isIP } from 'node:net';
+import { lookup } from 'node:dns/promises';
 import { nowIso, safeJsonParse, asString } from './util.js';
 import { withLlmRetry } from './retry.js';
 import { logAutoExtractError } from './diagnostics.js';
@@ -27,6 +28,16 @@ import { looksLikeSecret, redactSecrets } from './secrets.js';
 const MAX_CANDIDATES_PER_CALL = 6; // bumped from 3 to make room for durable + context_snapshot
 const MAX_INPUT_CHARS = 12000; // ~3k tokens of conversation context
 const LLM_TIMEOUT_MS = 4000; // hard cap on the chat call
+
+// Wall-clock cap on the DNS resolution the base-URL guard performs. That
+// resolution runs on the Stop path BEFORE the ingest-state write
+// (src/hooks/handlers/stop.js:100-105), and the LLM leg behind it already
+// spends up to ~9 s of the 14 s dispatcher ceiling
+// (HOOK_TIMEOUTS_MS.Stop in src/hooks/run.js), so an unbounded
+// `getaddrinfo` — which has no timeout of its own — against a black-holed
+// resolver would eat the remainder and lose the session cursor those writes
+// carry. 2 s is the largest wait that still leaves the LLM leg its budget.
+const DNS_LOOKUP_TIMEOUT_MS = 2000;
 
 // Secret detection + redaction live in the leaf module `secrets.js` so
 // the storage layer's write gate can use them without importing this
@@ -235,7 +246,11 @@ export async function readConfig(homeDir) {
 // Resolve the chat target the agent would use. Returns { provider, model,
 // apiKey, baseUrl, type } or { error: 'reason' } so the caller can skip
 // cleanly without a try/catch.
-export async function resolveLlmTarget(homeDir) {
+//
+// `lookupImpl` is a test seam for the base-URL guard's DNS step, matching the
+// injection style the rest of this module uses (callLlm, resolveLlmTargetImpl,
+// secretDetector). Real callers never pass it.
+export async function resolveLlmTarget(homeDir, { lookupImpl = lookup } = {}) {
   const cfg = await readConfig(homeDir);
   if (!cfg || typeof cfg !== 'object') return { error: 'no_config' };
   const defaultModel = asString(cfg.default_model);
@@ -263,6 +278,60 @@ export async function resolveLlmTarget(homeDir) {
     const guarded = guardLlmBaseUrl(baseUrl);
     if (!guarded.ok) {
       return { error: `base_url_blocked:${guarded.reason}`, baseUrl };
+    }
+    // The pure guard above judges literal IPs and the bare name
+    // `localhost` only — it is synchronous and offline by contract — so a
+    // NAME that resolves to loopback, or to a CGNAT / benchmarking
+    // address, sailed straight through: `https://127.0.0.1.nip.io/`,
+    // `https://localtest.me/`, `https://100.64.0.1/`, `https://198.18.0.1/`.
+    // Resolve the name here, at the single network boundary, and refuse
+    // when any address it maps to is loopback / private / link-local.
+    // Fail closed: this path is opt-in, and an unresolvable provider is
+    // not a working provider.
+    let resolvedHost;
+    // The parse cannot fail here — guardLlmBaseUrl just parsed the same
+    // string and returned ok — but this function is documented to report
+    // every failure as `{ error }` and its caller awaits it un-wrapped
+    // (extract.js:899), so a throw would break the module's fail-open
+    // contract. Cheap insurance behind that contract, not a live branch.
+    try {
+      resolvedHost = normalizeHostname(new URL(baseUrl).hostname);
+    } catch {
+      return { error: 'base_url_blocked:unparseable_url', baseUrl };
+    }
+    if (resolvedHost === 'localhost') {
+      return { error: 'base_url_blocked:private_host:localhost', baseUrl };
+    }
+    if (isIP(resolvedHost) === 0) {
+      let addresses;
+      // Bounded race: `getaddrinfo` has no timeout of its own and this call
+      // sits between the ingest and the ingest-state write, so a hanging
+      // resolver would cost the session cursor rather than just the
+      // extraction. An expiry is treated exactly like an NXDOMAIN — fail
+      // closed.
+      let dnsTimer = null;
+      try {
+        addresses = await Promise.race([
+          lookupImpl(resolvedHost, { all: true }),
+          new Promise((_, reject) => {
+            dnsTimer = setTimeout(() => {
+              const err = new Error(`dns_lookup_timeout after ${DNS_LOOKUP_TIMEOUT_MS}ms`);
+              err.code = 'ETIMEDOUT';
+              reject(err);
+            }, DNS_LOOKUP_TIMEOUT_MS);
+          }),
+        ]);
+      } catch {
+        return { error: `base_url_unresolvable:${resolvedHost}`, baseUrl };
+      } finally {
+        if (dnsTimer) clearTimeout(dnsTimer);
+      }
+      if (!Array.isArray(addresses) || addresses.length === 0) {
+        return { error: `base_url_unresolvable:${resolvedHost}`, baseUrl };
+      }
+      if (addresses.some((a) => isPrivateHost(normalizeHostname(a && a.address)))) {
+        return { error: `base_url_blocked:private_host:${resolvedHost}`, baseUrl };
+      }
     }
   }
   return {
@@ -296,7 +365,10 @@ function normalizeHostname(hostname) {
 // auditable: 0.0.0.0/8 ("this network"), 10/8, the whole of 127/8 (the
 // old check only knew 127.0.0.1 — every other 127.x.y.z is equally
 // loopback), 169.254/16 (link-local; contains the cloud metadata service
-// at 169.254.169.254), 172.16/12 and 192.168/16.
+// at 169.254.169.254), 172.16/12, 192.168/16, 100.64/10 (CGNAT, RFC 6598
+// — carrier-grade NAT space that routes to internal services on plenty of
+// real networks) and 198.18/15 (benchmarking, RFC 2544 — frequently
+// repurposed as a second private range).
 function isPrivateIpv4(addr) {
   const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(addr);
   if (!m) return false;
@@ -309,7 +381,9 @@ function isPrivateIpv4(addr) {
     a === 127 ||
     (a === 169 && b === 254) ||
     (a === 172 && b >= 16 && b <= 31) ||
-    (a === 192 && b === 168)
+    (a === 192 && b === 168) ||
+    (a === 100 && b >= 64 && b <= 127) ||
+    (a === 198 && (b === 18 || b === 19))
   );
 }
 
@@ -377,7 +451,9 @@ export function isPrivateIpv6(addr) {
 
 // True when the host must never receive the (redacted) transcript. DNS
 // names are deliberately not resolved — the guard stays deterministic and
-// offline — so the only name it can judge is `localhost`.
+// offline — so the only name it can judge is `localhost`. resolveLlmTarget
+// does the resolution step separately, at the network boundary, and feeds
+// every address a name maps to back through this predicate.
 function isPrivateHost(host) {
   if (host === 'localhost') return true;
   const kind = isIP(host);
