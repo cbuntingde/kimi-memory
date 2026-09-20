@@ -89,6 +89,18 @@ const ARCHIVE_SKILL_INVOCATIONS_DAYS = 90;
 // history is useful for audit but rarely a year old.
 const ARCHIVE_PERSONA_PROMOTIONS_DAYS = 365;
 
+// Drop settled Dream lifecycle rows older than 90 days: the job and
+// every proposal it holds, as one unit (dream_proposals.job_id is a
+// FOREIGN KEY, so the children go first). Only terminal jobs qualify —
+// an `applied` job is a closed audit record, and `cancelled` / `failed`
+// / `stale` are equally finished. A job in `queued`, `running`, `ready`
+// or `partially_applied` is *pending work*: its proposals are what
+// `dream_status` reports and what a later explicit apply would commit,
+// so it is never touched here. Without this sweep the pending sets that
+// a floor-limited apply leaves behind had no bound other than a full
+// project wipe.
+const ARCHIVE_DREAM_JOBS_DAYS = 90;
+
 // Drop rotated diagnostic backups older than 90 days. Mirrors the
 // per-row archive windows above. Lives in diagnostics.js for the
 // actual filesystem sweep; here we just trigger it on the same
@@ -293,12 +305,16 @@ export function runAutoPrune(db, projectKey, { now = new Date() } = {}) {
 
 // Drop raw audit rows older than their respective windows. The aggregate
 // signal (memory counts, current tier, etc.) is preserved elsewhere;
-// the raw rows are useful only for short-term debugging.
+// the raw rows are useful only for short-term debugging. Dream
+// lifecycle rows are the exception that proves the rule: settled jobs
+// are dropped, outstanding ones never are (they are the work queue).
 export function runAutoArchive(db, projectKey, { now = new Date() } = {}) {
   const result = {
     archived_conversation_events: 0,
     archived_skill_invocations: 0,
     archived_persona_promotions: 0,
+    archived_dream_jobs: 0,
+    archived_dream_proposals: 0,
     archived_log_backups: 0,
     skipped: null,
     error: null,
@@ -370,6 +386,43 @@ export function runAutoArchive(db, projectKey, { now = new Date() } = {}) {
       projectKey,
       ARCHIVE_PERSONA_PROMOTIONS_DAYS,
     );
+  }
+
+  // Dream lifecycle rows: settle the audit trail, keep the work queue.
+  // Terminal statuses only — see ARCHIVE_DREAM_JOBS_DAYS. The two
+  // DELETEs share one savepoint so a failure between them cannot leave
+  // a job behind whose proposals are already gone (an empty terminal
+  // job would still be counted by `dream_status`).
+  try {
+    const swept = withSavepoint(db, 'auto_archive_dream', () => {
+      const proposals =
+        db
+          .prepare(
+            `DELETE FROM dream_proposals
+             WHERE project_key = ?
+               AND job_id IN (
+                 SELECT id FROM dream_jobs
+                 WHERE project_key = ?
+                   AND status IN ('applied','cancelled','failed','stale')
+                   AND julianday('now') - julianday(updated_at) >= ?
+               )`,
+          )
+          .run(projectKey, projectKey, ARCHIVE_DREAM_JOBS_DAYS).changes || 0;
+      const jobs =
+        db
+          .prepare(
+            `DELETE FROM dream_jobs
+             WHERE project_key = ?
+               AND status IN ('applied','cancelled','failed','stale')
+               AND julianday('now') - julianday(updated_at) >= ?`,
+          )
+          .run(projectKey, ARCHIVE_DREAM_JOBS_DAYS).changes || 0;
+      return { proposals, jobs };
+    });
+    result.archived_dream_proposals = swept.proposals;
+    result.archived_dream_jobs = swept.jobs;
+  } catch (e) {
+    result.error = e && e.message ? e.message : String(e);
   }
 
   // Diagnostic log backups live on disk under _diagnostics/, not in

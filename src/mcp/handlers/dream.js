@@ -1,6 +1,6 @@
 // Dream (staged consolidation) MCP handlers (9 tools).
 //
-//   dream_list_jobs           — list queued/running/ready/applied/failed jobs
+//   dream_list_jobs           — list queued/running/ready/partially_applied/applied/failed/cancelled jobs
 //   dream_get_job             — fetch a job + its proposals
 //   dream_list_proposals      — filter proposals within a job
 //   dream_get_proposal        — fetch one proposal

@@ -198,8 +198,14 @@ export function register(server, handlers, home) {
           memoryLink: linkMemory,
           mergeMemory,
           kimiHomeDir: home,
+          // Pass the validated set through: the earlier shape computed
+          // it, validated it, then ran the project's configured set and
+          // only relabelled the response — so `include:"consolidate,gc"`
+          // reported `include:['consolidate','gc']` while the dream pass
+          // had run too (and its summary was dropped by a missing
+          // return, which is why the mismatch went unnoticed).
+          include: passes,
         });
-        result.include = passes;
         return {
           operation: 'dreaming_run',
           project_key: key,

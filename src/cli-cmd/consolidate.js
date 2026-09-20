@@ -91,10 +91,13 @@ export async function cmdConsolidate(args) {
            WHERE project_key=? ORDER BY datetime(at) DESC LIMIT 1`,
         )
         .get(key);
+      // A partially-applied job did commit live writes (its proposals
+      // above the floor), so it belongs in "when did a Dream apply last
+      // run" alongside a fully applied one.
       const lastDreamApply = db
         .prepare(
           `SELECT id, applied_at AS at FROM dream_jobs
-           WHERE project_key=? AND status='applied' AND applied_at IS NOT NULL
+           WHERE project_key=? AND status IN ('applied','partially_applied') AND applied_at IS NOT NULL
            ORDER BY datetime(applied_at) DESC LIMIT 1`,
         )
         .get(key);

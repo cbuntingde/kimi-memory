@@ -61,13 +61,13 @@ The codegraph tools walk source files and build `imports/calls/defines` edges in
 
 ## Dream (staged consolidation)
 
-Phase 1 of the Dream subsystem replaces the inline fire-and-forget dream pass with a durable job pipeline. The job state machine is `queued → running → ready → applied` with terminal branches `stale / failed / cancelled`. A partial unique index enforces one running job per project at the SQL layer.
+Phase 1 of the Dream subsystem replaces the inline fire-and-forget dream pass with a durable job pipeline. The job state machine is `queued → running → ready → applied`, with `partially_applied` as the resting state of a job whose apply ran with a confidence floor that held proposals back (a later explicit apply finishes it) and terminal branches `stale / failed / cancelled`. A partial unique index enforces one running job per project at the SQL layer; `dream_enqueue` treats every outstanding status (queued / running / ready / partially_applied) as a duplicate so the pending set cannot grow past one job per project.
 
 - `dream_status` — compact `{label, counts}` for the active project.
-- `dream_enqueue` — idempotently enqueue a Dream job (no-op if one is queued/ready).
-- `dream_generate_proposals` — run clustering inside a single `SAVEPOINT` and write proposal rows.
-- `dream_apply_job` — validate + apply every non-stale proposal in one `SAVEPOINT`.
-- `dream_discard_job` — mark a `queued / ready` job `cancelled`; reject pending proposals.
+- `dream_enqueue` — idempotently enqueue a Dream job (no-op if one is queued/ready/partially_applied).
+- `dream_generate_proposals` — run clustering inside a single `SAVEPOINT` and write proposal rows. A job that already has proposals (ready/partially_applied) is a no-op success.
+- `dream_apply_job` — validate + apply every non-stale proposal above the optional confidence floor in one `SAVEPOINT`. Proposals below the floor stay pending and the job is left `partially_applied`, which a later call (no floor) finishes.
+- `dream_discard_job` — mark a `queued / ready / partially_applied` job `cancelled`; reject pending proposals.
 - `dream_list_jobs` — paginated list of jobs by status.
 - `dream_get_job` — single job by id.
 - `dream_list_proposals` — paginated list of proposals by job + status.

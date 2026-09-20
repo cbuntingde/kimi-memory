@@ -53,6 +53,7 @@ export async function cmdDream(args) {
         process.stdout.write(`label=${status.label}\n`);
         process.stdout.write(`queued=${status.queued}\n`);
         process.stdout.write(`ready=${status.ready}\n`);
+        process.stdout.write(`partially_applied=${status.partially_applied}\n`);
         process.stdout.write(`applied=${status.applied}\n`);
         process.stdout.write(`failed=${status.failed}\n`);
         process.stdout.write(`cancelled=${status.cancelled}\n`);

@@ -311,10 +311,15 @@ export function shouldDreamNow(state, { now = new Date(), force = false } = {}) 
 //   - consolidate → runConsolidate(mode: 'direct'). Writes
 //     conclusion rows + edges + synthesizes links. Uses the existing
 //     v15 small-dataset relax + auto-merge.
-//   - dream → if a queued/running/ready job exists, enqueue is a
-//     no-op (idempotent). If no job exists, enqueue one. Then apply a
-//     ready job if one is ready (capped to one apply per call so the
-//     8s hook budget is never overrun).
+//   - dream → if an outstanding job exists (queued/running/ready/
+//     partially_applied), enqueue is a no-op (idempotent) and the pass
+//     works with the existing job. If no job exists, enqueue one. Then
+//     apply it (capped to one apply per call so the 8s hook budget is
+//     never overrun). This pass applies without a confidence floor, so
+//     it also finishes a job an earlier hook apply left
+//     `partially_applied`. The pass summary records the generation
+//     result, `ok: false` included — a failure is surfaced, not
+//     swallowed.
 //   - gc → runAutoGc. Runs all three sub-passes (prune, archive,
 //     tier). Honour the existing KIMI_MEMORY_AUTO_GC=off opt-out.
 async function runConsolidatePass(db, projectKey, saveMemory, linkMemory, mergeMemory) {
@@ -366,16 +371,37 @@ async function runDreamPass(db, projectKey, cwd, saveMemory, linkMemory, mergeMe
     // For a freshly-enqueued job: generate proposals first, then apply.
     // generateProposalsForJob mutates the job to `ready` so the next
     // apply call can run.
+    //
+    // Generation must not block the apply path, but its result must not
+    // vanish either: `{ ok: false }` means the job carries no (or an
+    // incomplete) proposal set, which the previous shape discarded
+    // silently. It is recorded on the pass summary — persisted into
+    // `last_run` and returned to the hook / MCP / CLI — and logged to
+    // the diagnostics pipeline.
     try {
-      await generateProposalsForJob(db, projectKey, readyId, {
+      const generated = await generateProposalsForJob(db, projectKey, readyId, {
         saveMemory,
         memoryLink: linkMemory,
         mergeMemory,
       });
+      out.generate = generated;
+      if (generated && generated.ok === false) {
+        out.proposal_error = generated.reason || 'generate_failed';
+      }
     } catch (e) {
-      // Proposal generation failure must not block the apply path;
-      // record and continue.
-      out.enqueued = { ...(out.enqueued || {}), proposal_error: e && e.message };
+      // generateProposalsForJob reports its own failures rather than
+      // throwing, so a throw here is a bug or a DB-level fault; it is
+      // surfaced the same way rather than dropped.
+      out.generate = { ok: false, reason: 'threw', error: e && e.message };
+      out.proposal_error = e && e.message ? e.message : String(e);
+    }
+    if (out.proposal_error) {
+      await logHookDiag('dreaming', 'warn', 'proposal generation failed', {
+        projectKey,
+        jobId: readyId,
+        reason: out.proposal_error,
+        error: out.generate && out.generate.error,
+      }).catch(() => {});
     }
     out.applied = applyDreamJob(db, projectKey, readyId, {
       saveMemory,
@@ -386,6 +412,11 @@ async function runDreamPass(db, projectKey, cwd, saveMemory, linkMemory, mergeMe
     out.enqueued = { ...(out.enqueued || {}), threw: e && e.message ? e.message : String(e) };
     return out;
   }
+  // The success path used to fall off the end of the function, so the
+  // pass summary (including a failed proposal generation) was dropped on
+  // every run that got this far — `passes.dream` in the `dreaming_run`
+  // result and in `last_run` was `undefined` whenever nothing threw.
+  return out;
 }
 
 function runGcPass(db, projectKey) {
@@ -399,6 +430,26 @@ function runGcPass(db, projectKey) {
   }
 }
 
+// Effective pass set for one run. The configured set (project state file)
+// is the default; a per-call `include` / `exclude` narrows it for that
+// call only — the persisted configuration is never rewritten by a run.
+// Returns null when the caller asked for passes but the intersection is
+// empty (the `dreaming_run` handler reports that as an error itself, so
+// this only guards a direct caller).
+function resolvePassInclude(configured, includeOverride, exclude) {
+  const override = Array.isArray(includeOverride) || Array.isArray(exclude);
+  let passes =
+    Array.isArray(includeOverride) && includeOverride.length
+      ? [...includeOverride]
+      : [...configured];
+  passes = passes.filter((p) => DREAMING_PASSES.includes(p));
+  if (Array.isArray(exclude) && exclude.length) {
+    passes = passes.filter((p) => !exclude.includes(p));
+  }
+  if (override && passes.length === 0) return null;
+  return passes.length ? passes : [...configured];
+}
+
 export async function runDreaming({
   db,
   projectKey,
@@ -409,13 +460,16 @@ export async function runDreaming({
   memoryLink,
   mergeMemory,
   kimiHomeDir = kimiHome(),
+  include: includeOverride = null,
+  exclude = null,
 }) {
   const startedAt = now.toISOString();
   const state = resolveDreamingState({ projectKey, kimiHomeDir });
+  const include = resolvePassInclude(state.include, includeOverride, exclude);
   const result = {
     mode: state.mode,
     intervalMs: state.intervalMs,
-    include: [...state.include],
+    include: include ? [...include] : [...state.include],
     started_at: startedAt,
     force,
     fired: false,
@@ -425,6 +479,10 @@ export async function runDreaming({
   };
   if (!db || !projectKey) {
     result.skipped = 'no_db_or_key';
+    return result;
+  }
+  if (!include) {
+    result.skipped = 'empty_include';
     return result;
   }
   if (!shouldDreamNow(state, { now, force })) {
@@ -438,7 +496,7 @@ export async function runDreaming({
   }
   result.fired = true;
 
-  if (state.include.includes('consolidate')) {
+  if (include.includes('consolidate')) {
     result.passes.consolidate = await runConsolidatePass(
       db,
       projectKey,
@@ -447,7 +505,7 @@ export async function runDreaming({
       mergeMemory,
     );
   }
-  if (state.include.includes('dream')) {
+  if (include.includes('dream')) {
     result.passes.dream = await runDreamPass(
       db,
       projectKey,
@@ -458,7 +516,7 @@ export async function runDreaming({
     );
   }
 
-  if (state.include.includes('gc')) {
+  if (include.includes('gc')) {
     result.passes.gc = runGcPass(db, projectKey);
   }
 
@@ -476,6 +534,9 @@ export async function runDreaming({
       ...current,
       mode: state.mode,
       intervalMs: state.intervalMs,
+      // The persisted configuration, not this call's narrowed set: a
+      // `dreaming_run` with include/exclude must not rewrite the
+      // project's configuration.
       include: state.include,
       last_run: {
         at: nowIso(),
