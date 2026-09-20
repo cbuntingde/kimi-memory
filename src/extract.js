@@ -17,6 +17,7 @@
 
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
+import { isIP } from 'node:net';
 import { nowIso, safeJsonParse, asString } from './util.js';
 import { withLlmRetry } from './retry.js';
 import { logAutoExtractError } from './diagnostics.js';
@@ -273,27 +274,128 @@ export async function resolveLlmTarget(homeDir) {
   };
 }
 
+// WHATWG `URL` already normalises the alternative IPv4 spellings
+// (decimal `2130706433`, octal `0177.0.0.1`, hex `0x7f000001`, short
+// `127.1`, userinfo `user@127.0.0.1`) down to a dotted quad, so those do
+// not need a second implementation here. What it does NOT tell us is
+// whether that quad is routable, which is the classification below.
+//
+// The two textual normalisations the range tests need:
+//   - IPv6 hostnames keep their brackets (`[::1]`), which no prefix test
+//     would ever match;
+//   - a trailing dot is legal DNS (`localhost.`) but compares unequal to
+//     the bare name.
+function normalizeHostname(hostname) {
+  let host = String(hostname || '').toLowerCase();
+  if (host.startsWith('[') && host.endsWith(']')) host = host.slice(1, -1);
+  if (host.endsWith('.')) host = host.slice(0, -1);
+  return host;
+}
+
+// Non-routable / internal IPv4 blocks, tested by octet so the table stays
+// auditable: 0.0.0.0/8 ("this network"), 10/8, the whole of 127/8 (the
+// old check only knew 127.0.0.1 — every other 127.x.y.z is equally
+// loopback), 169.254/16 (link-local; contains the cloud metadata service
+// at 169.254.169.254), 172.16/12 and 192.168/16.
+function isPrivateIpv4(addr) {
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(addr);
+  if (!m) return false;
+  const octets = m.slice(1, 5).map(Number);
+  if (octets.some((o) => o > 255)) return false;
+  const [a, b] = octets;
+  return (
+    a === 0 ||
+    a === 10 ||
+    a === 127 ||
+    (a === 169 && b === 254) ||
+    (a === 172 && b >= 16 && b <= 31) ||
+    (a === 192 && b === 168)
+  );
+}
+
+// `new URL()` emits IPv6 in canonical compressed form, but `::` keeps the
+// textual layout variable, so byte offsets are not stable. Expand to eight
+// fixed-width hextets (32 hex digits) instead, which makes every prefix
+// test below a plain string compare. Returns null when the text is not a
+// valid IPv6 address.
+function expandIpv6Parts(addr) {
+  let text = String(addr || '');
+  let v4 = [];
+  const dotted = /(^|:)(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/.exec(text);
+  if (dotted) {
+    const octets = dotted[2].split('.').map(Number);
+    if (octets.some((o) => o > 255)) return null;
+    v4 = [((octets[0] << 8) | octets[1]).toString(16), ((octets[2] << 8) | octets[3]).toString(16)];
+    text = text.slice(0, text.length - dotted[2].length);
+  }
+  const halves = text.split('::');
+  if (halves.length > 2) return null;
+  const left = halves[0] ? halves[0].split(':').filter(Boolean) : [];
+  const right = halves.length === 2 && halves[1] ? halves[1].split(':').filter(Boolean) : [];
+  const parts = [...left, ...right, ...v4];
+  const need = 8 - parts.length;
+  if (halves.length === 2) {
+    if (need < 0) return null;
+    parts.splice(left.length, 0, ...Array(need).fill('0'));
+  } else if (need !== 0) {
+    return null;
+  }
+  if (parts.some((h) => !/^[0-9a-f]{1,4}$/.test(h))) return null;
+  return parts.map((h) => h.padStart(4, '0')).join('');
+}
+
+// ::ffff:0:0/96 — the IPv4-mapped prefix. Addresses inside it carry a real
+// IPv4 address in their low 32 bits, so they are classified by the IPv4
+// table rather than as IPv6.
+const IPV6_V4MAPPED_PREFIX = '0'.repeat(20) + 'ffff';
+
+function isPrivateIpv6(addr) {
+  const hex = expandIpv6Parts(addr);
+  if (!hex) return false;
+  // fc00::/7 — unique local addresses.
+  if ((parseInt(hex.slice(0, 2), 16) & 0xfe) === 0xfc) return true;
+  // fe80::/10 — link-local.
+  if ((parseInt(hex.slice(0, 4), 16) & 0xffc0) === 0xfe80) return true;
+  // Every other non-public IPv6 shape puts an IPv4 address in the low 32
+  // bits: ::ffff:0:0/96 (IPv4-mapped, e.g. ::ffff:169.254.169.254) and the
+  // all-zero high 96 bits of :: , ::1 and the deprecated IPv4-compatible
+  // ::a.b.c.d form. One IPv4 table then covers them all.
+  const high = hex.slice(0, 24);
+  if (high === IPV6_V4MAPPED_PREFIX || high === '0'.repeat(24)) {
+    const v4 = [0, 2, 4, 6].map((i) => parseInt(hex.slice(24 + i, 26 + i), 16)).join('.');
+    return isPrivateIpv4(v4);
+  }
+  return false;
+}
+
+// True when the host must never receive the (redacted) transcript. DNS
+// names are deliberately not resolved — the guard stays deterministic and
+// offline — so the only name it can judge is `localhost`.
+function isPrivateHost(host) {
+  if (host === 'localhost') return true;
+  const kind = isIP(host);
+  if (kind === 4) return isPrivateIpv4(host);
+  if (kind === 6) return isPrivateIpv6(host);
+  return false;
+}
+
 // Pure helper: returns { ok, reason } describing whether a base URL is
 // acceptable for the auto-extract LLM call under the
 // `KIMI_MEMORY_AUTO_EXTRACT_REQUIRE_HTTPS=1` hardening policy.
 //
 // Accepts:
-//   - https://host[:port]/path
-//   - http://host[:port]/path   (loopback / private / link-local hosts
-//     are still permitted because local proxies are a legitimate use
-//     case; the strict-mode operator opts into cleartext rejection by
-//     setting the env var, but we don't second-guess a deliberate
-//     loopback pin — we only block non-HTTPS + the patterns flagged
-//     below)
+//   - https://host[:port]/path  to a public IP or a DNS name.
 // Refuses:
-//   - any URL whose host resolves to a private / loopback / link-local
-//     address AND the scheme is `http://` (cleartext + local = highest-
-//     risk combination — same origin policy lift). Public `http://`
-//     hosts are still permitted so a self-hosted Enterprise proxy that
-//     pins TLS at a different layer can keep working.
+//   - every cleartext `http://` base URL, public or not. The variable is
+//     named REQUIRE_HTTPS and the operator who sets it expects TLS on all
+//     traffic; the earlier "public http is fine" carve-out contradicted
+//     that (and AGENTS.md / SECURITY.md already documented the strict
+//     reading).
+//   - any URL whose host is a loopback / private / link-local / ULA
+//     address, whatever the scheme. An SSRF target is a target whether or
+//     not the connection is encrypted — `https://169.254.169.254/` is not
+//     a legitimate provider.
 //   - any non-http(s) scheme (file://, ssh://, etc.).
-//
-// Public IPv4 / IPv6 hosts on https:// are unconditionally accepted.
 // (Production-readiness review finding F-6.)
 export function guardLlmBaseUrl(rawUrl) {
   if (!rawUrl || typeof rawUrl !== 'string') {
@@ -309,27 +411,15 @@ export function guardLlmBaseUrl(rawUrl) {
   if (scheme !== 'http' && scheme !== 'https') {
     return { ok: false, reason: `unsupported_scheme:${scheme || 'unknown'}` };
   }
-  // Cleartext HTTP + a non-public host = block. Public cleartext is
-  // accepted so operators who terminate TLS at a sibling LB are not
-  // forced to rewrite their config.toml.
-  if (scheme === 'http' && url.hostname) {
-    const host = url.hostname.toLowerCase();
-    const isLoopback =
-      host === 'localhost' || host === '127.0.0.1' || host === '::1' || host === '[::1]';
-    // Detect a private IPv4 class without a DNS lookup (so this stays
-    // deterministic and offline): 10/8, 172.16/12, 192.168/16,
-    // 169.254/16 (link-local), 0.0.0.0.
-    const ipv4 = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
-    const isPrivateV4 =
-      ipv4 &&
-      (+ipv4[1] === 10 ||
-        (+ipv4[1] === 172 && +ipv4[2] >= 16 && +ipv4[2] <= 31) ||
-        (+ipv4[1] === 192 && +ipv4[2] === 168) ||
-        (+ipv4[1] === 169 && +ipv4[2] === 254) ||
-        +ipv4[1] === 0);
-    if (isLoopback || isPrivateV4) {
-      return { ok: false, reason: `cleartext_local:${host}` };
-    }
+  const host = normalizeHostname(url.hostname);
+  if (isPrivateHost(host)) {
+    return {
+      ok: false,
+      reason: scheme === 'http' ? `cleartext_local:${host}` : `private_host:${host}`,
+    };
+  }
+  if (scheme === 'http') {
+    return { ok: false, reason: `cleartext_http:${host}` };
   }
   return { ok: true };
 }
@@ -428,10 +518,27 @@ export function parseExtractionResponse(text) {
   return out;
 }
 
+// A non-OK response used to collapse to a bare `null`, which the retry
+// classifier could not tell apart from an empty 200 body: a permanent 401
+// burned the whole attempt budget and `logAutoExtractError` never recorded
+// the HTTP cause. Throwing a structured error keeps both the numeric
+// status (`code`, which `withLlmRetry` classifies) and the reason
+// (`message`, which reaches the diagnostic log).
+function llmHttpError(endpoint, res) {
+  const err = new Error(`llm_http_${res.status} ${endpoint}`);
+  err.code = res.status;
+  err.status = res.status;
+  return err;
+}
+
 // Call a chat-completion endpoint. Supports both OpenAI-compatible and
 // Anthropic-compatible providers (the two types declared in the config).
-// Returns the assistant text on success, null on any failure (so the
-// caller can skip silently).
+//
+// Returns the assistant text on success, `null` when the response was
+// well-formed but carried no usable text (the empty-reply case the retry
+// exists for), and throws a structured error for an HTTP or transport
+// failure so the caller's retry wrapper can tell a permanent 4xx from a
+// transient 5xx.
 export async function callChat({ apiKey, baseUrl, type, model, system, user, signal }) {
   if (!apiKey || !baseUrl) return null;
   const ctrl = new AbortController();
@@ -439,9 +546,17 @@ export async function callChat({ apiKey, baseUrl, type, model, system, user, sig
   if (signal) signal.addEventListener('abort', () => ctrl.abort());
   try {
     const url = baseUrl.replace(/\/+$/, '');
+    // `redirect: 'error'` on both calls. The base-URL guard only ever sees
+    // the URL read from config.toml, so following a 307/308 from a public
+    // host would re-POST the transcript wherever the Location header
+    // points — including http://169.254.169.254/ or a loopback port. A
+    // provider that legitimately redirects must be configured with its
+    // final URL; do not relax this back to the undici default 'follow'.
     if (type === 'anthropic') {
-      const res = await fetch(`${url}/v1/messages`, {
+      const endpoint = '/v1/messages';
+      const res = await fetch(`${url}${endpoint}`, {
         method: 'POST',
+        redirect: 'error',
         signal: ctrl.signal,
         headers: {
           'content-type': 'application/json',
@@ -455,7 +570,7 @@ export async function callChat({ apiKey, baseUrl, type, model, system, user, sig
           messages: [{ role: 'user', content: user }],
         }),
       });
-      if (!res.ok) return null;
+      if (!res.ok) throw llmHttpError(endpoint, res);
       const body = await res.json();
       const parts = body && body.content;
       if (!Array.isArray(parts)) return null;
@@ -465,8 +580,10 @@ export async function callChat({ apiKey, baseUrl, type, model, system, user, sig
         .trim();
     }
     // OpenAI-compatible (covers openai, nvidia, poolside, stepfun, …).
-    const res = await fetch(`${url}/chat/completions`, {
+    const endpoint = '/chat/completions';
+    const res = await fetch(`${url}${endpoint}`, {
       method: 'POST',
+      redirect: 'error',
       signal: ctrl.signal,
       headers: { 'content-type': 'application/json', authorization: `Bearer ${apiKey}` },
       body: JSON.stringify({
@@ -479,13 +596,31 @@ export async function callChat({ apiKey, baseUrl, type, model, system, user, sig
         ],
       }),
     });
-    if (!res.ok) return null;
+    if (!res.ok) throw llmHttpError(endpoint, res);
     const body = await res.json();
     const choice = body && body.choices && body.choices[0];
     const msg = choice && choice.message;
     return msg && typeof msg.content === 'string' ? msg.content.trim() : null;
-  } catch {
-    return null;
+  } catch (e) {
+    if (e && e.status) throw e;
+    // Transport failure or our own timeout. undici reports the socket
+    // cause on `error.cause` (ECONNRESET / ENOTFOUND / …); carry it into
+    // the message and the `code` so the classifier sees a transient
+    // failure instead of the bare `fetch failed` the previous
+    // `return null` hid entirely. An abort from our own timeout maps to
+    // ETIMEDOUT.
+    const cause = e && e.cause;
+    const causeMessage = cause && cause.message ? `: ${cause.message}` : '';
+    const err = new Error((e && e.message ? e.message : 'llm_call_failed') + causeMessage);
+    if (e && e.name === 'AbortError') {
+      err.message = `llm_call_timeout after ${LLM_TIMEOUT_MS}ms`;
+      err.code = 'ETIMEDOUT';
+    } else if (e && e.code) {
+      err.code = e.code;
+    } else if (cause && cause.code) {
+      err.code = cause.code;
+    }
+    throw err;
   } finally {
     clearTimeout(timeout);
   }
@@ -715,15 +850,20 @@ export async function runAutoExtract({
 
   let reply;
   try {
-    // Retry with exponential backoff for transient LLM failures.
+    // Retry with exponential backoff for transient LLM failures. Two
+    // attempts, not three: each attempt can burn LLM_TIMEOUT_MS (4s) and
+    // the Stop-hook dispatcher kills the pass at 14s
+    // (src/hooks/run.js HOOK_TIMEOUTS_MS.Stop), so worst case here is
+    // 2 x 4s + one 1000ms-capped backoff ≈ 9.1s. A third attempt would
+    // reach ~14s and be killed mid-flight, losing the pass entirely.
     reply = await withLlmRetry(
       () => callLlm({ ...target, system: prompt.system, user: prompt.user }),
-      { projectKey, maxAttempts: 3, baseDelayMs: 1000 },
+      { projectKey, maxAttempts: 2, baseDelayMs: 1000 },
     );
   } catch (error) {
     // LLM call failed after retries; log and continue with no extraction.
     await logAutoExtractError(projectKey, 'llm_failed_after_retries', error, {
-      max_attempts: 3,
+      max_attempts: 2,
       error_code: error?.code,
     }).catch(() => {});
     result.skipped = 'llm_failed_after_retries';

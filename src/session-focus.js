@@ -31,7 +31,7 @@
 // save error never throws out of the hook. Returns
 // `{ skipped, written, updated, reason, id?, title? }`.
 
-import { nowIso, sliceCodePointSafe } from './util.js';
+import { nowIso, sliceCodePointSafe, singleLine } from './util.js';
 import { extractSummary } from './wire.js';
 
 export const SESSION_FOCUS_MIN_PROMPTS = 1;
@@ -308,19 +308,21 @@ export function readLatestSessionFocus(db, projectKey) {
 // Build the one-line `[focus] "<title>" — <body snippet>` preview that
 // SessionStart / UserPromptSubmit emit on stdout. Returns null when
 // there is no focus to surface, so the caller can omit the line.
+//
+// The focus row is a stored memory: its title is built from the user's
+// own prompt text, but a prompt can itself quote pasted content, so the
+// title and snippet go through `singleLine` before they are rendered —
+// this line lands in `additionalContext`, where a newline would let the
+// text start a fresh line among the agent's instructions.
 export function buildSessionFocusLine(focus, { snippetChars = 120 } = {}) {
   if (!focus || !focus.title) return null;
-  const t = focus.title.length > 80 ? sliceCodePointSafe(focus.title, 80) + '…' : focus.title;
+  const t = singleLine(focus.title, 80);
   // First non-empty line of the body, condensed.
   const first = (focus.content || '')
     .split(/\r?\n/)
     .map((line) => line.replace(/\s+/g, ' ').trim())
     .find((line) => line.length > 0);
-  const snippet = first
-    ? first.length > snippetChars
-      ? sliceCodePointSafe(first, snippetChars) + '…'
-      : first
-    : '';
+  const snippet = first ? singleLine(first, snippetChars) : '';
   const tail = snippet ? ` — ${snippet}` : '';
   return `[focus] "${t}" (${focus.type})${tail}`;
 }

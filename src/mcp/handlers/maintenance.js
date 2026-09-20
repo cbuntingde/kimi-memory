@@ -13,7 +13,6 @@ import { toolError } from '../lib/tool-error.js';
 import { TOOL_DEFS_BY_NAME } from '../tool-defs.js';
 import { deriveProjectKey, projectDbPath } from '../../project-key.js';
 import { existsSync } from 'node:fs';
-import path from 'node:path';
 import { openDb, closeDb, resetProject, resetProjectDryRunCounts } from '../../persist.js';
 import { detectReclone } from '../../persist/project.js';
 import { enumeratePruneCandidates } from '../../prune.js';
@@ -65,9 +64,12 @@ export function register(server, handlers, home) {
   );
 
   // ---- memory_diagnostics (error logs and system observability) ----
+  // skipDb: the tool reads the cross-project diagnostics log and has no
+  // `cwd` in its schema, so the wrapper neither resolves a project root
+  // nor opens a project DB for it.
   registerTool(
     server,
-    D.memory_diagnostics,
+    { ...D.memory_diagnostics, skipDb: true },
     async (args) => {
       const hoursBack = args.hours_back || 24;
       const limit = args.limit || 100;
@@ -79,7 +81,10 @@ export function register(server, handlers, home) {
         recent_logs: recent,
         error_summary: summary,
         hours_back: hoursBack,
-        log_location: path.join(home, 'kimi-memory', '_diagnostics', 'hooks.log'),
+        // Relative to KIMI_CODE_HOME, not absolute: an absolute path
+        // would hand the model the user's home layout. The `<kimi-code-home>`
+        // placeholder names the same location without disclosing it.
+        log_location: '<kimi-code-home>/kimi-memory/_diagnostics/hooks.log',
         note: 'Recent logs are ordered most-recent-first. Use type_filter to focus on specific error types.',
       };
     },

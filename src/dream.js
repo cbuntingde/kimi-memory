@@ -26,10 +26,11 @@
 // the global project key. There is no global-memory Dream surface in
 // Phase 1 — the global store stays curated by the user via MCP /
 // `memory_save`.
-import { nowIso, hashId, shortId, safeJsonParse } from './util.js';
+import { nowIso, hashId, shortId, safeJsonParse, clampInt } from './util.js';
 import { runConsolidate, proposalSourceChecksum, recordConsolidationRun } from './consolidate.js';
 import { decodeVector as decodeEmbedding } from './embedding.js';
 import { linkMemory } from './persist/edges.js';
+import { withSavepoint } from './persist/tx.js';
 
 // Tunables (env-overridable so tests + operators can dial them).
 // Defaults are conservative: short debounce so a busy session can keep
@@ -253,47 +254,46 @@ export async function generateProposalsForJob(
 
   let proposalIds = [];
   try {
-    db.exec('SAVEPOINT dream_proposals_insert');
-    const insertStmt = db.prepare(
-      `INSERT INTO dream_proposals (id, job_id, project_key, kind, source_ids, target_ids, proposed_content, confidence, provenance, source_checksum, status, created_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
-    );
-    for (let i = 0; i < accepted.length; i++) {
-      const p = accepted[i];
-      const id = newProposalId(jobId, p.kind, i);
-      // Carry title + tags inside `proposed_content` is impractical
-      // (proposed_content holds body), so we stash the title/tags in
-      // the provenance JSON for the apply step. This keeps the schema
-      // additive without a column change.
-      const provenanceBlob = {
-        ...(p.provenance || {}),
-        proposed_title: p.proposed_title || '',
-        proposed_tags: p.proposed_tags || [],
-        proposed_kind: p.provenance?.proposed_kind || p.kind,
-      };
-      insertStmt.run(
-        id,
-        jobId,
-        projectKey,
-        p.kind,
-        JSON.stringify(p.source_ids || []),
-        JSON.stringify(p.target_ids || []),
-        p.proposed_content || '',
-        p.confidence ?? 0.7,
-        JSON.stringify(provenanceBlob),
-        p.source_checksum || '',
-        now,
-        now,
+    withSavepoint(db, 'dream_proposals_insert', () => {
+      const insertStmt = db.prepare(
+        `INSERT INTO dream_proposals (id, job_id, project_key, kind, source_ids, target_ids, proposed_content, confidence, provenance, source_checksum, status, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)`,
       );
-      proposalIds.push(id);
-    }
-    db.exec('RELEASE dream_proposals_insert');
+      for (let i = 0; i < accepted.length; i++) {
+        const p = accepted[i];
+        const id = newProposalId(jobId, p.kind, i);
+        // Carry title + tags inside `proposed_content` is impractical
+        // (proposed_content holds body), so we stash the title/tags in
+        // the provenance JSON for the apply step. This keeps the schema
+        // additive without a column change.
+        const provenanceBlob = {
+          ...(p.provenance || {}),
+          proposed_title: p.proposed_title || '',
+          proposed_tags: p.proposed_tags || [],
+          proposed_kind: p.provenance?.proposed_kind || p.kind,
+        };
+        insertStmt.run(
+          id,
+          jobId,
+          projectKey,
+          p.kind,
+          JSON.stringify(p.source_ids || []),
+          JSON.stringify(p.target_ids || []),
+          p.proposed_content || '',
+          p.confidence ?? 0.7,
+          JSON.stringify(provenanceBlob),
+          p.source_checksum || '',
+          now,
+          now,
+        );
+        proposalIds.push(id);
+      }
+    });
   } catch (e) {
-    try {
-      db.exec('ROLLBACK TO dream_proposals_insert');
-    } catch {
-      /* ignore */
-    }
+    // Runs after withSavepoint has unwound and released the savepoint,
+    // so the failure marker is committed rather than being carried away
+    // by the rollback (the previous shape wrote it inside the still-open
+    // transaction and could never release it).
     markJobFailed(db, projectKey, jobId, e && e.message ? e.message : String(e));
     return { ok: false, reason: 'persist_threw', error: e && e.message };
   }
@@ -379,88 +379,87 @@ export function applyDreamJob(db, projectKey, jobId, opts = {}) {
   let stale = 0;
   let failed = 0;
 
-  db.exec('SAVEPOINT dream_apply');
   try {
-    // Build a checksum → full cluster source map so a link proposal's
-    // checksum (computed against the cluster, not the single child)
-    // validates correctly. Without this map, the link proposal would
-    // be flagged stale because its source_ids only contains the
-    // single child id.
-    const checksumClusters = new Map();
-    for (const p of proposals) {
-      if (!checksumClusters.has(p.source_checksum)) {
-        checksumClusters.set(p.source_checksum, new Set(p.source_ids));
-      } else {
-        for (const id of p.source_ids) checksumClusters.get(p.source_checksum).add(id);
-      }
-    }
-
-    for (const p of proposals) {
-      // Auto-apply gate: skip proposals that don't meet the floor.
-      if (floor != null && (p.confidence || 0) < floor) continue;
-
-      // Resolve source rows. The "cluster" used for the checksum is
-      // every distinct source id across every proposal that shares the
-      // same source_checksum — otherwise a single-child proposal would
-      // never validate against a multi-child cluster checksum.
-      const clusterIds = [...(checksumClusters.get(p.source_checksum) || new Set())];
-      const clusterRows = clusterIds.map((id) => rowById(db, projectKey, id)).filter(Boolean);
-      if (clusterRows.length !== clusterIds.length) {
-        markProposal(db, p.id, projectKey, 'stale', now);
-        stale += 1;
-        continue;
-      }
-
-      // Re-derive the source checksum across the full cluster; mismatch
-      // → stale.
-      const liveChecksum = proposalSourceChecksum(
-        clusterRows.map((r) => ({
-          id: r.id,
-          updatedAt: r.updated_at,
-        })),
-      );
-      if (liveChecksum !== p.source_checksum) {
-        markProposal(db, p.id, projectKey, 'stale', now);
-        stale += 1;
-        continue;
-      }
-
-      // All cluster rows must still be active. If any drifted to
-      // superseded / deleted, the cluster is unsafe to synthesise.
-      const stillActive = clusterRows.every((r) => r.status === 'active');
-      if (!stillActive) {
-        markProposal(db, p.id, projectKey, 'stale', now);
-        stale += 1;
-        continue;
-      }
-
-      try {
-        const appliedFlag = applyProposal(db, projectKey, jobId, p, {
-          saveMemory,
-          memoryLink,
-          mergeMemory,
-        });
-        if (appliedFlag === 'ok') {
-          markProposal(db, p.id, projectKey, 'applied', now);
-          applied += 1;
+    withSavepoint(db, 'dream_apply', () => {
+      // Build a checksum → full cluster source map so a link proposal's
+      // checksum (computed against the cluster, not the single child)
+      // validates correctly. Without this map, the link proposal would
+      // be flagged stale because its source_ids only contains the
+      // single child id.
+      const checksumClusters = new Map();
+      for (const p of proposals) {
+        if (!checksumClusters.has(p.source_checksum)) {
+          checksumClusters.set(p.source_checksum, new Set(p.source_ids));
         } else {
-          markProposal(db, p.id, projectKey, 'rejected', now);
+          for (const id of p.source_ids) checksumClusters.get(p.source_checksum).add(id);
+        }
+      }
+
+      for (const p of proposals) {
+        // Auto-apply gate: skip proposals that don't meet the floor.
+        if (floor != null && (p.confidence || 0) < floor) continue;
+
+        // Resolve source rows. The "cluster" used for the checksum is
+        // every distinct source id across every proposal that shares the
+        // same source_checksum — otherwise a single-child proposal would
+        // never validate against a multi-child cluster checksum.
+        const clusterIds = [...(checksumClusters.get(p.source_checksum) || new Set())];
+        const clusterRows = clusterIds.map((id) => rowById(db, projectKey, id)).filter(Boolean);
+        if (clusterRows.length !== clusterIds.length) {
+          markProposal(db, p.id, projectKey, 'stale', now);
+          stale += 1;
+          continue;
+        }
+
+        // Re-derive the source checksum across the full cluster; mismatch
+        // → stale.
+        const liveChecksum = proposalSourceChecksum(
+          clusterRows.map((r) => ({
+            id: r.id,
+            updatedAt: r.updated_at,
+          })),
+        );
+        if (liveChecksum !== p.source_checksum) {
+          markProposal(db, p.id, projectKey, 'stale', now);
+          stale += 1;
+          continue;
+        }
+
+        // All cluster rows must still be active. If any drifted to
+        // superseded / deleted, the cluster is unsafe to synthesise.
+        const stillActive = clusterRows.every((r) => r.status === 'active');
+        if (!stillActive) {
+          markProposal(db, p.id, projectKey, 'stale', now);
+          stale += 1;
+          continue;
+        }
+
+        try {
+          const appliedFlag = applyProposal(db, projectKey, jobId, p, {
+            saveMemory,
+            memoryLink,
+            mergeMemory,
+          });
+          if (appliedFlag === 'ok') {
+            markProposal(db, p.id, projectKey, 'applied', now);
+            applied += 1;
+          } else {
+            markProposal(db, p.id, projectKey, 'rejected', now);
+            failed += 1;
+          }
+        } catch (e) {
+          // Per-proposal failure: mark stale so the lifecycle can
+          // re-enqueue a fresh job without looping on the same row.
+          markProposal(db, p.id, projectKey, 'stale', now);
           failed += 1;
         }
-      } catch (e) {
-        // Per-proposal failure: mark stale so the lifecycle can
-        // re-enqueue a fresh job without looping on the same row.
-        markProposal(db, p.id, projectKey, 'stale', now);
-        failed += 1;
       }
-    }
-    db.exec('RELEASE dream_apply');
+    });
   } catch (e) {
-    try {
-      db.exec('ROLLBACK TO dream_apply');
-    } catch {
-      /* ignore */
-    }
+    // The savepoint has been rolled back and released before we get
+    // here, so the failure marker is committed on its own — writing it
+    // inside the savepoint (the old shape) discarded it with the
+    // rollback and left the connection holding a transaction.
     markJobFailed(db, projectKey, jobId, e && e.message ? e.message : String(e));
     return { ok: false, reason: 'apply_threw', error: e && e.message };
   }
@@ -660,24 +659,19 @@ export function discardDreamJob(db, projectKey, jobId, { reason = 'cancelled' } 
   if (job.status === 'applied') return { ok: false, reason: 'already_applied' };
   const now = nowIso();
   try {
-    db.exec('SAVEPOINT dream_discard');
-    try {
+    withSavepoint(db, 'dream_discard', () => {
+      try {
+        db.prepare(
+          "UPDATE dream_proposals SET status='rejected', updated_at=? WHERE job_id=? AND project_key=? AND status='pending'",
+        ).run(now, jobId, projectKey);
+      } catch {
+        /* best-effort */
+      }
       db.prepare(
-        "UPDATE dream_proposals SET status='rejected', updated_at=? WHERE job_id=? AND project_key=? AND status='pending'",
-      ).run(now, jobId, projectKey);
-    } catch {
-      /* best-effort */
-    }
-    db.prepare(
-      "UPDATE dream_jobs SET status='cancelled', error=?, updated_at=? WHERE id=? AND project_key=?",
-    ).run(reason.slice(0, 500), now, jobId, projectKey);
-    db.exec('RELEASE dream_discard');
+        "UPDATE dream_jobs SET status='cancelled', error=?, updated_at=? WHERE id=? AND project_key=?",
+      ).run(reason.slice(0, 500), now, jobId, projectKey);
+    });
   } catch (e) {
-    try {
-      db.exec('ROLLBACK TO dream_discard');
-    } catch {
-      /* ignore */
-    }
     return { ok: false, reason: e && e.message ? e.message : String(e) };
   }
   return { ok: true, status: 'cancelled', reason };
@@ -703,7 +697,7 @@ export function listJobs(db, projectKey, { status = null, limit = 20 } = {}) {
     where.push('status = ?');
     params.push(status);
   }
-  params.push(Math.max(1, Math.min(100, limit)));
+  params.push(clampInt(limit, 1, 100));
   try {
     const rows = db
       .prepare(

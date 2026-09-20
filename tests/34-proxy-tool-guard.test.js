@@ -11,15 +11,32 @@ test('nonLoopbackToolGuard: loopback hosts bypass the guard entirely', () => {
   assert.equal(nonLoopbackToolGuard('memory_reset_project', { host: '127.0.0.1' }), null);
   assert.equal(nonLoopbackToolGuard('memory_delete', { host: '::1' }), null);
   assert.equal(nonLoopbackToolGuard('memory_prune', { host: 'localhost' }), null);
-  // Empty / undefined defaults to loopback (the safe default).
-  assert.equal(nonLoopbackToolGuard('memory_reset_project', { host: '' }), null);
+  // An omitted host is unspecified, not loopback: the guard falls back to
+  // KIMI_MEMORY_PROXY_HOST and then to the 127.0.0.1 default, so the guard
+  // stays off. An empty string is a *wildcard bind* (Node binds `::`), so it
+  // must never be classified as loopback.
   assert.equal(nonLoopbackToolGuard('memory_reset_project', {}), null);
+  assert.ok(nonLoopbackToolGuard('memory_reset_project', { host: '' }));
 });
 
 test('nonLoopbackToolGuard: non-loopback hosts deny destructive tools by default', () => {
-  const err = nonLoopbackToolGuard('memory_reset_project', { host: '0.0.0.0' });
-  assert.ok(err && err.includes('memory_reset_project'));
-  assert.ok(err.includes('KIMI_MEMORY_PROXY_ALLOW_TOOLS'));
+  for (const host of ['0.0.0.0', '::', '192.168.1.10', '', 'localhost.evil.com']) {
+    const err = nonLoopbackToolGuard('memory_reset_project', { host });
+    assert.ok(err, `host ${JSON.stringify(host)} must deny`);
+    assert.ok(err.includes('memory_reset_project'));
+    assert.ok(err.includes('KIMI_MEMORY_PROXY_ALLOW_TOOLS'));
+  }
+});
+
+test('nonLoopbackToolGuard: the whole 127/8 range is loopback', () => {
+  // Only 127.0.0.1 used to be recognised; 127.0.0.2 is equally loopback.
+  for (const host of ['127.0.0.2', '127.1.2.3', '[::1]', 'localhost.', 'LOCALHOST']) {
+    assert.equal(
+      nonLoopbackToolGuard('memory_reset_project', { host }),
+      null,
+      `host ${JSON.stringify(host)} must be treated as loopback`,
+    );
+  }
 });
 
 test('nonLoopbackToolGuard: read tools stay available on non-loopback binds', () => {

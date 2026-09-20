@@ -57,6 +57,24 @@ const CREDENTIALS = [
     'JWT: eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.abcdefghijklmnop',
     'eyJhbGciOiJIUzI1NiJ9',
   ],
+  // Second audit matrix: the shapes the detector still missed. `--name=`
+  // is the most common real-world form; `NAME <value>` is the shell
+  // form; a bare `scheme://user:pass@host` has no name prefix at all;
+  // the last entry has neither a prefix nor an assignment.
+  ['--api-key=abcd1234efgh5678ijkl', 'abcd1234efgh5678ijkl'],
+  ['AWS_SECRET_ACCESS_KEY wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY', 'wJalrXUtnFEMI'],
+  ['redis://default:mypassword123@cache.internal:6379', 'mypassword123'],
+  ['SendGrid: SG.abcdef1234567890.abcdef1234567890', 'SG.abcdef1234567890'],
+  [
+    'Google OAuth client secret GOCSPX-abcdefghijklmnopqrstuvwxyz',
+    'GOCSPX-abcdefghijklmnopqrstuvwxyz',
+  ],
+  [
+    'https://hooks.slack.com/services/T00/B00/XXXXXXXXXXXXXXXXXXXXXXXX',
+    'T00/B00/XXXXXXXXXXXXXXXXXXXXXXXX',
+  ],
+  ['Azure: AccountKey=base64blob+morebase64==', 'base64blob+morebase64'],
+  ['aB3dE5fG7hI9jK1lM2nO4pQ6rS8tU0vW1xY2zA', 'aB3dE5fG7hI9jK1lM2nO4pQ6rS8tU0vW1xY2zA'],
 ];
 
 // Text that merely mentions a credential-adjacent word. Guard against
@@ -70,6 +88,18 @@ const BENIGN = [
   'the password field is 8 characters minimum',
   'see https://github.com/cbuntingde/kimi-memory for details',
   'run npm test before committing',
+  // Near-misses for the high-entropy fallback: hex digests, UUIDs,
+  // paths and long identifiers all carry a 32+ character unbroken run,
+  // and none may be flagged. The last two are the whitespace-form
+  // guard: a long English word after a key-ish noun is not a value.
+  'git rev-parse 3f7a9c2e1b4d6f8a0c3e5b7d9f1a2c4e6b8d0f2a',
+  'session 550e8400-e29b-41d4-a716-446655440000 expired',
+  'edit /Users/alice/Project2/src/persist/connection.js next',
+  'call processConversationEventsSynchronously2 with the args',
+  'the env var KIMI_MEMORY_AUTO_EXTRACT_REQUIRE_HTTPS is set',
+  'REFACTOR_AUDIT_HARDENING_2026_08_18 is the branch name',
+  'token authentication is handled by the middleware',
+  'the token case-insensitive comparison lives in proxy/server.js',
 ];
 
 test('every credential shape is detected', () => {

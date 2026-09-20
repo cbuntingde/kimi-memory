@@ -17,7 +17,7 @@ import {
 } from '../../../persist.js';
 import { deriveProjectKey, GLOBAL_PROJECT_KEY } from '../../../project-key.js';
 import { formatFocusSegment } from '../../../session-focus.js';
-import { truncate, firstContentLine } from '../../../util.js';
+import { firstContentLine, singleLine } from '../../../util.js';
 import {
   STATUS_RECENT_MEMORIES,
   STATUS_RECENT_WM_SLOTS,
@@ -116,8 +116,12 @@ export function buildRecentSummary(projectDb, globalDb, key) {
 
 export function buildWorkingMemoryPreview(projectDb, key) {
   if (!projectDb) return [];
+  // singleLine: a slot value is caller-written free text and this
+  // preview is emitted into the session's hook output, so a newline
+  // here would splice stored text into the agent's context as a fresh
+  // line (same stored-injection vector as the recall lines).
   const slots = listWorkingMemory(projectDb, key).slice(0, STATUS_RECENT_WM_SLOTS);
-  return slots.map((s) => `- WM ${s.slot}: ${truncate(s.value, 200)}`);
+  return slots.map((s) => `- WM ${s.slot}: ${singleLine(s.value, 200)}`);
 }
 
 // Re-clone detection: if the canonical project root was created after
@@ -223,10 +227,12 @@ export function buildSessionThread(projectDb, projectKey) {
     } catch {
       /* ignore — fall back to the title only */
     }
-    const title = (focus && focus.title) || `Session ${i + 1}`;
-    const snippet = firstContentLine((focus && focus.content) || '');
+    // A focus title is a stored memory title; singleLine keeps it from
+    // breaking out of its quote on the [thread] line.
+    const title = singleLine(focus && focus.title, 80) || `Session ${i + 1}`;
+    const snippet = singleLine(firstContentLine((focus && focus.content) || ''));
     const tail = snippet ? ` — ${snippet}` : '';
-    lines.push(`[thread: ${i + 1}/${ordered.length}] "${truncate(title, 80)}"${tail}`);
+    lines.push(`[thread: ${i + 1}/${ordered.length}] "${title}"${tail}`);
   }
   return lines;
 }

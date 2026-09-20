@@ -34,24 +34,20 @@ import http from 'node:http';
 import { URL } from 'node:url';
 import crypto from 'node:crypto';
 import { makeServer } from '../server.js';
-import { kimiHome } from '../util.js';
+import { kimiHome, safeErrorMessage } from '../util.js';
 import { closeDb, flushEmbeddings } from '../persist.js';
 
 /**
- * Build the tool-name → handler map by walking the MCP server's
- * internal `_handlers` table. We can't directly enumerate
- * `TOOL_DEFS` from outside `server.js` without exposing it, so we
- * pre-register every public tool by calling makeServer() and then
- * iterating the McpServer's internal handler list via a small probe.
+ * Start the proxy HTTP server.
  *
- * The pragmatic approach: every call hits the proxy with a known
- * tool name; we forward by spinning up the real handler via the
- * `makeServer()._deps` interface. The MCP server exposes a
- * `server.tool(...)` registration API but no enumeration API; the
- * simplest cross-version path is to forward via the JSON-RPC
- * dispatcher that the McpServer wires up internally. To keep this
- * file self-contained and not depend on internals, the proxy keeps
- * its own name→spec table derived from TOOL_DEFS at startup.
+ * The callable surface is whatever `makeServer()` (src/server.js)
+ * registered: it returns `{ server, handlers }`, where `handlers` is a
+ * `Map<tool_name, async fn>` that each domain module fills in as it
+ * registers. `dispatchTool()` below resolves an inbound
+ * `POST /tools/<name>` through that map and invokes the handler
+ * directly — no JSON-RPC round trip, and no reach into the SDK's
+ * private registration fields (`_registeredTools` / `_tools`), whose
+ * shape has shifted across releases.
  */
 export async function startProxy({
   host = '127.0.0.1',
@@ -81,31 +77,32 @@ export async function startProxy({
   // exposes the entire MCP surface (read + write) to the network with
   // no authentication. The CLI flag --no-auth + --host 0.0.0.0 would
   // otherwise be a one-keystroke data-leak path.
-  if (bypass && host !== '127.0.0.1' && host !== '::1' && host !== 'localhost') {
+  if (bypass && !isLoopbackHost(host)) {
     const msg = `kimi-memory proxy: refusing to start — KIMI_MEMORY_PROXY_AUTH=off with host=${host} would expose unauthenticated access. Use a loopback host or set KIMI_MEMORY_PROXY_TOKEN.`;
     log(msg);
     throw new Error(msg);
   }
-  // KIMI_MEMORY_PROXY_REQUIRE_HTTPS=1 demands TLS termination. The
-  // proxy itself does not speak TLS (we're a stdio MCP transport
-  // translated to plain HTTP); the assumption is that a TLS
-  // terminator — haproxy, nginx, Caddy — sits in front. Without
-  // that terminator, bearer tokens flow cleartext and any attacker
-  // on the same broadcast domain reads them. Refuse to start unless
-  // either the bind host is loopback OR the operator explicitly opts
-  // in to cleartext-on-the-wire via KIMI_MEMORY_PROXY_REQUIRE_HTTPS=off.
+  // KIMI_MEMORY_PROXY_REQUIRE_HTTPS gates non-loopback binds. The proxy
+  // itself does not speak TLS (we're a stdio MCP transport translated to
+  // plain HTTP), so "required" means the operator asserts a TLS
+  // terminator — haproxy, nginx, Caddy — sits in front. Without that
+  // terminator, bearer tokens flow cleartext and any attacker on the
+  // same broadcast domain reads them.
+  //
+  //   unset (default) / anything unrecognised → refuse to start
+  //   1 | on | true   → start; TLS is terminated upstream
+  //   0 | off | false → start; explicit cleartext opt-out
   const requireHttps = (process.env.KIMI_MEMORY_PROXY_REQUIRE_HTTPS || '').toLowerCase().trim();
   const requireHttpsOn = requireHttps === '1' || requireHttps === 'on' || requireHttps === 'true';
   const requireHttpsOff =
     requireHttps === 'off' || requireHttps === '0' || requireHttps === 'false';
-  const isLoopbackBind =
-    host === '127.0.0.1' || host === '::1' || host === 'localhost' || host === '';
-  if (!isLoopbackBind && !requireHttpsOff) {
+  const isLoopbackBind = isLoopbackHost(host);
+  if (!isLoopbackBind && !requireHttpsOn && !requireHttpsOff) {
     const msg =
       `kimi-memory proxy: refusing to start — non-loopback bind host=${host} without TLS. ` +
       `Either place a TLS terminator in front of the proxy and set KIMI_MEMORY_PROXY_REQUIRE_HTTPS=1, ` +
       `or pass --host 127.0.0.1 (or any loopback address). ` +
-      `To override explicitly (NOT recommended), set KIMI_MEMORY_PROXY_REQUIRE_HTTPS=off.`;
+      `To send bearer tokens in cleartext instead (NOT recommended), set KIMI_MEMORY_PROXY_REQUIRE_HTTPS=off.`;
     log(msg);
     throw new Error(msg);
   }
@@ -137,17 +134,22 @@ export async function startProxy({
       return { ok: false, error: 'proxy auth token not configured (set KIMI_MEMORY_PROXY_TOKEN)' };
     }
     const auth = req.headers['authorization'] || '';
-    if (typeof auth !== 'string' || !auth.startsWith('Bearer ')) {
+    // RFC 7235 makes the scheme token case-insensitive, so `Bearer`,
+    // `bearer` and `BEARER` are all the same scheme.
+    const parts = typeof auth === 'string' ? /^(\S+)\s+(.+)$/.exec(auth.trim()) : null;
+    if (!parts || parts[1].toLowerCase() !== 'bearer') {
       return { ok: false, error: 'missing Authorization: Bearer <token>' };
     }
-    const presented = auth.slice('Bearer '.length).trim();
+    const presented = parts[2].trim();
     // Constant-time comparison so an attacker on the same loopback
-    // cannot recover the token byte-by-byte from response timing. The
-    // length check is intentionally first because timingSafeEqual
-    // throws when buffer lengths differ.
-    const a = Buffer.from(presented, 'utf8');
-    const b = Buffer.from(token, 'utf8');
-    if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) {
+    // cannot recover the token byte-by-byte from response timing.
+    // Compare fixed-size SHA-256 digests instead of the raw strings:
+    // timingSafeEqual() throws on mismatched buffer lengths, so a raw
+    // comparison would need a length short-circuit that leaks the
+    // token's length before the constant-time step ever runs.
+    const a = crypto.createHash('sha256').update(presented, 'utf8').digest();
+    const b = crypto.createHash('sha256').update(token, 'utf8').digest();
+    if (!crypto.timingSafeEqual(a, b)) {
       return { ok: false, error: 'invalid bearer token' };
     }
     return { ok: true };
@@ -157,10 +159,30 @@ export async function startProxy({
     return new Promise((resolve, reject) => {
       const chunks = [];
       let total = 0;
-      let aborted = false;
+      let done = false;
+      const onClose = () => finish(new Error('request aborted before the body was received'));
+      const onError = (err) => finish(err);
+      const onEnd = () => finish(null);
+      const onData = (c) => {
+        if (done) return;
+        total += c.length;
+        if (total > limit) {
+          chunks.length = 0;
+          finish(new Error(`request body too large (>${limit} bytes)`));
+          return;
+        }
+        chunks.push(c);
+      };
       const finish = (err) => {
-        if (aborted) return;
-        aborted = true;
+        if (done) return;
+        done = true;
+        // Detach every listener on all settle paths: a keep-alive socket
+        // is reused, and a stale listener would fire against a later
+        // request.
+        req.removeListener('data', onData);
+        req.removeListener('end', onEnd);
+        req.removeListener('error', onError);
+        req.removeListener('close', onClose);
         if (err) return reject(err);
         try {
           const body = Buffer.concat(chunks).toString('utf8');
@@ -186,18 +208,12 @@ export async function startProxy({
           reject(e);
         }
       };
-      req.on('data', (c) => {
-        if (aborted) return;
-        total += c.length;
-        if (total > limit) {
-          chunks.length = 0;
-          finish(new Error(`request body too large (>${limit} bytes)`));
-          return;
-        }
-        chunks.push(c);
-      });
-      req.on('end', () => finish(null));
-      req.on('error', finish);
+      req.on('data', onData);
+      req.on('end', onEnd);
+      req.on('error', onError);
+      // A client that hangs up mid-body fires neither 'end' nor 'error';
+      // without this the promise never settles and the handler leaks.
+      req.on('close', onClose);
     });
   }
 
@@ -236,6 +252,53 @@ export async function startProxy({
     });
   }
 
+  // Brute-force throttle for the bearer. Ten consecutive 401s from one
+  // remote address earn a 429 until the 60s window rolls over; a
+  // successful auth clears that address's counter. The map is pruned on
+  // every write (and hard-capped) so a spray of failed attempts cannot
+  // grow it without bound. Only consulted when auth is actually enabled
+  // — with no token configured there is no secret to guess, and the
+  // informative 401 should reach the operator instead.
+  const AUTH_FAIL_LIMIT = 10;
+  const AUTH_FAIL_WINDOW_MS = 60000;
+  const AUTH_FAIL_MAX_KEYS = 2048;
+  const authFailures = new Map();
+  const authFailureKey = (req) => {
+    const addr = req.socket && req.socket.remoteAddress;
+    return typeof addr === 'string' && addr ? addr : 'unknown';
+  };
+  const pruneAuthFailures = (now) => {
+    for (const [key, entry] of authFailures) {
+      if (now - entry.firstAt >= AUTH_FAIL_WINDOW_MS) authFailures.delete(key);
+    }
+    while (authFailures.size > AUTH_FAIL_MAX_KEYS) {
+      const oldest = authFailures.keys().next();
+      if (oldest.done) break;
+      authFailures.delete(oldest.value);
+    }
+  };
+  const authRetryAfter = (req, now) => {
+    const key = authFailureKey(req);
+    const entry = authFailures.get(key);
+    if (!entry) return 0;
+    if (now - entry.firstAt >= AUTH_FAIL_WINDOW_MS) {
+      authFailures.delete(key);
+      return 0;
+    }
+    if (entry.count < AUTH_FAIL_LIMIT) return 0;
+    return Math.max(1, Math.ceil((entry.firstAt + AUTH_FAIL_WINDOW_MS - now) / 1000));
+  };
+  const noteAuthFailure = (req, now) => {
+    const key = authFailureKey(req);
+    const entry = authFailures.get(key);
+    if (!entry || now - entry.firstAt >= AUTH_FAIL_WINDOW_MS) {
+      authFailures.set(key, { count: 1, firstAt: now });
+    } else {
+      entry.count += 1;
+    }
+    pruneAuthFailures(now);
+  };
+
   const server = http.createServer(async (req, res) => {
     state.requests += 1;
     state.lastRequestAt = new Date().toISOString();
@@ -250,12 +313,12 @@ export async function startProxy({
     const path = url.pathname.replace(/\/+$/, '') || '/';
 
     // CORS: list-based allowlist via `KIMI_MEMORY_PROXY_CORS_ORIGINS`
-    // (comma-separated). The proxy is a server-to-server transport by
-    // default; a wildcard CORS would let any browser-origin exfiltrate a
-    // token via a stolen cookie or shared workstation. Setting the env
-    // var to e.g. "https://dashboard.local" narrows the cross-origin
-    // surface to exactly the call sites that need it. Auth still applies
-    // on every tool endpoint regardless.
+    // (comma-separated, exact match, never a wildcard). The proxy is a
+    // server-to-server transport by default; a wildcard CORS would let
+    // any browser-origin exfiltrate a token via a stolen cookie or shared
+    // workstation. Setting the env var to e.g. "https://dashboard.local"
+    // narrows the cross-origin surface to exactly the call sites that
+    // need it. Auth still applies on every tool endpoint regardless.
     const allowedOrigins = (process.env.KIMI_MEMORY_PROXY_CORS_ORIGINS || '')
       .split(',')
       .map((s) => s.trim())
@@ -263,9 +326,21 @@ export async function startProxy({
     const reqOrigin = req.headers.origin || '';
     if (allowedOrigins.includes(reqOrigin)) {
       res.setHeader('access-control-allow-origin', reqOrigin);
-      res.setHeader('vary', 'Origin');
     }
-    res.setHeader('access-control-allow-methods', 'POST');
+    // Vary goes out on every response, reflected origin or not, so a
+    // shared cache cannot hand one origin's response to another. Merged
+    // into any existing Vary rather than overwritten. No
+    // allow-credentials: the bearer is passed explicitly, not via cookie.
+    const vary = new Set(
+      String(res.getHeader('vary') || '')
+        .split(',')
+        .map((s) => s.trim())
+        .filter(Boolean),
+    );
+    vary.add('Origin');
+    res.setHeader('vary', [...vary].join(', '));
+    // GET covers /tools and /readyz; OPTIONS covers the preflight itself.
+    res.setHeader('access-control-allow-methods', 'GET, POST, OPTIONS');
     res.setHeader('access-control-allow-headers', 'authorization, content-type');
     if (req.method === 'OPTIONS') {
       res.writeHead(204);
@@ -300,7 +375,7 @@ export async function startProxy({
         }
       } catch (e) {
         ready = false;
-        reason = e && e.message ? e.message : String(e);
+        reason = safeErrorMessage(e);
       }
       res.writeHead(ready ? 200 : 503, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ ok: ready, reason, startedAt: state.startedAt }));
@@ -311,12 +386,24 @@ export async function startProxy({
     // enumeration would let an unauthenticated probe catalogue the
     // proxy's attack surface; require the bearer for everything that
     // is not a liveness probe.
+    const now = Date.now();
+    const retryAfter = state.authEnabled ? authRetryAfter(req, now) : 0;
+    if (retryAfter > 0) {
+      res.writeHead(429, {
+        'content-type': 'application/json',
+        'retry-after': String(retryAfter),
+      });
+      res.end(JSON.stringify({ error: 'too many failed authentication attempts; retry later' }));
+      return;
+    }
     const auth = authenticate(req);
     if (!auth.ok) {
+      if (state.authEnabled) noteAuthFailure(req, now);
       res.writeHead(401, { 'content-type': 'application/json' });
       res.end(JSON.stringify({ error: auth.error }));
       return;
     }
+    if (state.authEnabled) authFailures.delete(authFailureKey(req));
 
     if (path === '/tools' && req.method === 'GET') {
       // List the tool names the proxy can call. Source of truth is
@@ -327,7 +414,7 @@ export async function startProxy({
         res.end(JSON.stringify({ tools: names, count: names.length }));
       } catch (e) {
         res.writeHead(500, { 'content-type': 'application/json' });
-        res.end(JSON.stringify({ error: e.message, code: e.code || 'internal' }));
+        res.end(JSON.stringify({ error: safeErrorMessage(e), code: e.code || 'internal' }));
       }
       return;
     }
@@ -355,7 +442,7 @@ export async function startProxy({
         body = await readJson(req);
       } catch (e) {
         res.writeHead(400, { 'content-type': 'application/json' });
-        res.end(JSON.stringify({ error: `invalid JSON body: ${e.message}` }));
+        res.end(JSON.stringify({ error: `invalid JSON body: ${safeErrorMessage(e)}` }));
         return;
       }
       try {
@@ -367,7 +454,7 @@ export async function startProxy({
         res.writeHead(isUnknown ? 404 : 500, { 'content-type': 'application/json' });
         res.end(
           JSON.stringify({
-            error: e.message,
+            error: safeErrorMessage(e),
             code: e.code || (isUnknown ? 'unknown_tool' : 'internal'),
           }),
         );
@@ -379,6 +466,17 @@ export async function startProxy({
     res.writeHead(404, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ error: `unknown route: ${path}` }));
   });
+
+  // Explicit bounds where Node's defaults are far too generous for a
+  // local tool transport: the 300s default requestTimeout would let one
+  // slow POST pin a request (and its buffers) open for five minutes,
+  // which is also the window a token-spraying client gets for free.
+  // headersTimeout must stay above keepAliveTimeout and below
+  // requestTimeout, or Node warns and picks its own value.
+  server.requestTimeout = 30000;
+  server.headersTimeout = 10000;
+  server.keepAliveTimeout = 5000;
+  server.maxHeadersCount = 100;
 
   await new Promise((resolve, reject) => {
     server.once('error', reject);
@@ -443,6 +541,29 @@ export function proxyAuthBypass() {
   return v === 'off' || v === '0' || v === 'false' || v === 'no';
 }
 
+// Genuinely-loopback bind hosts only. The classification matters more
+// than it looks: Node binds `listen(port, '')` to `::` (every interface,
+// dual-stack) — verified, not assumed — so an empty host is the opposite
+// of safe and must never count as loopback. Same for the wildcards
+// `0.0.0.0` and `::`. Accepts the whole 127.0.0.0/8 block, `::1` (bare or
+// `[::1]`) and `localhost` in any case, with or without a trailing dot.
+// Shared by the startup TLS gate, the auth-bypass gate and
+// nonLoopbackToolGuard() so those three decisions cannot drift apart.
+const LOOPBACK_V4 = /^127\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/;
+
+export function isLoopbackHost(host) {
+  if (typeof host !== 'string') return false;
+  let h = host.trim().toLowerCase();
+  if (h.startsWith('[') && h.endsWith(']')) h = h.slice(1, -1);
+  if (h.endsWith('.')) h = h.slice(0, -1);
+  if (h === 'localhost' || h === '::1') return true;
+  if (!LOOPBACK_V4.test(h)) return false;
+  return h
+    .split('.')
+    .slice(1)
+    .every((part) => Number(part) <= 255);
+}
+
 // Destructive MCP tools that must not be reachable on a non-loopback
 // bind without an explicit operator opt-in. Read-only and routine-write
 // tools (memory_recall, memory_list, memory_get, memory_save, …) stay
@@ -466,11 +587,13 @@ const NETWORK_DESTRUCTIVE_TOOLS = new Set([
 
 export function nonLoopbackToolGuard(toolName, { host } = {}) {
   // Loopback binds never trip the guard; the bearer-auth boundary is
-  // considered sufficient for the same machine.
+  // considered sufficient for the same machine. `host` is the address
+  // startProxy is listening on, and it is authoritative. Only when the
+  // caller omits it entirely do we fall back to KIMI_MEMORY_PROXY_HOST
+  // and then to the loopback default — startProxy itself never reads
+  // that env var, so a stale value there cannot loosen a live bind.
   const bindHost = host != null ? host : process.env.KIMI_MEMORY_PROXY_HOST || '127.0.0.1';
-  const loopback =
-    bindHost === '127.0.0.1' || bindHost === '::1' || bindHost === 'localhost' || bindHost === '';
-  if (loopback) return null;
+  if (isLoopbackHost(bindHost)) return null;
   // Operator-set deny-list always wins, regardless of any allow-list.
   // Useful for hardening the proxy against a specific tool even when
   // the operator has broader ALLOW_TOOLS set.

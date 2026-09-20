@@ -31,6 +31,9 @@ export {
   diversifyHitsByType,
   buildRecallSummary,
   buildRecallContextLines,
+  RECALL_FENCE_BEGIN,
+  RECALL_FENCE_END,
+  stripRecallMarkers,
 } from './recall.js';
 export {
   buildCounts,
@@ -52,6 +55,9 @@ export {
   handleAutoExtract,
 } from './stop.js';
 
-// `truncate` and `firstContentLine` moved to `src/util.js`; re-export
-// them so the hook layer keeps a single import path for both.
-export { truncate, firstContentLine } from '../../../util.js';
+// `truncate`, `firstContentLine`, and `singleLine` live in
+// `src/util.js`; re-export them so the hook layer keeps a single
+// import path for all three. `singleLine` is the sanitizer every
+// memory-derived field must pass through before it is rendered into
+// injected context.
+export { truncate, firstContentLine, singleLine } from '../../../util.js';
