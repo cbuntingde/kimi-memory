@@ -28,7 +28,11 @@
 // `memory_save`.
 import { nowIso, hashId, shortId, safeJsonParse, clampInt } from './util.js';
 import { runConsolidate, proposalSourceChecksum, recordConsolidationRun } from './consolidate.js';
-import { decodeVector as decodeEmbedding } from './embedding.js';
+// Nullable decoder: a corrupt embedding BLOB must drop its row, not
+// abort the proposal pass (the caller turns any throw into a failed
+// job). `decodeVector`'s strict form stays in src/embedding.js for
+// real validation paths.
+import { tryDecodeVector as decodeEmbedding } from './embedding.js';
 import { linkMemory } from './persist/edges.js';
 import { withSavepoint } from './persist/tx.js';
 

@@ -38,11 +38,12 @@ Unless noted, a value of `off` disables the feature and the default is
 
 ### Core
 
-| Variable                        | Default        | What it does                                                                                                           |
-| ------------------------------- | -------------- | ---------------------------------------------------------------------------------------------------------------------- |
-| `KIMI_CODE_HOME`                | `~/.kimi-code` | Root of Kimi's data folder. Every memory DB and state file lives under `$KIMI_CODE_HOME/kimi-memory/`.                 |
-| `KIMI_MEMORY_LEGACY_SUBSYSTEMS` | `on`           | Set to `off` to skip registration of the 15 legacy MCP tools and the tier/persona sweeps. See "Subsystem deprecation". |
-| `KIMI_MEMORY_SECRET_SCAN`       | `on`           | Set to `off` to bypass the credential-shape gate on save. Intended for fixture imports only.                           |
+| Variable                        | Default        | What it does                                                                                                                                                                                                                                                                                                                                                                           |
+| ------------------------------- | -------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `KIMI_CODE_HOME`                | `~/.kimi-code` | Root of Kimi's data folder. Every memory DB and state file lives under `$KIMI_CODE_HOME/kimi-memory/`.                                                                                                                                                                                                                                                                                 |
+| `KIMI_MEMORY_LEGACY_SUBSYSTEMS` | `on`           | Set to `off` to skip registration of the 15 legacy MCP tools and the tier/persona sweeps. See "Subsystem deprecation".                                                                                                                                                                                                                                                                 |
+| `KIMI_MEMORY_SECRET_SCAN`       | `on`           | Set to `off` to bypass the credential-shape gate on save. Intended for fixture imports only.                                                                                                                                                                                                                                                                                           |
+| `KIMI_MEMORY_BUSY_TIMEOUT_MS`   | `30000`        | SQLite `busy_timeout` for the connection. A hook process pins this down to 1500 ms (`src/hooks/run.js`) so a write that collides with a concurrent hook fails fast into the handler's fail-open path instead of blocking the JS thread past the dispatcher ceiling — timers cannot run inside a native SQLite call, so a long busy_timeout makes the hook timeout guard unenforceable. |
 
 ### Auto-extract
 

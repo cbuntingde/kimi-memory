@@ -3,18 +3,19 @@
 // The RRF (Reciprocal Rank Fusion) hybrid search lives here. Sibling
 // modules: memories.js owns CRUD + rowToMemory + getMemory,
 // edges.js owns typed edges, share.js owns visibility/tier vocab.
-import { nowIso } from '../util.js';
+import { nowIso, clampInt } from '../util.js';
 import {
   EMBEDDING_DIM,
+  EMBEDDING_MODEL,
   embedText,
   encodeVector,
-  decodeVector,
+  tryDecodeVector,
   cosineSimilarity,
 } from '../embedding.js';
 import { logPersistError } from '../diagnostics.js';
 import { rowToMemory } from './memories.js';
 import { VISIBILITY_SET as VISIBILITY_VALUES, TIER_SET as TIER_VALUES } from '../vocabulary.js';
-import { normalizeFts5Query, buildTitleBoostedQuery, buildOrderByClause } from '../search.js';
+import { normalizeFts5Query, buildTitleBoostedQuery } from '../search.js';
 
 // Combined-score floor below which a candidate is treated as not
 // relevant. Default tuning for the RRF (Reciprocal Rank Fusion) path:
@@ -90,21 +91,31 @@ function bumpAccess(db, projectKey, ids) {
 
 export async function searchMemories(db, projectKey, query, opts = {}) {
   if (!query || !query.trim()) return [];
-  const limit = Math.max(1, Math.min(200, opts.limit || 20));
+  // clampInt, not Math.min/Math.max: the value is bound to `LIMIT ?` and
+  // node:sqlite raises "datatype mismatch" when a float reaches that
+  // slot. The CLI passes `Number(args.flags.limit)` straight through, so
+  // `recall q --limit 2.5` used to throw. clampInt truncates and
+  // substitutes the fallback for non-finite input.
+  const limit = clampInt(opts.limit, 1, 200, 20);
   const type = opts.type || null;
   const minScore =
     Number.isFinite(opts.minScore) && opts.minScore >= 0 && opts.minScore <= 1
       ? opts.minScore
       : MIN_RELEVANCE_SCORE;
   // perType: when true, pick the top `perTypeLimit` rows from EACH
-  // type that has a hit, then sort by score and take the global top
-  // `limit`. Use this when you want a balanced recall (e.g. the
-  // UserPromptSubmit hook, so the agent sees a mix of conventions,
-  // procedures, and working notes rather than the top-N of one type).
+  // type that has a hit, then sort by the selection order (score by
+  // default, newest/oldest when a time sort was requested) and take
+  // the global top `limit`. Use this when you want a balanced recall
+  // (e.g. the UserPromptSubmit hook, so the agent sees a mix of
+  // conventions, procedures, and working notes rather than the top-N
+  // of one type).
   // The SQL-level `type` filter is ignored when perType is set — a
   // type filter plus per-type balancing is contradictory.
   const perType = !!opts.perType;
-  const perTypeLimit = Math.max(1, Math.min(20, opts.perTypeLimit || 2));
+  // Same clampInt rationale as `limit` — but this one only ever reaches
+  // the in-memory slice, so the truncation just keeps the two limits
+  // consistent.
+  const perTypeLimit = clampInt(opts.perTypeLimit, 1, 20, 2);
   const includeScore = !!opts.includeScore;
   // Fusion strategy. Default = 'rrf' (Reciprocal Rank Fusion, the
   // TencentDB-aligned path). 'weighted' preserves the legacy 0.5/0.5
@@ -151,6 +162,37 @@ export async function searchMemories(db, projectKey, query, opts = {}) {
       ? Math.floor(opts.maxTotalRecallChars)
       : 0;
 
+  // Time-ordered sort. When the caller asks for 'recent' / 'oldest' (or
+  // the legacy boolean `recentFirst` / `recent_first`), that order has
+  // to reach the FINAL returned list. The merge below always re-sorts
+  // by score, so pre-sorting the FTS candidates would only shuffle the
+  // RRF ranks and never survive to the caller — `bySelectionOrder`
+  // therefore replaces the score comparator in the selection step.
+  // That also means `limit` selects the newest / oldest matches rather
+  // than the highest-scoring ones, which is what a time sort asks for.
+  // With no time sort requested the comparator is the score order and
+  // the ranking path is unchanged.
+  const sortBy = opts.sortBy || opts.sort_by || null;
+  const recentFirst =
+    opts.recentFirst !== undefined
+      ? !!opts.recentFirst
+      : opts.recent_first !== undefined
+        ? !!opts.recent_first
+        : null;
+  const timeSort =
+    sortBy === 'oldest' ? 'oldest' : sortBy === 'recent' || recentFirst === true ? 'recent' : null;
+  const bySelectionOrder = timeSort
+    ? (a, b) => {
+        // updated_at is an ISO-8601 UTC string, so a byte comparison is
+        // chronological. A missing stamp sorts as the oldest row.
+        const av = a.row.updated_at || '';
+        const bv = b.row.updated_at || '';
+        if (av === bv) return 0;
+        const cmp = av < bv ? -1 : 1;
+        return timeSort === 'recent' ? -cmp : cmp;
+      }
+    : (a, b) => b.score - a.score;
+
   // ---- 1. FTS5 candidates ----
   // When perType is on we want every type's hits, so we suppress the
   // SQL-level type filter and bucket in memory below.
@@ -179,9 +221,12 @@ export async function searchMemories(db, projectKey, query, opts = {}) {
       tierClause = ` AND m.tier IN (${tierFilter.map(() => '?').join(',')})`;
       params.push(...tierFilter);
     }
-    // Cast a wide net for perType: pull up to `limit * 5` rows so
-    // every type has a chance to be represented.
-    params.push(perType ? Math.max(limit * 5, 100) : limit);
+    // Cast a wide net for perType (every type needs a chance to be
+    // represented) and for a time sort (the newest / oldest `limit` rows
+    // have to be inside the candidate window for the ordering to mean
+    // anything). The default path still pulls exactly `limit` rows in
+    // rank order, so its ranking is untouched.
+    params.push(perType || timeSort ? Math.max(limit * 5, 100) : limit);
     ftsRows.push(
       ...db
         .prepare(
@@ -200,36 +245,12 @@ export async function searchMemories(db, projectKey, query, opts = {}) {
     );
   }
 
-  // Sort-by handling: when the caller asks for "recent" or "oldest",
-  // the FTS has already returned rows in rank order; we re-sort
-  // before passing to the diversifier. The fall-through default is
-  // the RRF score (computed below).
-  const sortBy = opts.sortBy || opts.sort_by || null;
-  const recentFirst =
-    opts.recentFirst !== undefined
-      ? !!opts.recentFirst
-      : opts.recent_first !== undefined
-        ? !!opts.recent_first
-        : null;
-  if (sortBy === 'recent' || recentFirst === true) {
-    ftsRows.sort((a, b) =>
-      a.updated_at < b.updated_at ? 1 : a.updated_at > b.updated_at ? -1 : 0,
-    );
-  } else if (sortBy === 'oldest') {
-    ftsRows.sort((a, b) =>
-      a.updated_at < b.updated_at ? -1 : a.updated_at > b.updated_at ? 1 : 0,
-    );
-  }
-  // The buildOrderByClause helper is exported for callers that want
-  // to compose SQL themselves; the in-memory resort above is what
-  // searchMemories actually uses. (Referencing the helper here keeps
-  // it from being tree-shaken if a future bundler is aggressive.)
-  void buildOrderByClause;
-
   // ---- 2. Vector candidates (best-effort, fail-open) ----
   // Compute the query embedding once, then cosine-similarity against
   // every active memory in this project that has an embedding of the
-  // expected dimension. Embedding module never throws; null = skip.
+  // expected dimension. Both `embedText` and `tryDecodeVector` never
+  // throw; a null query vector or a corrupt stored BLOB is a skip, so
+  // one bad row cannot fail the whole recall.
   const qVec = await embedText(query);
   const vecScores = new Map();
   if (qVec && qVec.length === EMBEDDING_DIM) {
@@ -276,7 +297,7 @@ export async function searchMemories(db, projectKey, query, opts = {}) {
       )
       .all(...params, vectorCap);
     for (const r of rows) {
-      const v = decodeVector(r.embedding);
+      const v = tryDecodeVector(r.embedding);
       if (!v || v.length !== EMBEDDING_DIM) continue;
       vecScores.set(r.id, cosineSimilarity(qVec, v));
     }
@@ -381,8 +402,8 @@ export async function searchMemories(db, projectKey, query, opts = {}) {
   let picked;
   if (perType) {
     // Bucket by type, take top perTypeLimit per type, then re-sort
-    // by score and trim to the global `limit`. Guarantees the agent
-    // sees at least one row from every type that has a hit.
+    // and trim to the global `limit`. Guarantees the agent sees at
+    // least one row from every type that has a hit.
     const byType = new Map();
     for (const e of scored) {
       const t = e.row.type;
@@ -391,13 +412,13 @@ export async function searchMemories(db, projectKey, query, opts = {}) {
     }
     picked = [];
     for (const items of byType.values()) {
-      items.sort((a, b) => b.score - a.score);
+      items.sort(bySelectionOrder);
       picked.push(...items.slice(0, perTypeLimit));
     }
-    picked.sort((a, b) => b.score - a.score);
+    picked.sort(bySelectionOrder);
     picked = picked.slice(0, limit);
   } else {
-    scored.sort((a, b) => b.score - a.score);
+    scored.sort(bySelectionOrder);
     picked = scored.slice(0, limit);
   }
 
@@ -422,7 +443,7 @@ export async function searchMemories(db, projectKey, query, opts = {}) {
         remaining.push(e);
       }
     }
-    picked = [...remaining, ...[].concat(...byTier.values())].sort((a, b) => b.score - a.score);
+    picked = [...remaining, ...[].concat(...byTier.values())].sort(bySelectionOrder);
   }
 
   const out = picked.map(({ row, score, fts_rank, vec_rank, rrf_score, fts_score, vec_score }) => {
@@ -462,8 +483,9 @@ export async function searchMemories(db, projectKey, query, opts = {}) {
   }
 
   // v10 cumulative character cap. Drop tail rows once the running sum
-  // of content lengths exceeds maxTotalRecallChars. Keeps the
-  // highest-scoring rows the agent can actually fit into context.
+  // of content lengths exceeds maxTotalRecallChars. Keeps the leading
+  // rows of the returned order — highest-scoring by default, newest /
+  // oldest when a time sort was requested.
   let finalOut = out;
   if (maxTotalRecallChars > 0) {
     let used = 0;
@@ -494,7 +516,7 @@ export async function similarMemories(db, projectKey, id, { limit = 10, threshol
     .prepare('SELECT id, embedding, embedding_dim FROM memories WHERE id=? AND project_key=?')
     .get(id, projectKey);
   if (!target || !target.embedding) return [];
-  const tVec = decodeVector(target.embedding);
+  const tVec = tryDecodeVector(target.embedding);
   if (!tVec || tVec.length !== EMBEDDING_DIM) return [];
 
   const where = [
@@ -523,13 +545,17 @@ export async function similarMemories(db, projectKey, id, { limit = 10, threshol
 
   const scored = [];
   for (const row of rows) {
-    const v = decodeVector(row.embedding);
+    const v = tryDecodeVector(row.embedding);
     if (!v || v.length !== EMBEDDING_DIM) continue;
     const sim = cosineSimilarity(tVec, v);
     if (sim >= threshold) scored.push({ row, sim });
   }
   scored.sort((a, b) => b.sim - a.sim);
-  const top = scored.slice(0, Math.max(1, Math.min(50, limit)));
+  // clampInt keeps a fractional `limit` (e.g. from the CLI's
+  // `Number(args.flags.limit)`) from reaching the slice as a float; the
+  // candidate scan above is bounded by the constant RECALL_VECTOR_CAP, so
+  // this is the only caller-supplied limit in this function.
+  const top = scored.slice(0, clampInt(limit, 1, 50, 10));
 
   if (top.length > 0) {
     bumpAccess(

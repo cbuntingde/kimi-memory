@@ -1,6 +1,7 @@
 // SessionStart handler. Boot-time: status line + decay + embed retry
-// + consolidate + auto-GC + opportunistic Dream apply + thread +
-// working-memory preview + re-clone warning.
+// + consolidate + auto-GC + opportunistic Dream apply + the
+// wall-clock-gated dreaming pass + thread + working-memory preview +
+// re-clone warning.
 
 import {
   ensureProjectDir,
@@ -25,6 +26,7 @@ import {
   runAutoGcThrottled,
   safeHandleStop,
   maybeApplyReadyDream,
+  maybeDreaming,
   emitLines,
   readLatestSessionFocus,
   buildSessionFocusLine,
@@ -127,6 +129,29 @@ export async function handleSessionStart(payload) {
     }
   }
 
+  // The wall-clock-gated Dreaming pass (consolidate + dream + auto-GC).
+  // AGENTS.md documents `KIMI_MEMORY_DREAMING` as gating "the
+  // SessionStart dreaming pass" and src/dreaming.js describes
+  // runDreaming as called by the SessionStart hook; until this call
+  // existed the pass ran only from the `dreaming_run` MCP tool and the
+  // CLI, and the `KIMI_MEMORY_DREAMING=off` opt-out gated nothing.
+  let dreaming = null;
+  if (projectDb) {
+    try {
+      dreaming = await maybeDreaming({
+        projectDb,
+        projectKey: key,
+        cwd,
+        kimiHomeDir: HOME,
+      });
+      if (dreaming && dreaming.fired) {
+        await logDiag('info', 'dreaming pass result', { key, dreaming });
+      }
+    } catch (e) {
+      dreaming = { skipped: 'threw', error: e && e.message };
+    }
+  }
+
   const lines = [];
   lines.push(
     buildStatusLine({
@@ -200,5 +225,6 @@ export async function handleSessionStart(payload) {
     workLog: latestWorkLog,
     stale_memory: staleMemoryLine ? true : false,
     dream,
+    dreaming,
   };
 }

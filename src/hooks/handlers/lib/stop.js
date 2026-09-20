@@ -38,8 +38,33 @@ import { payloadSessionId, logDiag } from './payload.js';
 //
 // Idempotent wire.jsonl ingest. Used by every event that wants the
 // project's archive to be up to date before reading from it.
+//
+// `safeHandleStop` is the only entry point callers use. It never
+// throws: the dispatcher documents "we always fail open" (run.js), and
+// its callers — SessionStart, UserPromptSubmit, Stop — are unguarded,
+// so a single throw from `ensureProjectDir` (mkdir EPERM), `openDb`
+// (SQLITE_BUSY / corrupt file) or `readSessionIndex` would abandon the
+// whole event: SessionStart emits no status line and skips
+// decay/consolidate/auto-GC/Dream, UserPromptSubmit emits no recall and
+// no additionalContext. The failure shape is the one callers already
+// test for (`ingest.ok !== false`, `ingest.skipped`).
 export async function safeHandleStop(payload, cwd) {
-  const key = deriveProjectKey(cwd);
+  let key = null;
+  try {
+    key = deriveProjectKey(cwd);
+    return await ingestSnapshot(payload, cwd, key);
+  } catch (e) {
+    await logDiag('warn', 'ingest threw', { error: e && e.message });
+    return {
+      ok: false,
+      skipped: 'ingest_threw',
+      error: e && e.message ? e.message : String(e),
+      project_key: key,
+    };
+  }
+}
+
+async function ingestSnapshot(payload, cwd, key) {
   await ensureProjectDir(HOME, key);
   const sessionId = payloadSessionId(payload);
   if (!sessionId) return { ok: true, skipped: 'no_session_id', session_id: null, project_key: key };

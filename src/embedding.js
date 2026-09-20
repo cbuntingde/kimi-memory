@@ -100,15 +100,27 @@ let pipelineLoaded = false;
 let lastError = null;
 // Test-only injection: a stub that replaces the @huggingface/transformers
 // pipeline() loader. When set, getPipeline returns the stub's promise
-// instead of importing the real package. Used to exercise the timeout
-// race without depending on a 25 MB model download. The stub must
-// resolve to a function with the same shape as a transformers pipeline
-// (i.e. `await pipe(text, { pooling, normalize })` returns a tensor-like
-// value with `.data`).
+// instead of importing the real package; the promise is cached in the
+// same slot the real loader uses, so the stub is invoked once per cache
+// lifetime and its handle is released by the same resets. Used to
+// exercise the timeout race and the failure resets without depending on
+// a 25 MB model download. The stub must resolve to a function with the
+// same shape as a transformers pipeline (i.e. `await pipe(text,
+// { pooling, normalize })` returns a tensor-like value with `.data`).
 let pipelineStub = null;
 
 async function getPipeline() {
-  if (pipelineStub) return pipelineStub();
+  // The stub shares the real loader's cache slot so it is subject to
+  // the same lifecycle — in particular, the dispose on the
+  // real-failure reset path below and in _resetForTests. A stub whose
+  // loader rejects therefore clears the cache exactly like a real
+  // failed load, and a stub that resolves is reused instead of being
+  // re-invoked per call, which is what makes "the reset releases the
+  // previous handle" observable without a model download.
+  if (pipelineStub) {
+    if (!pipelinePromise) pipelinePromise = Promise.resolve(pipelineStub());
+    return pipelinePromise;
+  }
   if (!pipelinePromise) {
     pipelinePromise = (async () => {
       const { pipeline, env } = await import('@huggingface/transformers');
@@ -177,8 +189,10 @@ async function embedRaw(text) {
     }
     // Real failure (rejection from import, pipe, or runtime): reset
     // the cache so the next call re-attempts the download.
+    const stale = pipelinePromise;
     pipelinePromise = null;
     pipelineLoaded = false;
+    disposePipeline(stale);
     lastError = msg;
     warnOnce(`embeddings unavailable: ${msg}`);
     logEmbeddingError(null, 'model_load', e, { model: EMBEDDING_MODEL }).catch(() => {});
@@ -194,6 +208,28 @@ function warnOnce(msg) {
   warnedOnce = true;
   try {
     process.stderr.write(`[kimi-memory] ${msg}\n`);
+  } catch {
+    /* ignore */
+  }
+}
+
+// Best-effort release of a cached pipeline handle. A loaded
+// transformers.js pipeline owns a native ONNX session; dropping the
+// reference without disposing it leaks that session, and the
+// real-failure reset path can run repeatedly (every failed load creates
+// a fresh one). The handle is a promise that may still be pending or may
+// have rejected — in those cases there is no session to release and the
+// `.catch` swallows the rejection so it does not surface as an
+// unhandled rejection. `dispose` is not part of the documented pipeline
+// surface in every transformers.js release, so it is feature-checked
+// rather than assumed.
+function disposePipeline(promise) {
+  try {
+    Promise.resolve(promise)
+      .then((pipe) => {
+        if (pipe && typeof pipe.dispose === 'function') pipe.dispose();
+      })
+      .catch(() => {});
   } catch {
     /* ignore */
   }
@@ -260,8 +296,15 @@ export function lastEmbeddingError() {
 // re-download, which we want to be opt-in only). Tests use this to
 // reset state between cases.
 export function _resetForTests() {
+  // Dispose as well as drop. A test that reset between cases used to
+  // leak whatever the previous case had loaded — a real ONNX session
+  // when a test drove a real load, or the stub's handle. The stub
+  // handles in tests/07-embedding.test.js are plain functions with no
+  // `dispose`, so the feature check makes this a no-op for them.
+  const stale = pipelinePromise;
   pipelinePromise = null;
   pipelineLoaded = false;
+  disposePipeline(stale);
   lastError = null;
   warnedOnce = false;
   pipelineStub = null;
@@ -320,6 +363,19 @@ export function decodeVector(buf) {
     }
   }
   return vec;
+}
+
+// Null-returning twin of `decodeVector`. Best-effort callers (the
+// consolidation clusterer, near-dup detection, Dream's proposal pass,
+// the brute-force cosine scan) treat a missing embedding as "skip this
+// row", so a corrupt/short BLOB must not abort the whole pass. Keep
+// `decodeVector` strict — real validation paths rely on its throw.
+export function tryDecodeVector(buf) {
+  try {
+    return decodeVector(buf);
+  } catch {
+    return null;
+  }
 }
 
 // Pure-JS dot product. The MiniLM pipeline returns L2-normalized

@@ -281,6 +281,30 @@ export function saveMemory(db, projectKey, input) {
   // persona_promotions). persona_id is pass-through.
   const tier = TIER_VALUES.has(input.tier) ? input.tier : 'L0';
   const personaId = input.persona_id || null;
+  // Timestamps and usage counters. These are part of the documented
+  // import surface — src/cli-cmd/import.js restores an export verbatim —
+  // so the INSERT below honours them when the caller supplies them
+  // explicitly. An export→import round-trip has to preserve created_at /
+  // updated_at / access_count / last_accessed_at / stability_days /
+  // last_rehearsed_at: without them every restored row looks freshly
+  // created, stability_days falls back to the column default of 30, and
+  // access_count resets to 0 — which disables the auto-tier rules in
+  // auto-gc.js (access_count >= 3 for L0→L1, >= 10 for L1→L2).
+  // "Explicitly supplied" means the key is present, the same
+  // `!== undefined` discipline the expires_at binding below uses.
+  const createdAt = input.created_at !== undefined ? input.created_at : now;
+  const updatedAt = input.updated_at !== undefined ? input.updated_at : now;
+  const lastRehearsedAt = input.last_rehearsed_at !== undefined ? input.last_rehearsed_at : now;
+  // The counters are coerced: a hand-edited export with a string value
+  // degrades to the column default instead of throwing a node:sqlite
+  // datatype error that would drop the row.
+  const accessCount = Number.isFinite(input.access_count)
+    ? Math.max(0, Math.trunc(input.access_count))
+    : 0;
+  const lastAccessedAt = input.last_accessed_at !== undefined ? input.last_accessed_at : null;
+  // 30 is the column default on both the fresh table and the v9
+  // migration, so an omitted stability_days writes what it always did.
+  const stabilityDays = Number.isFinite(input.stability_days) ? input.stability_days : 30;
 
   // Supersession: when supersede=true and a prior memory with the
   // same (project_key, type, title) is active, mark the prior
@@ -290,16 +314,19 @@ export function saveMemory(db, projectKey, input) {
   // pure "replace me" should pair supersede=true with an existing
   // title they intend to replace.
   //
-  // The supersede UPDATE + the row write below are wrapped in a
-  // SAVEPOINT so a transient INSERT failure (UNIQUE collision, FK
-  // violation, SQLITE_BUSY) cannot leave the prior row marked
-  // superseded pointing at a non-existent id. The previous shape
-  // issued the supersede UPDATE before the INSERT without any
-  // transactional safety, so every auto-extract `supersede: true`
-  // save (session-focus, work-log, the deterministic stack summary)
-  // was exposed to that corruption window. (Audit fix BUG-7.)
+  // The supersede UPDATE, the row write, the FTS reseed, and the
+  // synthesizes inserts all run inside ONE savepoint. `withSavepoint`
+  // RELEASEs the savepoint on its success path, and a RELEASE commits
+  // that savepoint's work — so two savepoints would make the supersede
+  // UPDATE durable before the row write even started. A throw in the
+  // row write would then leave the prior memory `superseded` pointing
+  // at an id that was never inserted: invisible to every read path
+  // (they all filter status='active') and with no replacement, i.e.
+  // silent data loss. One savepoint covering every write makes the
+  // pair atomic. (Audit fix BUG-7; the shape it claimed to fix opened
+  // two savepoints, so it fixed nothing.)
   let supersedesId = input.supersedes || null;
-  withSavepoint(db, 'save_memory_supersede', () => {
+  withSavepoint(db, 'save_memory', () => {
     if (input.supersede) {
       const existing = db
         .prepare(
@@ -337,26 +364,33 @@ export function saveMemory(db, projectKey, input) {
         }
       }
     }
-  });
-
-  const row = db.prepare('SELECT id, created_at FROM memories WHERE id=?').get(id);
-  // Dedicated session-focus column: stamped when the metadata carries
-  // the canonical flag. The hook thread's read path queries this
-  // column instead of `instr(metadata, '"session_focus":true') > 0`,
-  // so the lookup rides idx_memories_session_focus rather than
-  // scanning every working row. (Audit flag — session-focus
-  // indexability.)
-  const isSessionFocus = metadata && /"session_focus":true/.test(metadata) ? 1 : 0;
-  // Wrap the row write + FTS reseed + synthesizes edge insert in a
-  // single SAVEPOINT opened *above* the row write. The previous shape
-  // opened the SAVEPOINT between the row write and the FTS insert,
-  // so a throw inside the FTS path could roll back the FTS / synth
-  // side while leaving a `memories` row visible to listMemories but
-  // invisible to searchMemories (recall depends on the FTS row).
-  // (Audit fix H3.) withSavepoint releases the savepoint on the error
-  // path as well, so a failed save cannot strand an open transaction
-  // on the shared connection (see persist/tx.js).
-  withSavepoint(db, 'save_memory_upsert', () => {
+    const row = db.prepare('SELECT id, created_at FROM memories WHERE id=?').get(id);
+    // Dedicated session-focus column: stamped when the metadata carries
+    // the canonical flag. The hook thread's read path queries this
+    // column instead of `instr(metadata, '"session_focus":true') > 0`,
+    // so the lookup rides idx_memories_session_focus rather than
+    // scanning every working row. (Audit flag — session-focus
+    // indexability.)
+    //
+    // The flag is read back out of the parsed JSON rather than matched
+    // with a `/"session_focus":true/` regex: a producer that serialises
+    // the same object with different spacing (a hand-edited DB, a
+    // third-party import, another tool) would otherwise have its flag
+    // silently reset to 0 by the next routine save, re-enabling the
+    // full scan this column exists to avoid. Behaviour is unchanged for
+    // the canonical `{"session_focus":true}` shape.
+    const metaForFocus = safeParseJson(
+      metadata,
+      {},
+      (v) => v && typeof v === 'object' && !Array.isArray(v),
+    );
+    const isSessionFocus = metaForFocus.session_focus === true ? 1 : 0;
+    // `supersedes` needs the same presence flag the expires_at binding
+    // below uses, with one wrinkle: `input.supersede` can resolve a
+    // prior row's id into `supersedesId` even when the caller never
+    // passed `input.supersedes`. The flag is therefore "the caller
+    // supplied the key, or the supersede pass resolved an id".
+    const hasSupersedes = input.supersedes !== undefined || supersedesId != null;
     if (row) {
       db.prepare(
         `
@@ -369,17 +403,17 @@ export function saveMemory(db, projectKey, input) {
           confidence = COALESCE(?, confidence),
           status = COALESCE(?, status),
           priority = COALESCE(?, priority),
-          supersedes = COALESCE(?, supersedes),
-          expires_at = COALESCE(?, expires_at),
+          supersedes = CASE WHEN ? THEN ? ELSE supersedes END,
+          expires_at = CASE WHEN ? THEN ? ELSE expires_at END,
           visibility = COALESCE(?, visibility),
           shared_with = COALESCE(?, shared_with),
-          team_id = COALESCE(?, team_id),
-          agent_id = COALESCE(?, agent_id),
-          user_id = COALESCE(?, user_id),
-          session_id = COALESCE(?, session_id),
-          task_id = COALESCE(?, task_id),
+          team_id = CASE WHEN ? THEN ? ELSE team_id END,
+          agent_id = CASE WHEN ? THEN ? ELSE agent_id END,
+          user_id = CASE WHEN ? THEN ? ELSE user_id END,
+          session_id = CASE WHEN ? THEN ? ELSE session_id END,
+          task_id = CASE WHEN ? THEN ? ELSE task_id END,
           tier = COALESCE(?, tier),
-          persona_id = COALESCE(?, persona_id),
+          persona_id = CASE WHEN ? THEN ? ELSE persona_id END,
           is_session_focus = ?,
           updated_at = ?,
           last_rehearsed_at = ?
@@ -399,16 +433,35 @@ export function saveMemory(db, projectKey, input) {
         input.confidence != null ? confidence : null,
         input.status ?? null,
         input.priority != null ? priority : null,
+        // `supersedes` / `team_id` / `agent_id` / `user_id` /
+        // `session_id` / `task_id` / `persona_id` are the nullable
+        // columns an explicit `null` has to be able to clear —
+        // `memory_update`'s documented "clear it" signal. COALESCE can
+        // never write NULL, so each pair below binds a presence flag
+        // first and the value second: key omitted keeps the stored
+        // value, key present (a value or an explicit null) writes it.
+        hasSupersedes ? 1 : 0,
         supersedesId ?? null,
+        // `expires_at` follows the same presence-flag contract: key
+        // omitted keeps the stored expiry, key present (a value or an
+        // explicit null) writes it — the schema's "null = never"
+        // contract, which `memory_update` depends on to drop an expiry.
+        input.expires_at !== undefined ? 1 : 0,
         expires,
         input.visibility ?? null,
         input.shared_with != null ? JSON.stringify(input.shared_with) : null,
+        input.team_id !== undefined ? 1 : 0,
         input.team_id ?? null,
+        input.agent_id !== undefined ? 1 : 0,
         input.agent_id ?? null,
+        input.user_id !== undefined ? 1 : 0,
         input.user_id ?? null,
+        input.session_id !== undefined ? 1 : 0,
         input.session_id ?? null,
+        input.task_id !== undefined ? 1 : 0,
         input.task_id ?? null,
         input.tier ?? null,
+        input.persona_id !== undefined ? 1 : 0,
         input.persona_id ?? null,
         isSessionFocus,
         now,
@@ -418,8 +471,8 @@ export function saveMemory(db, projectKey, input) {
     } else {
       db.prepare(
         `
-        INSERT INTO memories (id, project_key, type, title, content, tags, metadata, provenance, confidence, status, priority, supersedes, created_at, updated_at, expires_at, last_rehearsed_at, visibility, shared_with, team_id, agent_id, user_id, session_id, task_id, tier, persona_id, is_session_focus)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        INSERT INTO memories (id, project_key, type, title, content, tags, metadata, provenance, confidence, status, priority, supersedes, created_at, updated_at, expires_at, access_count, last_accessed_at, stability_days, last_rehearsed_at, visibility, shared_with, team_id, agent_id, user_id, session_id, task_id, tier, persona_id, is_session_focus)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `,
       ).run(
         id,
@@ -434,10 +487,13 @@ export function saveMemory(db, projectKey, input) {
         status,
         priority,
         supersedesId,
-        now,
-        now,
+        createdAt,
+        updatedAt,
         expires,
-        now,
+        accessCount,
+        lastAccessedAt,
+        stabilityDays,
+        lastRehearsedAt,
         visibility,
         sharedWith,
         teamId,
@@ -451,19 +507,29 @@ export function saveMemory(db, projectKey, input) {
       );
     }
 
-    // FTS upsert — wrapped in SAVEPOINT above so a failure rolls the
-    // memories row back too, keeping search Memoriestable consistent
-    // with the FTS index.
+    // FTS reseed, inside the same savepoint as the row write so the
+    // two can never disagree. Seed from the *persisted* row, not from
+    // `input`: the UPDATE branch above uses COALESCE(?, col), so a
+    // partial re-save (any field omitted) leaves the omitted columns
+    // holding their stored values, and seeding the index from `input`
+    // would write NULL/'' for them — search would then miss a row that
+    // exists. Reading the values back also removes two input-shape
+    // crashes: a string `tags` used to throw a TypeError on `.join`,
+    // and an omitted `type` used to throw ERR_INVALID_ARG_TYPE out of
+    // node:sqlite. The stored tags JSON is parsed defensively, so a
+    // corrupt value degrades to [] instead of throwing.
+    const stored = db.prepare('SELECT type, title, content, tags FROM memories WHERE id=?').get(id);
+    const storedTags = safeParseJson(stored?.tags, [], (v) => Array.isArray(v)).join(' ');
     db.prepare('DELETE FROM memories_fts WHERE id=?').run(id);
     db.prepare(
       'INSERT INTO memories_fts (id, project_key, type, title, content, tags) VALUES (?, ?, ?, ?, ?, ?)',
     ).run(
       id,
       projectKey,
-      input.type,
-      input.title || '',
-      input.content || '',
-      (input.tags || []).join(' '),
+      stored?.type ?? '',
+      stored?.title ?? '',
+      stored?.content ?? '',
+      storedTags,
     );
 
     // Conclusion edge: record this memory's synthesizes[] children in
@@ -1016,11 +1082,29 @@ export function projectStatus(db, projectKey) {
   };
 }
 // Row-count snapshot used by the dry-run path of memory_reset_project
-// (and the matching CLI command). Both call sites need the same six
-// counts, so the SELECT statements live here and the call sites
-// decorate the result with `reclone` + `total_rows` as needed.
+// (and the matching CLI command). Every row set the destructive path
+// deletes is counted here, so the dry run cannot under-report what the
+// reset does: the six original tables, the two FTS5 mirrors that shadow
+// them, and the memories_acl / persona_promotions / skill_invocations
+// rows resetProject also clears. The call sites decorate the result
+// with `reclone` + `total_rows` as needed.
 export function resetProjectDryRunCounts(db, projectKey) {
   const get = (sql) => db.prepare(sql).get(projectKey).n;
+  // memories_acl and persona_promotions have no project_key column (see
+  // the schema in connection.js) — a row is keyed on memory_id alone —
+  // so "belongs to this project" is the same subquery over memories
+  // that resetProject uses, and it must be evaluated while the memories
+  // rows are still present. memories_fts is keyed on id only for the
+  // same reason; conversation_events_fts and skill_invocations carry
+  // project_key directly.
+  const countById = (table) =>
+    get(
+      `SELECT COUNT(*) AS n FROM ${table} WHERE id IN (SELECT id FROM memories WHERE project_key=?)`,
+    );
+  const countByMemoryId = (table) =>
+    get(
+      `SELECT COUNT(*) AS n FROM ${table} WHERE memory_id IN (SELECT id FROM memories WHERE project_key=?)`,
+    );
   return {
     memories: get('SELECT COUNT(*) AS n FROM memories WHERE project_key=?'),
     working_memory: get('SELECT COUNT(*) AS n FROM working_memory WHERE project_key=?'),
@@ -1028,5 +1112,12 @@ export function resetProjectDryRunCounts(db, projectKey) {
     conversation_events: get('SELECT COUNT(*) AS n FROM conversation_events WHERE project_key=?'),
     memory_edges: get('SELECT COUNT(*) AS n FROM memory_edges WHERE project_key=?'),
     memory_synthesizes: get('SELECT COUNT(*) AS n FROM memory_synthesizes WHERE project_key=?'),
+    memories_acl: countByMemoryId('memories_acl'),
+    persona_promotions: countByMemoryId('persona_promotions'),
+    skill_invocations: get('SELECT COUNT(*) AS n FROM skill_invocations WHERE project_key=?'),
+    memories_fts: countById('memories_fts'),
+    conversation_events_fts: get(
+      'SELECT COUNT(*) AS n FROM conversation_events_fts WHERE project_key=?',
+    ),
   };
 }

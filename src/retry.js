@@ -113,42 +113,6 @@ export async function withRetry(
   return lastHadValue ? lastValue : undefined;
 }
 
-// Wrapper for auto-extract retry with semantic error classification.
-// Errors are classified as retryable (e.g. network timeout) or permanent
-// (e.g. config missing).
-//
-// `shouldRetry` receives the `{ error } | { value }` state wrapper that
-// `withRetry` builds — NOT the raw error. Every wrapper in this file used
-// to read `.code` / `.message` straight off the wrapper, so each
-// classification silently fell through to its default branch: this one
-// always retried (including on auth errors), and `withLlmRetry` below
-// never retried at all.
-export async function withAutoExtractRetry(
-  fn,
-  { projectKey, maxAttempts = 3, baseDelayMs = 1000 } = {},
-) {
-  return withRetry(fn, {
-    maxAttempts,
-    baseDelayMs,
-    diagnosticContext: { projectKey, operationType: 'auto_extract' },
-    shouldRetry: (state) => {
-      const err = state && state.error;
-      // An exception-free call that produced no reply is the common LLM
-      // failure shape and is worth another attempt.
-      if (!err) return true;
-      const code = err.code || err.name || '';
-      const message = err.message || '';
-      // Don't retry auth errors, missing config, or semantic errors.
-      const nonRetryable = ['EAUTH', 'ENOENT', 'ENOCONFIG', 'EPERM', 'EACCES'];
-      for (const c of nonRetryable) {
-        if (code === c || message.includes(c)) return false;
-      }
-      // Everything else is assumed transient.
-      return true;
-    },
-  });
-}
-
 // Wrapper for LLM call retry with specific handling for API errors.
 //
 // Budget arithmetic — the Stop hook is the only production caller, and the
@@ -204,33 +168,5 @@ export async function withLlmRetry(
         message.includes('temporarily unavailable')
       );
     },
-  });
-}
-
-// Two busy signatures reach us in practice: the driver's
-// "database is locked" string and the codes-prefixed / structured
-// (err.code) variants. Deliberately permissive — the caller always has
-// a fallback — so slight string drift (e.g. "table is locked") still
-// trips the detector.
-export function isSqliteBusyError(err) {
-  if (!err) return false;
-  if (err.code === 'SQLITE_BUSY' || err.code === 'SQLITE_LOCKED') return true;
-  const msg = String(err.message || err);
-  if (!msg) return false;
-  return /SQLITE_BUSY|SQLITE_LOCKED|database is locked|table is locked/i.test(msg);
-}
-
-// Wrapper for database operations with retry on SQLITE_BUSY.
-//
-// Only a thrown busy error counts. A resolved-but-null value is not a
-// lock signal, so this deliberately does not use `withRetry`'s default
-// classifier, which treats any missing value as retryable.
-export async function withDbRetry(fn, { maxAttempts = 5, baseDelayMs = 100 } = {}) {
-  return withRetry(fn, {
-    maxAttempts,
-    baseDelayMs,
-    maxDelayMs: 5000, // DB locks usually resolve quickly
-    jitterFraction: 0.05,
-    shouldRetry: (state) => isSqliteBusyError(state && state.error),
   });
 }

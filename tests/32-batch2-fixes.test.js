@@ -128,13 +128,16 @@ test('B2-11: assertNoSecret blocks secret-shaped metadata values', () => {
   }
 });
 
-test('B4-7: consolidate.js imports decodeVector from embedding.js', async () => {
+test('B4-7: consolidate.js decodes embeddings via the canonical embedding.js helper', async () => {
   const { readFileSync } = await import('node:fs');
   const src = readFileSync(new URL('../src/consolidate.js', import.meta.url), 'utf8');
-  assert.match(
-    src,
-    /import\s*\{\s*decodeVector\s+as\s+decodeEmbedding\s*\}\s*from\s*['"]\.\/embedding\.js['"]/,
-  );
+  // It imports a decoder from the canonical module rather than carrying
+  // a local copy. Asserting the intent (not one literal import string)
+  // leaves the module free to pick whichever of the two decoders each
+  // call site needs — strict `decodeVector` for validation, nullable
+  // `tryDecodeVector` for the best-effort clusterer.
+  assert.match(src, /import\s*\{\s*\w+\s*\}\s*from\s*['"]\.\/embedding\.js['"]/);
+  assert.doesNotMatch(src, /function\s+(?:decodeEmbedding|decodeVector)\s*\(/);
   // The canonical decoder still rejects corrupt input.
   const bad = new Uint8Array(4); // 4 bytes, way below the EMBEDDING_DIM*4 floor
   assert.throws(() => importedDecode(bad), /CORRUPT|too small/i);

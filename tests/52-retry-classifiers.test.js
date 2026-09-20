@@ -1,21 +1,16 @@
 // Regression coverage for the retry classifiers.
 //
 // `withRetry` hands `shouldRetry` a `{ error } | { value }` state wrapper,
-// not the raw error. All three wrappers in `src/retry.js` used to read
-// `.code` / `.message` straight off that wrapper, so every classification
-// silently fell through to its default branch:
-//
-//   * `withLlmRetry` NEVER retried anything — including the empty-reply
-//     case the retry exists for — so a single provider flap lost the
-//     whole auto-extract pass.
-//   * `withAutoExtractRetry` ALWAYS retried, including on auth and
-//     missing-config errors it explicitly meant to treat as permanent.
-//   * `withDbRetry` never retried a busy lock.
+// not the raw error. `withLlmRetry` used to read `.code` / `.message`
+// straight off that wrapper, so its classification silently fell through
+// to its default branch and it NEVER retried anything — including the
+// empty-reply case the retry exists for — so a single provider flap lost
+// the whole auto-extract pass.
 //
 // Every assertion here fails against the old code.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { withRetry, withLlmRetry, withDbRetry, withAutoExtractRetry } from '../src/retry.js';
+import { withRetry, withLlmRetry } from '../src/retry.js';
 
 // Tiny backoffs keep the suite fast; the classification is independent of
 // the delay.
@@ -99,61 +94,6 @@ test('withLlmRetry stays inside the Stop hook budget', async () => {
     (fn) => withLlmRetry(fn, FAST),
   );
   assert.ok(attempts <= 2, `attempt budget grew past the hook budget: ${attempts}`);
-});
-
-test('withDbRetry retries a busy lock until the budget is spent', async () => {
-  const { attempts, error } = await countAttempts(
-    () => {
-      throw Object.assign(new Error('database is locked'), { code: 'SQLITE_BUSY' });
-    },
-    (fn) => withDbRetry(fn, FAST),
-  );
-  assert.ok(attempts > 1, `a busy lock must be retried, got ${attempts}`);
-  assert.equal(error.code, 'SQLITE_BUSY');
-});
-
-test('withDbRetry does not retry a missing value or a non-busy error', async () => {
-  const nullResult = await countAttempts(
-    () => null,
-    (fn) => withDbRetry(fn, FAST),
-  );
-  assert.equal(nullResult.attempts, 1, 'a null value is not a lock signal');
-
-  const other = await countAttempts(
-    () => {
-      throw new Error('near "SELEC": syntax error');
-    },
-    (fn) => withDbRetry(fn, FAST),
-  );
-  assert.equal(other.attempts, 1, 'a syntax error is not retryable');
-});
-
-test('withAutoExtractRetry does not retry a permanent configuration error', async () => {
-  for (const code of ['ENOCONFIG', 'EAUTH', 'ENOENT', 'EACCES']) {
-    const { attempts } = await countAttempts(
-      () => {
-        throw Object.assign(new Error(`permanent: ${code}`), { code });
-      },
-      (fn) => withAutoExtractRetry(fn, FAST),
-    );
-    assert.equal(attempts, 1, `${code} must not be retried`);
-  }
-});
-
-test('withAutoExtractRetry retries a transient failure and an empty reply', async () => {
-  const transient = await countAttempts(
-    () => {
-      throw new Error('ECONNRESET');
-    },
-    (fn) => withAutoExtractRetry(fn, FAST),
-  );
-  assert.ok(transient.attempts > 1);
-
-  const empty = await countAttempts(
-    () => null,
-    (fn) => withAutoExtractRetry(fn, FAST),
-  );
-  assert.ok(empty.attempts > 1, 'an empty reply is worth another attempt');
 });
 
 test('withRetry default classifier retries on error and on a missing value', async () => {

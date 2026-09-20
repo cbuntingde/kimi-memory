@@ -32,6 +32,31 @@ import {
   setContext,
 } from './handlers/_helpers.js';
 
+// Lock contention is the case the hard-timeout guard below exists for,
+// and it is exactly the case the guard cannot cover: a writer waiting
+// on `PRAGMA busy_timeout` blocks the JS thread inside a native SQLite
+// call, so no timer can run and the runtime SIGKILLs the process at the
+// manifest budget. The hook therefore asks for a short busy timeout
+// (well inside its own dispatcher ceiling) so a lock attempt fails fast
+// and the handler's fail-open path runs instead of the thread blocking
+// past the ceiling. The MCP/CLI/proxy processes leave the env var unset
+// and keep the connection layer's 30000 ms default.
+//
+// NOTE: the read below is picked up by `src/persist/connection.js`,
+// which resolves `KIMI_MEMORY_BUSY_TIMEOUT_MS` inside `openDb()` on
+// every open. It must stay a per-open read: ESM evaluates this module's
+// imports before the statements below, so a module-scope read in the
+// connection layer would run before this assignment.
+export const HOOK_BUSY_TIMEOUT_MS = 1500;
+{
+  const requested = Number(process.env.KIMI_MEMORY_BUSY_TIMEOUT_MS);
+  const effective =
+    Number.isFinite(requested) && requested > 0
+      ? Math.min(requested, HOOK_BUSY_TIMEOUT_MS)
+      : HOOK_BUSY_TIMEOUT_MS;
+  process.env.KIMI_MEMORY_BUSY_TIMEOUT_MS = String(effective);
+}
+
 // HOME is set once per process. EVENT is set per dispatch from the
 // hook-shim entry points; the dispatcher below uses the env var
 // directly because module-load ordering would otherwise init EVENT
@@ -131,12 +156,42 @@ async function main() {
   }
 }
 
+// Bounded stdout flush. `process.exit()` does not wait for an async
+// pipe write to drain, so a hook that writes (UserPromptSubmit's JSON
+// envelope, `emitLines` in render.js) and then exits immediately can
+// lose the whole payload silently — the agent simply sees no memory
+// context. Wait for the pending writes, but never longer than the
+// budget: a stuck pipe must not hang the hook past its ceiling.
+export function flushStream(stream, { budgetMs = 250 } = {}) {
+  return new Promise((resolve) => {
+    let done = false;
+    const finish = () => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      resolve();
+    };
+    const timer = setTimeout(finish, budgetMs);
+    timer.unref?.();
+    try {
+      if (stream.writableLength === 0) {
+        finish();
+        return;
+      }
+      stream.once('error', finish);
+      stream.write('', finish);
+    } catch {
+      finish();
+    }
+  });
+}
+
 // Hard-timeout guard: if anything blocks, release cached SQLite
 // handles (so any pending WAL writes flush) and exit cleanly. The
 // ceiling is per-event (HOOK_TIMEOUTS_MS above) and is strictly less
 // than the manifest budget for that event so the cleanup runs before
 // the runtime force-kills us.
-const t = setTimeout(() => {
+const t = setTimeout(async () => {
   try {
     process.stderr.write(`[kimi-memory:hook:${EVENT}] timeout, exiting\n`);
   } catch {
@@ -147,6 +202,7 @@ const t = setTimeout(() => {
   } catch {
     /* ignore */
   }
+  await flushStream(process.stdout);
   process.exit(0);
 }, hookTimeoutMs(EVENT));
 t.unref?.();
@@ -156,9 +212,11 @@ t.unref?.();
 // import the module for its helpers; without this guard the module
 // would read stdin and exit before the test runner gets a turn.
 if (process.env.KM_HOOK_EVENT) {
-  main()
-    .then(() => process.exit(0))
-    .catch(() => process.exit(0));
+  const exit = async () => {
+    await flushStream(process.stdout);
+    process.exit(0);
+  };
+  main().then(exit, exit);
 }
 
 // Re-exported for backward compatibility with tests and any consumer

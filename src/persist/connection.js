@@ -9,12 +9,58 @@ import path from 'node:path';
 import { logPersistError } from '../diagnostics.js';
 import { edgeKindSqlList } from '../edge-kinds.js';
 
+// Current schema generation. `PRAGMA user_version` is stamped with this
+// value once every entry in MIGRATIONS has run, and an openDb() that
+// sees a HIGHER value refuses to touch the file (an older build must
+// never mutate a newer schema). The value tracks the highest migration
+// label in the array; the numbering has a gap at v14 (no such
+// migration was ever shipped) and the array holds 18 functions for the
+// 16 labelled versions, because v10 was split across five functions.
+// Bumping this without appending a migration is a no-op; appending a
+// migration without bumping it means existing DBs never run it.
 const SCHEMA_VERSION = 16;
 
+// Default SQLite busy timeout in milliseconds. The hook runner and the
+// MCP server are separate processes writing the same DB; a second
+// writer must wait for the first to commit or SQLite returns
+// SQLITE_BUSY immediately. 30s suits the long-lived MCP / CLI / proxy
+// processes, but a hook has only a 4-5s budget per event, so the hook
+// shim can set KIMI_MEMORY_BUSY_TIMEOUT_MS to a shorter value rather
+// than blocking past its own deadline.
+const DEFAULT_BUSY_TIMEOUT_MS = 30000;
+
+// Resolve the busy timeout from KIMI_MEMORY_BUSY_TIMEOUT_MS. Anything
+// that is not a positive base-10 integer (unset, empty, non-numeric,
+// zero, negative) falls back to the default rather than aborting the
+// open — a bad override must not make the store unopenable.
+function resolveBusyTimeoutMs() {
+  const raw = process.env.KIMI_MEMORY_BUSY_TIMEOUT_MS;
+  if (typeof raw !== 'string') return DEFAULT_BUSY_TIMEOUT_MS;
+  const trimmed = raw.trim();
+  if (!/^[0-9]+$/.test(trimmed)) return DEFAULT_BUSY_TIMEOUT_MS;
+  const parsed = Number(trimmed);
+  if (!Number.isSafeInteger(parsed) || parsed <= 0) return DEFAULT_BUSY_TIMEOUT_MS;
+  return parsed;
+}
+
+// Read the authoritative schema marker. A DB that has never been opened
+// by a gating build reports 0 (SQLite's default), which routes it
+// through the migration loop exactly as before.
+function readUserVersion(db) {
+  const row = db.prepare('PRAGMA user_version').get();
+  const value = Number(row && row.user_version);
+  return Number.isInteger(value) && value >= 0 ? value : 0;
+}
+
 // Schema migrations. Each entry is idempotent: it inspects the live
-// schema, no-ops when its target shape is already in place, and
-// mutates the schema otherwise. All entries run unconditionally on
-// every openDb() call; cost is one PRAGMA table_info per migration.
+// schema, no-ops when its target shape is already in place, and mutates
+// the schema otherwise. openDb() runs the whole loop whenever the file
+// is at or behind `PRAGMA user_version`'s SCHEMA_VERSION target (a fresh
+// DB reports 0) and then stamps the marker; a file marked NEWER is
+// refused before the loop is reached. The loop is not skipped at the
+// current version, because v12's is_session_focus pass is deliberately a
+// per-open reconcile — it re-derives the column from metadata for rows
+// an older build wrote without it.
 //
 // To add a future schema change: append a new idempotent function
 // here, and bump SCHEMA_VERSION above so observers can tell which
@@ -753,8 +799,10 @@ const MIGRATIONS = [
   // probe-then-rebuild shape as migrateAddSkillType (v10): read the
   // CREATE TABLE SQL from sqlite_master, short-circuit if the new
   // type is already in the CHECK. The rebuild drops + recreates
-  // memories + memories_fts and re-applies every index in SCHEMA_SQL,
-  // mirroring the v10 path exactly.
+  // memories + memories_fts and re-applies every index on `memories` —
+  // the SCHEMA_SQL ones plus the two added by migrations (v3's
+  // idx_memories_project_embedding_dim and v12's
+  // idx_memories_session_focus), mirroring the v10 path.
   function migrateAddContextSnapshotType(db) {
     const createSql =
       db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='memories'").get()
@@ -818,6 +866,13 @@ const MIGRATIONS = [
       CREATE INDEX idx_memories_supersedes     ON memories(supersedes);
       CREATE INDEX idx_memories_embedded_at    ON memories(embedded_at);
       CREATE INDEX idx_memories_project_embedding_dim ON memories(project_key, embedding_dim);
+      -- v12's idx_memories_session_focus is one of the indexes DROP TABLE
+      -- memories destroys, so it must be recreated here. The v12 migration
+      -- already ran earlier in this same open and its index probe
+      -- short-circuits, which would otherwise leave the index missing
+      -- until the NEXT openDb — a window in which the session-focus read
+      -- path full-scans. Statement matches migrateAddSessionFocusColumn.
+      CREATE INDEX idx_memories_session_focus ON memories(project_key, is_session_focus, updated_at);
       DELETE FROM memories_fts;
       INSERT INTO memories_fts (id, project_key, type, title, content, tags)
         SELECT id, project_key, type, title, content, tags FROM memories;
@@ -1007,6 +1062,22 @@ export function openDb(dbPath) {
   let db;
   try {
     db = new DatabaseSync(dbPath, { readOnly: false, create: true });
+    // Schema-version gate. `PRAGMA user_version` is the authoritative
+    // marker of which migration generation built this file; the
+    // schema_meta row is kept alongside it for continuity and for
+    // observers that already read it. Read the marker before any other
+    // PRAGMA so a build older than the file it is opening refuses
+    // without mutating it — `journal_mode = WAL` is itself a persistent
+    // change to the file header, so the check has to come first.
+    const userVersion = readUserVersion(db);
+    if (userVersion > SCHEMA_VERSION) {
+      throw new Error(
+        `kimi-memory: refusing to open ${dbPath} — it was written by a newer ` +
+          `build (schema version ${userVersion}; this build supports ${SCHEMA_VERSION}). ` +
+          `Downgrading would corrupt the schema. Update the kimi-memory plugin ` +
+          `and retry.`,
+      );
+    }
     db.exec('PRAGMA journal_mode = WAL;');
     db.exec('PRAGMA foreign_keys = ON;');
     db.exec('PRAGMA synchronous = NORMAL;');
@@ -1014,13 +1085,25 @@ export function openDb(dbPath) {
     // both write to the same DB. WAL allows concurrent readers + a
     // single writer, but a second writer must wait for the first to
     // commit; without a busy_timeout SQLite returns SQLITE_BUSY
-    // immediately. Increase timeout from 5s to 30s for better reliability,
-    // and log long waits for observability.
-    db.exec('PRAGMA busy_timeout = 30000;');
+    // immediately. Default 30s for the long-lived processes; the hook
+    // shim overrides it via KIMI_MEMORY_BUSY_TIMEOUT_MS to fit its
+    // shorter budget.
+    db.exec(`PRAGMA busy_timeout = ${resolveBusyTimeoutMs()};`);
     db.exec(SCHEMA_SQL);
-    // Run every idempotent migration. Cost is one PRAGMA per migration;
-    // on a healthy DB each one short-circuits.
-    for (const migrate of MIGRATIONS) migrate(db);
+    // Conservative gating variant. Every entry in MIGRATIONS is
+    // idempotent, so re-running the loop on a file that is already at
+    // SCHEMA_VERSION is harmless — and one of them (v12's
+    // is_session_focus reconcile) is deliberately a per-open pass that
+    // re-derives the column from metadata for rows an older build wrote
+    // without it, so the loop cannot be skipped without dropping that
+    // behaviour. Run it for any file at or behind the current version
+    // (the newer case already threw above), then stamp the authoritative
+    // marker. `PRAGMA user_version` only accepts a literal and
+    // SCHEMA_VERSION is a module constant, so interpolating it is safe.
+    if (userVersion <= SCHEMA_VERSION) {
+      for (const migrate of MIGRATIONS) migrate(db);
+      db.exec(`PRAGMA user_version = ${SCHEMA_VERSION};`);
+    }
     db.prepare(
       `
       INSERT INTO schema_meta (key, value) VALUES ('schema_version', ?)

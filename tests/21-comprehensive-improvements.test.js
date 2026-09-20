@@ -9,8 +9,8 @@ import { fileURLToPath } from 'node:url';
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
 // Import modules under test
-import { calculateBackoffMs, isSqliteBusyError } from '../src/retry.js';
-import { normalizeFts5Query, buildTitleBoostedQuery, buildOrderByClause } from '../src/search.js';
+import { calculateBackoffMs } from '../src/retry.js';
+import { normalizeFts5Query, buildTitleBoostedQuery } from '../src/search.js';
 import { parseToml } from '../src/toml.js';
 
 test('retry: exponential backoff with jitter', () => {
@@ -27,16 +27,6 @@ test('retry: exponential backoff with jitter', () => {
 test('retry: respects max delay cap', () => {
   const delay = calculateBackoffMs(10, 100, 500, 0);
   assert(delay <= 500, 'delay should not exceed max');
-});
-
-test('retry: detect SQLITE_BUSY errors', () => {
-  const error1 = new Error('database is locked');
-  const error2 = new Error('SQLITE_BUSY');
-  const error3 = new Error('other error');
-
-  assert(isSqliteBusyError(error1), 'should detect "database is locked"');
-  assert(isSqliteBusyError(error2), 'should detect SQLITE_BUSY');
-  assert(!isSqliteBusyError(error3), 'should not detect other errors');
 });
 
 test('search: normalize FTS5 query', () => {
@@ -57,16 +47,6 @@ test('search: build title-boosted query', () => {
   const query = buildTitleBoostedQuery('deployment');
   assert(query.includes('title:'), 'should boost title matches');
   assert(query.includes('OR'), 'should fall back to general search');
-});
-
-test('search: build ORDER BY clauses', () => {
-  const recent = buildOrderByClause('recent');
-  const confidence = buildOrderByClause('confidence');
-  const relevance = buildOrderByClause('relevance');
-
-  assert(recent.includes('updated_at DESC'), 'recent should sort by date');
-  assert(confidence.includes('confidence DESC'), 'confidence should sort by confidence');
-  assert(relevance.includes('rank'), 'relevance should sort by rank');
 });
 
 test('config: parse TOML-like values', () => {

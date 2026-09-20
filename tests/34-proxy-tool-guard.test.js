@@ -7,16 +7,40 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { nonLoopbackToolGuard } from '../src/proxy/server.js';
 
-test('nonLoopbackToolGuard: loopback hosts bypass the guard entirely', () => {
-  assert.equal(nonLoopbackToolGuard('memory_reset_project', { host: '127.0.0.1' }), null);
-  assert.equal(nonLoopbackToolGuard('memory_delete', { host: '::1' }), null);
-  assert.equal(nonLoopbackToolGuard('memory_prune', { host: 'localhost' }), null);
-  // An omitted host is unspecified, not loopback: the guard falls back to
-  // KIMI_MEMORY_PROXY_HOST and then to the 127.0.0.1 default, so the guard
-  // stays off. An empty string is a *wildcard bind* (Node binds `::`), so it
-  // must never be classified as loopback.
-  assert.equal(nonLoopbackToolGuard('memory_reset_project', {}), null);
-  assert.ok(nonLoopbackToolGuard('memory_reset_project', { host: '' }));
+test('nonLoopbackToolGuard: loopback binds bypass the destructive-set guard, never the deny-list', () => {
+  // AGENTS.md, `## Environment variables` → HTTP proxy:
+  //   `KIMI_MEMORY_PROXY_DENY_TOOLS` | unset | "Comma-separated
+  //   deny-list. Wins over the allow-list."
+  // The contract carries no loopback carve-out, and the proxy is
+  // documented to default to 127.0.0.1 — so the deny-list has to
+  // enforce there too. This test used to assert `null` for a loopback
+  // host while DENY_TOOLS was set, which pinned the defect: the control
+  // was silently inert on the documented default bind.
+  const prevDeny = process.env.KIMI_MEMORY_PROXY_DENY_TOOLS;
+  try {
+    delete process.env.KIMI_MEMORY_PROXY_DENY_TOOLS;
+    assert.equal(nonLoopbackToolGuard('memory_reset_project', { host: '127.0.0.1' }), null);
+    assert.equal(nonLoopbackToolGuard('memory_delete', { host: '::1' }), null);
+    assert.equal(nonLoopbackToolGuard('memory_prune', { host: 'localhost' }), null);
+    // An omitted host is unspecified, not loopback: the guard falls back to
+    // KIMI_MEMORY_PROXY_HOST and then to the 127.0.0.1 default, so the guard
+    // stays off. An empty string is a *wildcard bind* (Node binds `::`), so it
+    // must never be classified as loopback.
+    assert.equal(nonLoopbackToolGuard('memory_reset_project', {}), null);
+    assert.ok(nonLoopbackToolGuard('memory_reset_project', { host: '' }));
+
+    // With the deny-list set, the same loopback bind denies — and an
+    // unlisted tool is still untouched.
+    process.env.KIMI_MEMORY_PROXY_DENY_TOOLS = 'memory_delete';
+    const err = nonLoopbackToolGuard('memory_delete', { host: '127.0.0.1' });
+    assert.ok(err, 'the operator deny-list must apply on the default loopback bind');
+    assert.ok(err.includes('KIMI_MEMORY_PROXY_DENY_TOOLS'));
+    assert.equal(nonLoopbackToolGuard('memory_recall', { host: '127.0.0.1' }), null);
+    assert.equal(nonLoopbackToolGuard('memory_reset_project', { host: '127.0.0.1' }), null);
+  } finally {
+    if (prevDeny === undefined) delete process.env.KIMI_MEMORY_PROXY_DENY_TOOLS;
+    else process.env.KIMI_MEMORY_PROXY_DENY_TOOLS = prevDeny;
+  }
 });
 
 test('nonLoopbackToolGuard: non-loopback hosts deny destructive tools by default', () => {

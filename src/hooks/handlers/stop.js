@@ -1,6 +1,8 @@
 // Stop handler (and SessionEnd / PreCompact / Interrupt /
 // StopFailure). On every conversational close: idempotent ingest,
-// auto-extract, work-log, session-focus, Dream enqueue.
+// work-log, session-focus, Dream enqueue — plus auto-extract, which
+// only the events with the budget for it (Stop, SessionEnd) run. See
+// `skipExtract` below.
 
 import path from 'node:path';
 import { deriveProjectKey } from '../../project-key.js';
@@ -20,7 +22,16 @@ import { nowIso } from '../../util.js';
 import { maybeWriteWorkLog, recordWorkLogResult } from '../../work-log.js';
 import { captureSessionFocus, recordSessionFocusResult } from '../../session-focus.js';
 
-export async function handleStop(payload) {
+// `skipExtract` is set by the short-budget close events (PreCompact,
+// Interrupt, StopFailure). Those hooks run on a 4 s dispatcher ceiling
+// (5 s manifest budget — src/hooks/run.js + kimi.plugin.json) while the
+// extract pass is bounded by 2 x LLM_TIMEOUT_MS (4 s) + a 1 s backoff
+// ≈ 9 s (src/extract.js). Running it meant the timer killed the process
+// mid-fetch: the provider kept billing the abandoned request, and every
+// local step after the extract — the ingest-state write, work-log,
+// session-focus and Dream enqueue — never ran. With `skipExtract` the
+// events return `extract: null` and still do all of that local work.
+export async function handleStop(payload, { skipExtract = false } = {}) {
   const cwd = payloadProjectRoot(payload);
   if (!cwd) {
     emitLinesMessage(`[kimi-memory] event=${EVENT} skipped: no project cwd in payload`);
@@ -30,7 +41,7 @@ export async function handleStop(payload) {
   const ingest = await safeHandleStop(payload, cwd);
 
   let extract = null;
-  if (sessionId && ingest && ingest.ok !== false && !ingest.skipped) {
+  if (!skipExtract && sessionId && ingest && ingest.ok !== false && !ingest.skipped) {
     try {
       extract = await handleAutoExtract(cwd, sessionId);
     } catch (e) {
@@ -118,26 +129,31 @@ export async function handleStop(payload) {
   return { ok: true, ingest, extract, workLog, focus, dream };
 }
 
-// SessionEnd: idempotent ingest + same pass as Stop. Silent on stdout.
+// SessionEnd: idempotent ingest + the full pass, extract included —
+// its 15 s manifest budget accommodates the ~9 s worst case. Silent on
+// stdout.
 export async function handleSessionEnd(payload) {
   return handleStop(payload);
 }
 
+// The three short-budget events below skip the extract pass: their 5 s
+// manifest budget cannot cover it, and losing the local work that
+// follows the extract is worse than losing the extract itself.
 export async function handlePreCompact(payload) {
-  const result = await handleStop(payload);
+  const result = await handleStop(payload, { skipExtract: true });
   return { ok: true, snapshot: result };
 }
 
 export async function handleInterrupt(payload) {
   const cwd = payloadProjectRoot(payload);
-  const snapshot = await handleStop(payload);
+  const snapshot = await handleStop(payload, { skipExtract: true });
   await logDiag('info', 'interrupt observed', { cwd, snapshot });
   return { ok: true, snapshot };
 }
 
 export async function handleStopFailure(payload) {
   const cwd = payloadProjectRoot(payload);
-  const snapshot = await handleStop(payload);
+  const snapshot = await handleStop(payload, { skipExtract: true });
   await logDiag('warn', 'stop-failure observed', { cwd, snapshot });
   return { ok: true, snapshot };
 }

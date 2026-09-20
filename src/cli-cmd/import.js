@@ -6,10 +6,12 @@
 // Routes every imported row through saveMemory so the v10 ACL columns
 // (visibility, shared_with, team_id, agent_id, user_id, session_id,
 // task_id, tier, persona_id, is_session_focus, stability_days,
-// last_rehearsed_at), the FTS mirror, and the synthesizes[] edges all
-// land in lockstep with the live DB. _embed:false disables the per-row
-// embedding microtask; the operator can run `npm run backfill-embeddings`
-// after import if they want the recall vector populated.
+// last_rehearsed_at), the usage counters (created_at, updated_at,
+// access_count, last_accessed_at), the FTS mirror, and the
+// synthesizes[] edges all land in lockstep with the live DB.
+// _embed:false disables the per-row embedding microtask; the operator
+// can run `npm run backfill-embeddings` after import if they want the
+// recall vector populated.
 import { statSync, readFileSync } from 'node:fs';
 import { openDb, closeDb, saveMemory, assertNoSecret, setWorkingMemory } from '../persist.js';
 import {

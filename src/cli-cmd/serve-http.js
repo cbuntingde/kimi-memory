@@ -4,8 +4,11 @@
 //              [--auth-token-env KIMI_MEMORY_PROXY_TOKEN] [--no-auth]
 //
 // The proxy translates POST /tools/<name> into the same TOOL_DEFS
-// handlers the stdio MCP server uses. Auth defaults to env-supplied
-// bearer; --no-auth is dev-only and refuses non-loopback binds.
+// handlers the stdio MCP server uses. Auth defaults to the
+// env-supplied bearer; with no token configured the proxy still starts
+// but auth fails closed — every route except the /healthz and /readyz
+// probes answers 401. --no-auth is dev-only and is refused on a
+// non-loopback bind.
 import { closeDb } from '../persist.js';
 import { startProxy } from '../proxy/server.js';
 import { homeDir } from '../cli/lib.js';

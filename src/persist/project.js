@@ -5,6 +5,7 @@
 // from the memories table that the rest of the package operates on.
 import { promises as fs } from 'node:fs';
 import { statSync } from 'node:fs';
+import { randomBytes } from 'node:crypto';
 import path from 'node:path';
 import { nowIso, safeJsonParse } from '../util.js';
 import { ensureProjectDir, ingestStatePath } from '../project-key.js';
@@ -132,17 +133,20 @@ export function searchConversationEvents(
   // not yet mirrored is still findable via the LIKE fallback below.
   // (Audit fix H4.)
   let rows = [];
-  let ftsFailed = false;
   try {
     const ftsQuery = tokens.map((t) => `"${t.replace(/"/g, '""')}"`).join(' OR ');
-    const ftsWhere = ['project_key = ?'];
+    // Every predicate must be qualified with the `f.` alias: the joined
+    // conversation_events source table exposes session_id / project_key /
+    // role as well, and an unqualified name is an ambiguous-column error
+    // that the catch below would swallow into the slow LIKE path.
+    const ftsWhere = ['f.project_key = ?'];
     const ftsParams = [projectKey];
     if (sessionId) {
-      ftsWhere.push('session_id = ?');
+      ftsWhere.push('f.session_id = ?');
       ftsParams.push(sessionId);
     }
     if (role) {
-      ftsWhere.push('role = ?');
+      ftsWhere.push('f.role = ?');
       ftsParams.push(role);
     }
     ftsParams.push(Math.max(1, Math.min(200, limit)));
@@ -158,9 +162,11 @@ export function searchConversationEvents(
          ORDER BY datetime(m.created_at) DESC LIMIT ?`,
       )
       .all(ftsQuery, ...ftsParams);
-    // Lazy mirror backfill: if the FTS5 query returned nothing but
-    // the source table has rows, the mirror is empty (e.g. the DB
-    // pre-dates the v12-mirror migration). Backfill once and retry.
+    // Lazy mirror backfill: the FTS5 query returned nothing, so check
+    // whether this project simply has no mirrored rows yet. That is the
+    // normal first-search state — recordConversationEvent deliberately
+    // does not write the mirror (WAL contention under ingest loads) — so
+    // backfill once from the source table and retry the same query.
     if (rows.length === 0) {
       const sourceCount = db
         .prepare('SELECT COUNT(*) AS n FROM conversation_events WHERE project_key = ?')
@@ -187,7 +193,6 @@ export function searchConversationEvents(
   } catch {
     /* FTS5 mirror missing or stale — fall through to LIKE. */
     rows = [];
-    ftsFailed = true;
   }
   // LIKE fallback covers freshly-ingested rows the mirror hasn't seen
   // yet, and the case where the FTS5 mirror was never populated.
@@ -282,9 +287,11 @@ export function recordConversationEvent(db, projectKey, sessionId, lineNo, byteO
   // revised to lazy backfill.)
 }
 
-// Rebuild the FTS5 mirror from scratch. Cheap on healthy DBs; on a
-// 50k-event archive it runs once on the first searchConversationEvents
-// call after a schema upgrade and then becomes a no-op. (Audit fix H4.)
+// Rebuild the FTS5 mirror from scratch for one project. Cheap on
+// healthy DBs; on a 50k-event archive it runs once, on the first
+// searchConversationEvents call that finds an empty mirror for the
+// project, and every later search is served from the mirror.
+// (Audit fix H4.)
 export function mirrorConversationEventsFts(db, projectKey) {
   if (!db || !projectKey) return { mirrored: 0 };
   try {
@@ -360,9 +367,26 @@ export async function loadIngestState(kimiHomeDir, projectKey) {
 
 export async function saveIngestState(kimiHomeDir, projectKey, state) {
   const dir = await ensureProjectDir(kimiHomeDir, projectKey);
-  const tmp = ingestStatePath(kimiHomeDir, projectKey) + '.tmp';
-  await fs.writeFile(tmp, JSON.stringify(state, null, 2));
-  await fs.rename(tmp, path.join(dir, 'ingest-state.json'));
+  const dest = path.join(dir, 'ingest-state.json');
+  // The temp name must be unique per write. A Stop hook can still be
+  // running when the next UserPromptSubmit fires, so two hook processes
+  // read-modify-write this file for one project at the same time; a fixed
+  // temp name lets them write each other's staging file, and then one
+  // rename publishes the other's bytes (or raises EPERM on Windows while
+  // the path is held open) — silently dropping the loser's session cursor
+  // and the latest_extract / latest_work_log / latest_session_focus
+  // entries. `rename` is atomic within one directory, so the destination
+  // is never observed half-written.
+  const tmp = `${dest}.${process.pid}.${randomBytes(6).toString('hex')}.tmp`;
+  try {
+    await fs.writeFile(tmp, JSON.stringify(state, null, 2));
+    await fs.rename(tmp, dest);
+  } catch (err) {
+    // Best-effort cleanup: the failed write must not leave staging files
+    // behind for the next pass to trip over.
+    await fs.rm(tmp, { force: true }).catch(() => {});
+    throw err;
+  }
 }
 
 // ----- Project paths (per-DB registry, re-clone detection, reset) -----
@@ -520,6 +544,12 @@ export function detectReclone(db, projectKey, canonicalRoot) {
 //     this project after the reset.
 //   - It preserves the `last_canonical_root` audit trail (the row
 //     before the reset is what an external auditor can read).
+//   - It clears the FTS5 mirrors that shadow the rows it deletes
+//     (memories_fts, conversation_events_fts) so a search after the
+//     reset cannot hit a stale index.
+//   - It clears the per-memory ACL grants (memories_acl) and tier audit
+//     rows (persona_promotions) plus the project's skill invocations, so
+//     a "wiped" project carries no rows keyed to it.
 //   - It does NOT touch the global DB, ingest-state.json, or the DB
 //     file itself: schema + migrations stay in place.
 //
@@ -536,6 +566,9 @@ export function resetProject(db, projectKey, { canonicalRoot = '' } = {}) {
     conversation_events_deleted: 0,
     memory_edges_deleted: 0,
     memory_synthesizes_deleted: 0,
+    memories_acl_deleted: 0,
+    persona_promotions_deleted: 0,
+    skill_invocations_deleted: 0,
     project_path_preserved: false,
   };
   // node:sqlite does not expose a `db.transaction()` helper, so we run
@@ -544,9 +577,44 @@ export function resetProject(db, projectKey, { canonicalRoot = '' } = {}) {
   // wraps at most a few hundred rows; the round-trip is sub-ms.
   db.exec('BEGIN');
   try {
+    // Capture the project's memory ids BEFORE the DELETE below. The FTS5
+    // mirror only carries an `id` column (no project_key lookup the delete
+    // can use as a filter in the same statement), so the ids have to be
+    // read while the rows still exist — selecting them afterwards always
+    // returns an empty set. (Audit fix M3 — corrected.)
+    const memIds = db
+      .prepare('SELECT id FROM memories WHERE project_key=?')
+      .all(projectKey)
+      .map((r) => r.id);
+    // memories_acl and persona_promotions have no project_key column (see
+    // the schema in connection.js): a row is keyed on memory_id alone, so
+    // "belongs to this project" means "its memory_id names a memories row
+    // in this project DB". Both therefore use the same subquery, and both
+    // must run BEFORE the memories DELETE below empties that subquery's
+    // source. (A row whose memory was hard-deleted by an earlier prune is
+    // already orphaned and has no project_key to scope it by.)
+    summary.memories_acl_deleted = db
+      .prepare(
+        'DELETE FROM memories_acl WHERE memory_id IN (SELECT id FROM memories WHERE project_key=?)',
+      )
+      .run(projectKey).changes;
+    summary.persona_promotions_deleted = db
+      .prepare(
+        'DELETE FROM persona_promotions WHERE memory_id IN (SELECT id FROM memories WHERE project_key=?)',
+      )
+      .run(projectKey).changes;
+    // skill_invocations carries project_key directly, so it is scoped like
+    // working_memory / conversations.
+    summary.skill_invocations_deleted = db
+      .prepare('DELETE FROM skill_invocations WHERE project_key=?')
+      .run(projectKey).changes;
     summary.memories_deleted = db
       .prepare('DELETE FROM memories WHERE project_key=?')
       .run(projectKey).changes;
+    if (memIds.length > 0) {
+      const placeholders = memIds.map(() => '?').join(',');
+      db.prepare(`DELETE FROM memories_fts WHERE id IN (${placeholders})`).run(...memIds);
+    }
     summary.working_memory_deleted = db
       .prepare('DELETE FROM working_memory WHERE project_key=?')
       .run(projectKey).changes;
@@ -556,26 +624,17 @@ export function resetProject(db, projectKey, { canonicalRoot = '' } = {}) {
     summary.conversation_events_deleted = db
       .prepare('DELETE FROM conversation_events WHERE project_key=?')
       .run(projectKey).changes;
+    // The conversation_events mirror is not touched by any other path, so
+    // without this the archived rows stay searchable after the reset. It
+    // carries project_key as an UNINDEXED column, so it is deletable
+    // directly.
+    db.prepare('DELETE FROM conversation_events_fts WHERE project_key=?').run(projectKey);
     summary.memory_edges_deleted = db
       .prepare('DELETE FROM memory_edges WHERE project_key=?')
       .run(projectKey).changes;
     summary.memory_synthesizes_deleted = db
       .prepare('DELETE FROM memory_synthesizes WHERE project_key=?')
       .run(projectKey).changes;
-    // FTS5 mirrors the memories table. The previous shape issued an
-    // unconditional `DELETE FROM memories_fts` that could orphan FTS
-    // rows for every *other* project_key in the same DB. Scope the
-    // delete to the project's own ids so multi-project DBs (and any
-    // future shared-DB design) keep their FTS index intact.
-    // (Audit fix M3.)
-    const memIds = db
-      .prepare('SELECT id FROM memories WHERE project_key=?')
-      .all(projectKey)
-      .map((r) => r.id);
-    if (memIds.length > 0) {
-      const placeholders = memIds.map(() => '?').join(',');
-      db.prepare(`DELETE FROM memories_fts WHERE id IN (${placeholders})`).run(...memIds);
-    }
     // Refresh the project_paths row so first_seen_at reflects the new
     // incarnation. last_canonical_root is preserved as the audit
     // breadcrumb of the pre-reset project. record_count is left as-is
@@ -615,19 +674,39 @@ export function resetProject(db, projectKey, { canonicalRoot = '' } = {}) {
 //
 // Scope is strict: every DELETE matches project_key=? so a multi-
 // project DB (and the future shared-DB design) keeps its sibling
-// project rows intact. Throws on any error.
+// project rows intact. Throws on any error, and the deletes run inside
+// one transaction so a failure leaves every row in place.
 export function wipeProjectLifecycleLogs(db, projectKey) {
   if (!db || !projectKey) {
     throw new Error('wipeProjectLifecycleLogs: db and projectKey are required');
   }
-  return {
-    dream_jobs_deleted: db.prepare('DELETE FROM dream_jobs WHERE project_key=?').run(projectKey)
-      .changes,
-    dream_proposals_deleted: db
+  // Children before parents: dream_proposals.job_id REFERENCES
+  // dream_jobs(id) and there is no ON DELETE CASCADE, so with
+  // PRAGMA foreign_keys = ON (set on every open) deleting a job whose
+  // proposals are still present raises FOREIGN KEY constraint failed.
+  // consolidation_runs has no foreign key of its own but is wiped in the
+  // same pass.
+  db.exec('BEGIN');
+  try {
+    const proposals = db
       .prepare('DELETE FROM dream_proposals WHERE project_key=?')
-      .run(projectKey).changes,
-    consolidation_runs_deleted: db
+      .run(projectKey).changes;
+    const runs = db
       .prepare('DELETE FROM consolidation_runs WHERE project_key=?')
-      .run(projectKey).changes,
-  };
+      .run(projectKey).changes;
+    const jobs = db.prepare('DELETE FROM dream_jobs WHERE project_key=?').run(projectKey).changes;
+    db.exec('COMMIT');
+    return {
+      dream_jobs_deleted: jobs,
+      dream_proposals_deleted: proposals,
+      consolidation_runs_deleted: runs,
+    };
+  } catch (err) {
+    try {
+      db.exec('ROLLBACK');
+    } catch {
+      /* ignore */
+    }
+    throw err;
+  }
 }

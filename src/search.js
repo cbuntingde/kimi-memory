@@ -105,26 +105,3 @@ export function buildTitleBoostedQuery(input) {
   // hit.
   return `title:${norm} OR ${norm}`;
 }
-
-// Build an ORDER BY clause from a sort key. The keys map to the
-// documented surface in IMPROVEMENTS.md §5:
-//   - 'recent'     => rank + priority + updated_at DESC
-//   - 'relevance'  => rank + priority + updated_at DESC (alias)
-//   - 'confidence' => confidence DESC + updated_at DESC
-//   - 'oldest'     => updated_at ASC
-//
-// Anything else falls back to 'relevance' so callers get a sensible
-// default. Returns a SQL fragment (no leading "ORDER BY").
-export function buildOrderByClause(sort) {
-  switch (sort) {
-    case 'recent':
-      return 'updated_at DESC';
-    case 'oldest':
-      return 'updated_at ASC';
-    case 'confidence':
-      return 'confidence DESC, updated_at DESC';
-    case 'relevance':
-    default:
-      return 'rank ASC, priority DESC, updated_at DESC';
-  }
-}
