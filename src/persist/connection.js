@@ -14,11 +14,11 @@ import { edgeKindSqlList } from '../edge-kinds.js';
 // sees a HIGHER value refuses to touch the file (an older build must
 // never mutate a newer schema). The value tracks the highest migration
 // label in the array; the numbering has a gap at v14 (no such
-// migration was ever shipped) and the array holds 18 functions for the
-// 16 labelled versions, because v10 was split across five functions.
+// migration was ever shipped) and the array holds 19 functions for the
+// 17 labelled versions, because v10 was split across five functions.
 // Bumping this without appending a migration is a no-op; appending a
 // migration without bumping it means existing DBs never run it.
-const SCHEMA_VERSION = 16;
+const SCHEMA_VERSION = 17;
 
 // Default SQLite busy timeout in milliseconds. The hook runner and the
 // MCP server are separate processes writing the same DB; a second
@@ -693,8 +693,12 @@ const MIGRATIONS = [
   //
   //   dream_jobs       — one row per scheduled Dream pass.
   //                      Status moves through queued → running → ready
-  //                      → applied (or failed / stale / cancelled).
-  //                      A partial unique index on
+  //                      → applied, with partially_applied as the
+  //                      resting state when a floor-limited apply left
+  //                      proposals pending (see
+  //                      migrateAddDreamPartiallyAppliedStatus), and
+  //                      failed / stale / cancelled as terminal
+  //                      branches. A partial unique index on
   //                      (project_key) WHERE status='running' is the
   //                      "single in-flight job per project" guard.
   //
@@ -712,13 +716,18 @@ const MIGRATIONS = [
     // dream_jobs: lifecycle + scheduling metadata. Input snapshot is
     // stored as a small JSON blob (memory_count + sessions list) so
     // apply-time can validate "sources unchanged" without re-walking
-    // the whole DB.
+    // the whole DB. The status CHECK carries the full vocabulary —
+    // including 'partially_applied' (v17) — so a fresh DB never pays
+    // the probe-then-rebuild pass in
+    // migrateAddDreamPartiallyAppliedStatus. SQLite cannot ALTER a
+    // CHECK, so any future status value needs that migration extended
+    // as well.
     db.exec(`
       CREATE TABLE IF NOT EXISTS dream_jobs (
         id              TEXT PRIMARY KEY,
         project_key     TEXT NOT NULL,
         status          TEXT NOT NULL DEFAULT 'queued'
-                          CHECK (status IN ('queued','running','ready','applied','stale','failed','cancelled')),
+                          CHECK (status IN ('queued','running','ready','partially_applied','applied','stale','failed','cancelled')),
         triggered_by    TEXT NOT NULL DEFAULT 'lifecycle',
         input_snapshot  TEXT NOT NULL DEFAULT '{}',
         result_counts   TEXT NOT NULL DEFAULT '{}',
@@ -787,6 +796,84 @@ const MIGRATIONS = [
       .get();
     if (!idxPropProj)
       db.exec('CREATE INDEX idx_dream_proposals_project ON dream_proposals(project_key, status)');
+  },
+
+  // v17: widen the dream_jobs status vocabulary with 'partially_applied'
+  // — the resting state of a job whose apply ran with a confidence floor
+  // that held some proposals back. Before this value existed, such a job
+  // reported status='applied' while its `dream_proposals` rows stayed
+  // 'pending' forever, so the job status claimed more than had happened
+  // and the deferred work was invisible to every reader of the column.
+  //
+  // Same probe-then-rebuild shape as migrateAddContextSnapshotType:
+  // SQLite cannot ALTER a CHECK, so the table is rebuilt. Two details
+  // differ from the memories rebuild and both matter:
+  //
+  //   - dream_proposals carries FOREIGN KEY (job_id) REFERENCES
+  //     dream_jobs(id) and openDb sets `PRAGMA foreign_keys = ON`, so
+  //     DROP TABLE dream_jobs trips the constraint for every job that
+  //     still has proposals (the implicit DELETE FROM cannot succeed).
+  //     Enforcement is toggled off around the rebuild instead. The
+  //     pragma is a no-op inside a transaction, so it is set before
+  //     BEGIN and restored in a finally.
+  //   - The new table is built under a temporary name and renamed into
+  //     place. Renaming `dream_jobs` itself would make SQLite rewrite
+  //     the child's FK clause to point at the renamed table (references
+  //     are rewritten on ALTER TABLE RENAME), leaving dream_proposals
+  //     bound to a table that is about to be dropped.
+  //
+  // Rows are copied verbatim: the rebuild is a vocabulary change, not a
+  // data migration, and a queued / ready / pending job must survive it.
+  function migrateAddDreamPartiallyAppliedStatus(db) {
+    const createSql =
+      db.prepare("SELECT sql FROM sqlite_master WHERE type='table' AND name='dream_jobs'").get()
+        ?.sql || '';
+    // Older DBs created before v13 (or opened with the Dream tables
+    // gated off) have no dream_jobs at all — nothing to widen.
+    if (!createSql) return;
+    if (/partially_applied/.test(createSql)) return;
+    db.exec('PRAGMA foreign_keys = OFF;');
+    try {
+      db.exec(`
+        BEGIN;
+        CREATE TABLE dream_jobs_new (
+          id              TEXT PRIMARY KEY,
+          project_key     TEXT NOT NULL,
+          status          TEXT NOT NULL DEFAULT 'queued'
+                            CHECK (status IN ('queued','running','ready','partially_applied','applied','stale','failed','cancelled')),
+          triggered_by    TEXT NOT NULL DEFAULT 'lifecycle',
+          input_snapshot  TEXT NOT NULL DEFAULT '{}',
+          result_counts   TEXT NOT NULL DEFAULT '{}',
+          error           TEXT,
+          enqueued_at     TEXT NOT NULL,
+          started_at      TEXT,
+          ready_at        TEXT,
+          applied_at      TEXT,
+          updated_at      TEXT NOT NULL
+        );
+        INSERT INTO dream_jobs_new
+          SELECT id, project_key, status, triggered_by, input_snapshot, result_counts,
+                 error, enqueued_at, started_at, ready_at, applied_at, updated_at
+          FROM dream_jobs;
+        DROP TABLE dream_jobs;
+        ALTER TABLE dream_jobs_new RENAME TO dream_jobs;
+        CREATE INDEX idx_dream_jobs_project ON dream_jobs(project_key, updated_at);
+        CREATE UNIQUE INDEX idx_dream_jobs_active ON dream_jobs(project_key) WHERE status = 'running';
+        COMMIT;
+      `);
+    } catch (e) {
+      // Leave no half-rebuilt table or open transaction behind: the
+      // migration loop is not wrapped in a transaction, so a throw here
+      // would otherwise strand the connection mid-BEGIN.
+      try {
+        db.exec('ROLLBACK;');
+      } catch {
+        /* the failure happened before BEGIN, or the tx already unwound */
+      }
+      throw e;
+    } finally {
+      db.exec('PRAGMA foreign_keys = ON;');
+    }
   },
 
   // v15: consolidation_runs table. Records every consolidation pass

@@ -517,7 +517,7 @@ export function register(server, handlers, home) {
         const lastDreamApplyRow = ctx.db
           .prepare(
             `SELECT applied_at AS at FROM dream_jobs
-             WHERE project_key=? AND status='applied' AND applied_at IS NOT NULL
+             WHERE project_key=? AND status IN ('applied','partially_applied') AND applied_at IS NOT NULL
              ORDER BY datetime(applied_at) DESC LIMIT 1`,
           )
           .get(ctx.projectKey);

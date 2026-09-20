@@ -72,17 +72,17 @@ Unless noted, a value of `off` disables the feature and the default is
 
 ### Consolidation and cleanup
 
-| Variable                            | Default | What it does                                                                                                                     |
-| ----------------------------------- | ------- | -------------------------------------------------------------------------------------------------------------------------------- |
-| `KIMI_MEMORY_CONSOLIDATE`           | `on`    | Set to `off` to skip the in-line merge pass at session start.                                                                    |
-| `KIMI_MEMORY_CONSOLIDATE_RELAX`     | `on`    | Gates the small-dataset escape (under 10 active memories, the tag-overlap filter is dropped). `off` restores strict tag-overlap. |
-| `KIMI_MEMORY_DEDUP`                 | `on`    | Enables the pair-level dedup paths (title-dedup + near-duplicate cosine). `off` falls back to the clusterer only.                |
-| `KIMI_MEMORY_AUTO_MERGE`            | `on`    | Set to `off` to disable the pair-level auto-merge inside the inline consolidate pass.                                            |
-| `KIMI_MEMORY_AUTO_GC`               | `on`    | Set to `off` to disable all three auto-GC passes (prune, archive, tier).                                                         |
-| `KIMI_MEMORY_AUTO_PRUNE`            | `on`    | Set to `off` to disable auto-prune of dead rows.                                                                                 |
-| `KIMI_MEMORY_AUTO_ARCHIVE`          | `on`    | Set to `off` to disable auto-archive of old audit rows.                                                                          |
-| `KIMI_MEMORY_AUTO_TIER`             | `on`    | Set to `off` to disable L0 → L3 auto-tier promotion and demotion.                                                                |
-| `KIMI_MEMORY_AUTO_RESET_ON_RECLONE` | `on`    | Set to `off` to keep a manual hint instead of auto-wiping when a re-clone is detected.                                           |
+| Variable                            | Default | What it does                                                                                                                                                   |
+| ----------------------------------- | ------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `KIMI_MEMORY_CONSOLIDATE`           | `on`    | Set to `off` to skip the in-line merge pass at session start.                                                                                                  |
+| `KIMI_MEMORY_CONSOLIDATE_RELAX`     | `on`    | Gates the small-dataset escape (under 10 active memories, the tag-overlap filter is dropped). `off` restores strict tag-overlap.                               |
+| `KIMI_MEMORY_DEDUP`                 | `on`    | Enables the pair-level dedup paths (title-dedup + near-duplicate cosine). `off` falls back to the clusterer only.                                              |
+| `KIMI_MEMORY_AUTO_MERGE`            | `on`    | Set to `off` to disable the pair-level auto-merge inside the inline consolidate pass.                                                                          |
+| `KIMI_MEMORY_AUTO_GC`               | `on`    | Set to `off` to disable all three auto-GC passes (prune, archive, tier).                                                                                       |
+| `KIMI_MEMORY_AUTO_PRUNE`            | `on`    | Set to `off` to disable auto-prune of dead rows.                                                                                                               |
+| `KIMI_MEMORY_AUTO_ARCHIVE`          | `on`    | Set to `off` to disable auto-archive of old audit rows (conversation events, skill invocations, persona promotions, and settled Dream jobs + their proposals). |
+| `KIMI_MEMORY_AUTO_TIER`             | `on`    | Set to `off` to disable L0 → L3 auto-tier promotion and demotion.                                                                                              |
+| `KIMI_MEMORY_AUTO_RESET_ON_RECLONE` | `on`    | Set to `off` to keep a manual hint instead of auto-wiping when a re-clone is detected.                                                                         |
 
 ### Dream
 

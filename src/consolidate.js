@@ -44,6 +44,25 @@ const COVERAGE_RATIO = 0.75; // an existing conclusion "covers" a cluster if >=7
 // caught 2 sibling pairs".
 const SMALL_DATASET_THRESHOLD = 10;
 
+// Confidence stamped on every proposal this pass emits — conclusion,
+// synthesizes-link, and cluster merge alike.
+//
+// There is no model behind the number: the pass is a pure function over
+// the snapshot, and `applyDreamJob` re-derives each proposal's source
+// checksum against the live rows before writing anything, so the gate
+// this value feeds (`KIMI_MEMORY_DREAM_AUTO_APPLY_CONFIDENCE` /
+// `auto_apply_confidence`) selects *how much of the pass runs
+// unattended*, not how safe a given proposal is. The classes are not
+// equally invasive: a conclusion inserts one row and a link one edge,
+// while the merge — the only destructive member of the set, since it
+// rewrites the target body and soft-supersedes its siblings — already
+// sat at 0.85. Leaving the conclusion / link below that line meant the
+// automatic path applied the merge and withheld the conclusion its
+// rewritten body points at, so the project ended up with a rewritten
+// memory and no synthesis row (dream job defect A). One shared value
+// keeps the set atomic with respect to any floor at or below it.
+const PROPOSAL_CONFIDENCE = 0.85;
+
 // KIMI_MEMORY_CONSOLIDATE_RELAX=on (default on) gates the small-dataset
 // escape. Off restores strict tag-overlap behaviour.
 function isRelaxEnabled() {
@@ -497,7 +516,10 @@ export function recordConsolidationRun(db, projectKey, result, { trigger = 'inli
 // target's body — the sibling is soft-superseded so recall still hits
 // the surviving row with the same body.
 function buildPairMergeProposal({ target, sibling, trigger, cosine }) {
-  const baseConf = trigger === 'title_dedup' ? 0.9 : 0.85;
+  // A title collision is a stronger signal than a cosine pass — the two
+  // rows are the same memory saved twice — so it sits above the shared
+  // deterministic floor rather than at it.
+  const baseConf = trigger === 'title_dedup' ? 0.9 : PROPOSAL_CONFIDENCE;
   const provenance = {
     source: 'consolidation_pass',
     cluster_size: 2,
@@ -733,7 +755,7 @@ export async function runConsolidate({
         proposed_content: content,
         proposed_title: title,
         proposed_tags: tags,
-        confidence: 0.7,
+        confidence: PROPOSAL_CONFIDENCE,
         provenance: { ...provenance, proposed_kind: 'conclusion' },
         source_checksum: checksum,
       });
@@ -750,7 +772,7 @@ export async function runConsolidate({
           proposed_content: '',
           proposed_title: '',
           proposed_tags: [],
-          confidence: 0.7,
+          confidence: PROPOSAL_CONFIDENCE,
           provenance: { ...provenance, proposed_kind: 'synthesizes_link' },
           source_checksum: checksum,
         });
@@ -770,7 +792,7 @@ export async function runConsolidate({
               proposed_content: content,
               proposed_title: '',
               proposed_tags: [],
-              confidence: 0.85,
+              confidence: PROPOSAL_CONFIDENCE,
               provenance: { ...provenance, proposed_kind: 'merge', merge_target: target.id },
               source_checksum: checksum,
             });

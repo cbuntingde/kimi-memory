@@ -818,7 +818,16 @@ export const TOOL_DEFS = [
     input: {
       cwd: z.string().describe('Project root (absolute path). Required.'),
       status: z
-        .enum(['queued', 'running', 'ready', 'applied', 'stale', 'failed', 'cancelled'])
+        .enum([
+          'queued',
+          'running',
+          'ready',
+          'partially_applied',
+          'applied',
+          'stale',
+          'failed',
+          'cancelled',
+        ])
         .optional(),
       limit: z.number().int().min(1).max(100).optional(),
     },
@@ -864,7 +873,7 @@ export const TOOL_DEFS = [
   },
   {
     name: 'dream_generate_proposals',
-    desc: 'Run the deterministic consolidate pass against a queued dream job and persist the resulting proposals. Marks the job `ready`. Live memories are untouched.',
+    desc: 'Run the deterministic consolidate pass against a queued dream job and persist the resulting proposals. Marks the job `ready`. Idempotent: a job that already has proposals on file (ready or partially_applied) is returned as a no-op success and its rows are left untouched. Live memories are untouched.',
     input: {
       cwd: z.string().describe('Project root (absolute path). Required.'),
       job_id: z.string().min(4).max(64).describe('Dream job id.'),
@@ -872,7 +881,7 @@ export const TOOL_DEFS = [
   },
   {
     name: 'dream_apply_job',
-    desc: 'Apply a ready Dream job in one transaction. Validates each proposal against the live rows (status, checksum), soft-supersedes unchanged sources, and marks stale proposals instead of applying them.',
+    desc: 'Apply a Dream job in one transaction: `ready` or `partially_applied`. Validates each proposal against the live rows (status, checksum), soft-supersedes unchanged sources, and marks stale proposals instead of applying them. Proposals held back by the confidence floor stay pending and the job is left `partially_applied` so a later call can finish them.',
     input: {
       cwd: z.string().describe('Project root (absolute path). Required.'),
       job_id: z.string().min(4).max(64).describe('Dream job id.'),
@@ -888,7 +897,7 @@ export const TOOL_DEFS = [
   },
   {
     name: 'dream_discard_job',
-    desc: 'Cancel a queued or ready Dream job. Pending proposals are marked rejected; live memories are untouched.',
+    desc: 'Cancel an outstanding Dream job (queued, ready, or partially_applied). Pending proposals are marked rejected; live memories are untouched.',
     input: {
       cwd: z.string().describe('Project root (absolute path). Required.'),
       job_id: z.string().min(4).max(64).describe('Dream job id.'),

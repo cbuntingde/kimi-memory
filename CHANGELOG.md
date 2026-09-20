@@ -162,6 +162,56 @@ with `busy_timeout=1500` now returns after ~2.3 s where it failed in
 busy handler for a journal-mode change — so that half of the finding is
 bounded but not eliminated.
 
+### Fixed — a Dream job could claim `applied` while its proposals stayed `pending`
+
+`applyDreamJob` skipped proposals below the confidence floor and then
+wrote `status='applied'` unconditionally. The lifecycle path applies at
+0.85 while the deterministic pass emitted its conclusion and
+synthesizes-link proposals at 0.7, so every automatic apply committed
+the merge (0.85) — rewriting a memory body and soft-superseding its
+siblings — while the conclusion that body describes was never written,
+and the pending rows could never be reached again because apply required
+`status='ready'`. The deterministic proposals now share the merge's
+confidence, so one floor selects the whole set, and an apply that leaves
+anything pending settles the job as `partially_applied` (a new v17
+status, added by rebuilding `dream_jobs` since SQLite cannot ALTER a
+CHECK). A later explicit apply commits the remainder; running it twice
+changes nothing. `dream_status`, the CLI, `dream_list_jobs`,
+`dream_apply_job`, `dream_discard_job`, the enqueue guard and the
+`last_dream_apply_at` readers all know the value
+(`src/consolidate.js`, `src/dream.js`, `src/persist/connection.js`,
+`tests/74-dream-job-lifecycle.test.js`).
+
+### Fixed — re-generating proposals destroyed an already-`ready` job
+
+`generateProposalsForJob` guarded only `applied` / `cancelled`, and the
+proposal ids it writes are a pure function of (job id, kind, index), so a
+second generation over a `ready` job collided on the primary key, the
+savepoint unwound, and the job was marked `failed` — stranding every
+proposal it had. `src/dreaming.js` triggers exactly that on any
+`dreaming_run` that finds an existing ready job. Generation over a job
+that already has proposals is now an idempotent no-op success that
+leaves the rows byte-identical, a `failed` job is recoverable while
+nothing on it was applied, and `runDreamPass` returns its summary —
+it previously fell off the end of the function without a `return`, so
+`passes.dream` was `undefined` on every successful run and a failed
+generation was invisible. The same missing return had also masked the
+`dreaming_run` handler ignoring its own validated `include`/`exclude`
+filter; the filter is now honoured (`src/dream.js`, `src/dreaming.js`,
+`src/mcp/handlers/dreaming.js`).
+
+### Added — Dream lifecycle rows are swept once they are settled
+
+`dream_jobs` / `dream_proposals` had no bound at all: a floor-limited
+apply left its pending set on disk forever, and only a full project wipe
+removed it. The auto-archive pass (same
+`KIMI_MEMORY_AUTO_GC` / `KIMI_MEMORY_AUTO_ARCHIVE` gates as the other
+archival sweeps) now deletes `applied` / `cancelled` / `failed` / `stale`
+jobs older than 90 days together with their proposals. Jobs in `queued`,
+`running`, `ready` or `partially_applied` are pending work and are never
+touched, and `dream_enqueue` treats `partially_applied` as outstanding so
+the queue stays at one job per project (`src/auto-gc.js`, `src/dream.js`).
+
 ## [0.7.0] — 2026-09-19
 
 ### Fixed — two earlier audit findings that never actually landed

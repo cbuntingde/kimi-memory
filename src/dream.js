@@ -6,7 +6,11 @@
 // `dream_jobs` table until it is applied, cancelled, or marked stale.
 //
 // Lifecycle:
-//   queued → running → ready → applied (or stale / failed / cancelled)
+//   queued → running → ready → applied
+//   ready → partially_applied → applied   (a floor-limited apply left
+//                                          proposals pending; an
+//                                          explicit apply finishes it)
+//   terminal branches: stale / failed / cancelled
 //
 // `running` is exclusive per-project: a partial unique index
 // (`idx_dream_jobs_active`) enforces "one running job per project"
@@ -117,21 +121,33 @@ function buildInputSnapshot(db, projectKey) {
 // project is a no-op (the partial unique index trips first; we
 // catch it here). A previously `ready` job is returned as `duplicate`
 // so the caller can skip re-generation.
+//
+// `partially_applied` counts as outstanding work too. Such a job holds
+// proposals that no automatic pass will commit (they sit below the
+// operator's confidence floor) and that only an explicit apply or a
+// discard can settle, so starting a second job alongside it would let
+// unsettled jobs — and their proposal rows — accumulate one per
+// session. One outstanding job per project keeps that set bounded and
+// keeps `dream_status` unambiguous about what still needs attention.
 export function enqueueDreamJob(db, projectKey, opts = {}) {
   if (!db || !projectKey) return { status: 'error', reason: 'no_inputs' };
   if (dreamOptOut()) return { status: 'opt_out', reason: 'env_opt_out' };
 
   const now = nowIso();
   try {
-    // Bail early if a job is already running for this project.
+    // Bail early if a job is already outstanding for this project.
     const existing = db
       .prepare(
-        "SELECT id, status FROM dream_jobs WHERE project_key=? AND status IN ('queued','running','ready') ORDER BY updated_at DESC LIMIT 1",
+        "SELECT id, status FROM dream_jobs WHERE project_key=? AND status IN ('queued','running','ready','partially_applied') ORDER BY updated_at DESC LIMIT 1",
       )
       .get(projectKey);
     if (existing) {
       if (existing.status === 'running') return { status: 'duplicate', job_id: existing.id };
-      if (existing.status === 'queued' || existing.status === 'ready') {
+      if (
+        existing.status === 'queued' ||
+        existing.status === 'ready' ||
+        existing.status === 'partially_applied'
+      ) {
         return { status: 'duplicate', job_id: existing.id };
       }
     }
@@ -191,9 +207,12 @@ export function lastDreamEnqueuedAt(db, projectKey) {
 }
 
 // Generate proposals for a queued job. Marks the job `ready` and
-// persists the proposal rows. Re-runs against an already-ready job
-// are no-ops via the status guard. Returns the consolidate result
-// object so callers can surface counts.
+// persists the proposal rows. Re-runs against a job that already
+// carries proposals (ready / partially_applied) are idempotent
+// successes that leave those rows untouched. Returns the consolidate
+// result object so callers can surface counts, and `{ ok: false }`
+// with a reason for anything that genuinely failed — callers must not
+// discard that result.
 //
 // db is the project DB. saveMemory / memoryLink / mergeMemory are
 // injected so tests can stub them; default to the real implementations.
@@ -215,8 +234,44 @@ export async function generateProposalsForJob(
 
   const job = readJob(db, projectKey, jobId);
   if (!job) return { ok: false, reason: 'not_found' };
+  // A job that already has proposals on file is returned as an
+  // idempotent success rather than regenerated. Re-running the pass
+  // would flip the job back to `running` and re-insert the same
+  // proposal ids — `newProposalId` is a pure function of (job id, kind,
+  // index) — so the first INSERT collided on the primary key, the
+  // savepoint unwound, and `markJobFailed` flipped the job to `failed`,
+  // stranding every proposal it had (a failed job can never be
+  // applied). `src/dreaming.js` invokes exactly that path whenever a
+  // `dreaming_run` finds an existing ready job, so both statuses that
+  // mean "proposals are on file" are guarded.
+  if (job.status === 'ready' || job.status === 'partially_applied') {
+    return { ok: true, reason: 'already_generated', noop: true, job_id: jobId, status: job.status };
+  }
   if (job.status === 'applied') return { ok: false, reason: 'already_applied' };
   if (job.status === 'cancelled') return { ok: false, reason: 'cancelled' };
+  if (job.status === 'failed') {
+    // Recoverable, because the cause of a `failed` job is usually gone
+    // by the time anyone retries: the collision above, or a transient
+    // DB error, and the deterministic pass recomputes the set from the
+    // live rows either way. The dead rows are cleared first so the
+    // positional ids cannot collide with an aborted attempt's leftovers.
+    // A job that already has an `applied` proposal is NOT recovered —
+    // the pass would re-propose work that is already committed (and a
+    // merge would rewrite a body its siblings no longer carry), so the
+    // operator's route there is `dream_discard_job` plus a fresh job.
+    const existing = listProposals(db, projectKey, jobId);
+    if (existing.some((p) => p.status === 'applied')) {
+      return { ok: false, reason: 'failed_with_applied_proposals', status: 'failed' };
+    }
+    try {
+      db.prepare('DELETE FROM dream_proposals WHERE job_id=? AND project_key=?').run(
+        jobId,
+        projectKey,
+      );
+    } catch (e) {
+      return { ok: false, reason: 'recover_threw', error: e && e.message };
+    }
+  }
 
   // Mark `running` so a concurrent generate is a no-op. The partial
   // unique index catches cross-process races; the status guard above
@@ -343,19 +398,30 @@ function markJobFailed(db, projectKey, jobId, message) {
   }
 }
 
-// Apply a ready job. Validates each proposal against the live rows
-// (status='active', id intact, source_checksum matches), then writes
-// the conclusions / edges / merges inside a single SAVEPOINT. Stale
-// proposals are flipped to status='stale' and skipped.
+// Apply a job that has proposals on file. Validates each proposal
+// against the live rows (status='active', id intact, source_checksum
+// matches), then writes the conclusions / edges / merges inside a
+// single SAVEPOINT. Stale proposals are flipped to status='stale' and
+// skipped.
 //
-// Returns { ok, applied, stale, failed, error } where each count
-// names a proposal class. Empty job (no pending proposals) is a
-// no-op success.
+// Accepts `ready` and `partially_applied`: the latter is what an apply
+// with a confidence floor leaves behind — including the case where the
+// floor held back every proposal, so nothing was committed at all (the
+// status names "not fully applied", which stays true). The whole point
+// of naming that state is that the proposals it held back stay
+// reachable through a later explicit call (no floor → nothing is
+// withheld) or are dropped by an explicit discard.
+//
+// Returns { ok, applied, stale, failed, remaining, status, error }
+// where each count names a proposal class. Empty job (no pending
+// proposals) is a no-op success.
 export function applyDreamJob(db, projectKey, jobId, opts = {}) {
   if (!db || !projectKey || !jobId) return { ok: false, reason: 'no_inputs' };
   const job = readJob(db, projectKey, jobId);
   if (!job) return { ok: false, reason: 'not_found' };
-  if (job.status !== 'ready') return { ok: false, reason: 'not_ready', status: job.status };
+  if (job.status !== 'ready' && job.status !== 'partially_applied') {
+    return { ok: false, reason: 'not_ready', status: job.status };
+  }
 
   const proposals = listProposals(db, projectKey, jobId, { status: 'pending' });
   if (proposals.length === 0) {
@@ -368,11 +434,12 @@ export function applyDreamJob(db, projectKey, jobId, opts = {}) {
     } catch {
       /* swallow */
     }
-    return { ok: true, applied: 0, stale: 0, failed: 0 };
+    return { ok: true, applied: 0, stale: 0, failed: 0, remaining: 0, status: 'applied' };
   }
 
   // Optional auto-apply: proposals above the confidence floor apply
-  // immediately; everything else stays pending for an explicit call.
+  // immediately; everything else stays pending and the job ends up
+  // `partially_applied` so a later explicit call can still reach it.
   const floor = typeof opts.autoApplyConfidence === 'number' ? opts.autoApplyConfidence : null;
 
   const saveMemory = opts.saveMemory;
@@ -468,12 +535,17 @@ export function applyDreamJob(db, projectKey, jobId, opts = {}) {
     return { ok: false, reason: 'apply_threw', error: e && e.message };
   }
 
-  // Mark the job applied when every pending proposal is settled.
+  // The job status must not claim more than what happened. `remaining`
+  // holds whatever the floor (or a rejection) left pending: while any
+  // of it is there the job is `partially_applied`, which is what
+  // `dream_status` reports and what a later explicit apply finishes.
+  // Only an empty pending set is `applied`.
   const remaining = listProposals(db, projectKey, jobId, { status: 'pending' });
+  const finalStatus = remaining.length > 0 ? 'partially_applied' : 'applied';
   try {
     db.prepare(
-      "UPDATE dream_jobs SET status='applied', applied_at=?, updated_at=? WHERE id=? AND project_key=?",
-    ).run(now, now, jobId, projectKey);
+      'UPDATE dream_jobs SET status=?, applied_at=?, updated_at=? WHERE id=? AND project_key=?',
+    ).run(finalStatus, now, now, jobId, projectKey);
   } catch {
     /* best-effort */
   }
@@ -506,6 +578,7 @@ export function applyDreamJob(db, projectKey, jobId, opts = {}) {
     stale,
     failed,
     remaining: remaining.length,
+    status: finalStatus,
     auto_apply_floor: floor,
   };
 }
@@ -654,8 +727,12 @@ function applyProposal(db, projectKey, jobId, proposal, deps) {
   return 'reject';
 }
 
-// Cancel / discard a queued or ready job. Proposals are marked
-// rejected so re-enqueue is clean. Returns { ok, reason }.
+// Cancel / discard an outstanding job (queued, ready, or
+// partially_applied). Proposals are marked rejected so re-enqueue is
+// clean. Returns { ok, reason }. For a `partially_applied` job this is
+// the operator's "I want none of the remainder" path: the live writes
+// an earlier apply already committed are never undone, but the held-back
+// proposals stop counting as outstanding work.
 export function discardDreamJob(db, projectKey, jobId, { reason = 'cancelled' } = {}) {
   if (!db || !projectKey || !jobId) return { ok: false, reason: 'no_inputs' };
   const job = readJob(db, projectKey, jobId);
@@ -795,6 +872,13 @@ function parseJson(text, fallback) {
 
 // Find the next ready job for the project (oldest first). Used by the
 // SessionStart hook to opportunistically apply pending proposals.
+//
+// Deliberately `ready` only: a `partially_applied` job is reached by an
+// explicit apply, not by the hook. The hook applies with the configured
+// confidence floor, which is exactly what held those proposals back, so
+// picking the job up here would re-validate the same rows every session
+// and settle nothing. `runDreamPass` (the dreaming pass, which applies
+// without a floor) still finishes it on its next run.
 export function findReadyJob(db, projectKey) {
   try {
     const row = db
@@ -810,8 +894,18 @@ export function findReadyJob(db, projectKey) {
 
 // Compact status shape for the hook status line. Bounded counts + a
 // single short label; never echoes memory ids or proposal bodies.
+// `partially_applied` is reported alongside `ready` because both mean
+// "this project has work a later apply would commit".
 export function buildDreamStatus(db, projectKey) {
-  const empty = { label: 'none', queued: 0, ready: 0, applied: 0, failed: 0, cancelled: 0 };
+  const empty = {
+    label: 'none',
+    queued: 0,
+    ready: 0,
+    partially_applied: 0,
+    applied: 0,
+    failed: 0,
+    cancelled: 0,
+  };
   if (!db || !projectKey) return empty;
   try {
     const counts = db
@@ -821,6 +915,7 @@ export function buildDreamStatus(db, projectKey) {
     const queued = byStatus.queued || 0;
     const running = byStatus.running || 0;
     const ready = byStatus.ready || 0;
+    const partiallyApplied = byStatus.partially_applied || 0;
     const applied = byStatus.applied || 0;
     const failed = byStatus.failed || 0;
     const cancelled = byStatus.cancelled || 0;
@@ -828,12 +923,21 @@ export function buildDreamStatus(db, projectKey) {
     let label = 'none';
     if (failed > 0) label = `failed:${failed}`;
     else if (ready > 0) label = `ready:${ready}`;
+    else if (partiallyApplied > 0) label = `partially_applied:${partiallyApplied}`;
     else if (running > 0) label = `running:${running}`;
     else if (queued > 0) label = `queued:${queued}`;
     else if (applied > 0) label = `applied:${applied}`;
     else if (cancelled > 0) label = `cancelled:${cancelled}`;
     else if (stale > 0) label = `stale:${stale}`;
-    return { label, queued, ready, applied, failed, cancelled };
+    return {
+      label,
+      queued,
+      ready,
+      partially_applied: partiallyApplied,
+      applied,
+      failed,
+      cancelled,
+    };
   } catch {
     return empty;
   }
