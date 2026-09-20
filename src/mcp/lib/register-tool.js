@@ -24,12 +24,15 @@
 //   memory_reset_project -> {"error":"no project DB at C:\\Users\\…\\memory.sqlite"}
 // leaking the home layout and the project key into the agent context.
 //
-// `handlers` (optional Map<name, async fn>) is populated with the
-// post-resolve handler so the proxy can call a tool by name without
-// going through the MCP dispatcher. This eliminates the proxy's
-// dependency on the SDK's private `_registeredTools` / `_tools`
-// fields.
+// `handlers` (optional Map<name, { schema, fn }>) is populated with the
+// tool's own Zod input schema and its post-resolve handler, so the
+// proxy can call a tool by name without going through the MCP
+// dispatcher. This eliminates the proxy's dependency on the SDK's
+// private `_registeredTools` / `_tools` fields. The schema travels with
+// the handler so the HTTP path can run the same parse the SDK runs for
+// an MCP call.
 
+import { z } from 'zod';
 import { resolveProjectRoot, validateScope } from '../../validation.js';
 import { safeErrorMessage } from '../../util.js';
 import { openScopeDb, ok, textError } from './scope-db.js';
@@ -116,7 +119,24 @@ export function registerTool(server, def, handler, handlers, home) {
     }
   };
   server.tool(name, desc, input, wrapped);
-  if (handlers) handlers.set(name, wrapped);
+  // The registry hands the proxy BOTH the schema and the post-resolve
+  // callback. Storing the bare callback let the proxy dispatch around the
+  // SDK's own `safeParseAsync` step: unknown keys survived (so a smuggled
+  // `scope: 'global'` reached openScopeDb on a project-scoped tool) and no
+  // `.max()` / `.refine()` cap applied. The Map value is therefore
+  // `{ schema, fn }`, not a function.
+  //
+  // `input` is a Zod RAW SHAPE (`{ name: z.string() }`), not a ZodType —
+  // the SDK wraps it with `objectFromShape` at registration, and a raw
+  // shape has no `safeParseAsync` of its own. Storing it verbatim would
+  // therefore have left the proxy's validation disabled, so the shape is
+  // wrapped in `z.object()` here. That is the same conversion the SDK
+  // performs, and it is the same `z` module every def uses, so the parsed
+  // result matches the MCP path: unknown keys stripped, declared caps
+  // enforced. A def that already carries a real ZodType is passed through.
+  const schema =
+    input && typeof input.safeParseAsync === 'function' ? input : input ? z.object(input) : null;
+  if (handlers) handlers.set(name, { schema, fn: wrapped });
 }
 
 // Unwrap Zod's optional / nullable / default wrappers to reach the

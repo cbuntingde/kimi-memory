@@ -9,6 +9,14 @@
 // and truncated the value. The replacement walks the line char by
 // char so a # inside a quoted string is preserved, and a # outside
 // any string is treated as a comment terminator.
+//
+// Prototype safety: this parser used to assign through `node[key]` on
+// plain objects, so a `[__proto__]` header made `node` become
+// Object.prototype and every following line wrote an own property onto
+// it — process-wide pollution from a file on disk. Two independent
+// defences now apply: chain-walking names are dropped outright, and
+// every write goes through defineProperty, which creates an own
+// property and can never invoke a setter inherited from the chain.
 
 function stripComment(line) {
   let inQuote = null;
@@ -27,6 +35,24 @@ function stripComment(line) {
   return line;
 }
 
+// Names that address the prototype chain rather than a config key. A
+// config.toml has no legitimate use for any of them, so they are
+// dropped instead of assigned.
+const UNSAFE_TOML_KEYS = new Set(['__proto__', 'constructor', 'prototype']);
+
+// Writing through defineProperty rather than `node[key] = value` is the
+// structural half of the fix: an own data property is created without
+// consulting the prototype chain, so even a name that slipped past the
+// denylist above cannot reach a setter.
+function assign(obj, key, value) {
+  Object.defineProperty(obj, key, {
+    value,
+    writable: true,
+    enumerable: true,
+    configurable: true,
+  });
+}
+
 export function parseToml(text) {
   const out = {};
   let cur = out;
@@ -35,21 +61,27 @@ export function parseToml(text) {
     if (!line) continue;
     if (line.startsWith('[')) {
       const sec = line.replace(/^\[|\]$/g, '').trim();
-      const parts = splitTomlPath(sec);
+      const parts = splitTomlPath(sec).filter((p) => !UNSAFE_TOML_KEYS.has(p));
+      // An empty header ([]) — or one made only of unsafe segments —
+      // has no addressable path: drop the section rather than
+      // inventing one.
+      if (parts.length === 0) continue;
       let node = out;
       for (let i = 0; i < parts.length - 1; i++) {
-        node[parts[i]] = node[parts[i]] || {};
-        node = node[parts[i]];
+        const seg = parts[i];
+        if (!node[seg] || typeof node[seg] !== 'object') assign(node, seg, {});
+        node = node[seg];
       }
-      node[parts[parts.length - 1]] = node[parts[parts.length - 1]] || {};
-      cur = node[parts[parts.length - 1]];
+      const leaf = parts[parts.length - 1];
+      if (!node[leaf] || typeof node[leaf] !== 'object') assign(node, leaf, {});
+      cur = node[leaf];
       continue;
     }
     const eq = line.indexOf('=');
     if (eq < 0) continue;
     const k = unquoteKey(line.slice(0, eq).trim());
-    const v = parseTomlValue(line.slice(eq + 1).trim());
-    cur[k] = v;
+    if (UNSAFE_TOML_KEYS.has(k)) continue;
+    assign(cur, k, parseTomlValue(line.slice(eq + 1).trim()));
   }
   return out;
 }

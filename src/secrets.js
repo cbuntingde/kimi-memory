@@ -131,8 +131,118 @@ const CONNECTION_RE = new RegExp(CONNECTION_SOURCE, 'i');
 const CONNECTION_RE_G = new RegExp(CONNECTION_SOURCE, 'gi');
 
 const PEM_HEADER_RE = /-----BEGIN [A-Z ]*PRIVATE KEY-----/;
-const PEM_BLOCK_RE =
-  /-----BEGIN [A-Z ]*?(?:PRIVATE|OPENSSH PRIVATE) KEY-----[\s\S]*?-----END [A-Z ]*?PRIVATE KEY-----/g;
+
+// PEM block redaction is a linear indexOf scanner, not a regex.
+//
+// The regex it replaces — `-----BEGIN … KEY-----[\s\S]*?-----END … KEY-----`
+// — is quadratic on a session tail that contains many `-----BEGIN` headers,
+// because a lazy quantifier that fails must retry from every start
+// position: measured through redactSecrets on a tail of repeated headers
+// (the shape a pasted key repeated across a long session produces), 512 KB
+// cost ~273 ms, 1.25 MB ~1724 ms and 2.5 MB ~6978 ms — five times the input
+// for twenty-five times the work. This runs on a raw wire line with no size
+// limit, under a 14 s Stop budget (src/hooks/run.js), so a large tail could
+// kill the pass before the ingest-state write landed.
+//
+// Bounding the body does not fix that. A bounded lazy quantifier loses
+// V8's literal-lookahead fast path, so 512 KB measured 2814 ms with the
+// 64 KiB cap — worse, not better — and a "skip the pass when the text holds
+// no END marker" pre-check only covers the zero-marker case: one stray
+// `-----END` at the end of the text still cost 3355 ms, and four spread
+// through it 1292 ms (14.7 s and 13.5 s at 2.5 MB). The scanner below does
+// that block step in 0.6 ms / 2.4 ms / 0.9 ms on those three inputs, and the
+// whole of redactSecrets — the other passes over the same text included —
+// in ~27 ms / ~25 ms / ~14 ms at 512 KB and ~130 ms at 2.5 MB: about 5x the
+// work for 5x the input.
+//
+// How it stays linear: every well-formed END footer is located ONCE in a
+// forward pass (each indexOf resumes past the marker it found, so the total
+// scanned bytes is the text length), then one forward-only pointer walks
+// that list while the BEGIN positions advance. No position is ever rescanned
+// for a second BEGIN, and when the pointer runs off the end of the list no
+// later BEGIN can match either, so the rest of the text is copied verbatim
+// in one slice. The per-BEGIN header/footer parses are sticky-anchored, so
+// each is a bounded check at a fixed offset rather than a search.
+//
+// The 64 KiB body cap is kept as defence in depth: it is not needed for the
+// timing any more, but it stops one stray BEGIN from swallowing a distant
+// END and redacting megabytes as a single "key". An over-long block is not
+// redacted as one unit — that was already true of the capped regex this
+// scanner replaces; the pre-cap unbounded regex did claim it. What matters
+// is that such a block is still DETECTED, by PEM_HEADER_RE above, which is
+// the half that makes looksLikeSecret refuse to persist it. The scanner
+// claims exactly the spans the capped regex claimed, so no shape loses
+// scrub coverage it had.
+const PEM_BODY_MAX_CHARS = 65536;
+
+// Anchored parses of the two header forms. Sticky, so `exec` starts exactly
+// at `lastIndex` and the cost is the header's own length, never a search.
+const PEM_BEGIN_AT_RE = /-----BEGIN [A-Z ]*?(?:PRIVATE|OPENSSH PRIVATE) KEY-----/y;
+const PEM_END_AT_RE = /-----END [A-Z ]*?PRIVATE KEY-----/y;
+
+// Parse `re` anchored at exactly `at`. Returns the end offset of the match
+// or -1. Both callers below hold a candidate offset from an indexOf, so an
+// unanchored search would be both slower and wrong. The `m.index === at`
+// test is belt-and-braces on the `y` flag: a sticky `exec` always reports
+// the match at `lastIndex`, so it can only fire if someone drops that flag —
+// and a silent fallback to an unanchored search would shift every offset
+// used in the splice below, which is data loss in a redaction path.
+function matchAt(text, re, at) {
+  re.lastIndex = at;
+  const m = re.exec(text);
+  return m && m.index === at ? at + m[0].length : -1;
+}
+
+function redactPemBlocks(text) {
+  // Every END footer that could terminate a block, in one forward pass.
+  // A position that does not parse as a full footer can never parse for any
+  // BEGIN, so filtering here (rather than per BEGIN) keeps the walk below
+  // bounded by the number of real footers. `p + 8` cannot skip an overlapping
+  // occurrence: '-----END' does not contain itself off-phase, the same way
+  // '-----BEGIN' does not.
+  const ends = [];
+  for (let p = text.indexOf('-----END'); p >= 0; p = text.indexOf('-----END', p + 8)) {
+    const end = matchAt(text, PEM_END_AT_RE, p);
+    if (end >= 0) ends.push({ start: p, end });
+  }
+  if (ends.length === 0) return text;
+  // Two cursors: `flushed` is how far the output has been emitted, `i` is
+  // where the next BEGIN search starts. They diverge as soon as a header
+  // fails to parse (the scan moves on, but nothing has been copied yet), so
+  // one cursor cannot serve both.
+  let out = '';
+  let flushed = 0;
+  let i = 0;
+  let endPtr = 0;
+  while (i < text.length) {
+    const begin = text.indexOf('-----BEGIN', i);
+    if (begin < 0) break;
+    const headerEnd = matchAt(text, PEM_BEGIN_AT_RE, begin);
+    // Not a private-key header ('-----BEGIN CERTIFICATE-----', a truncated
+    // one). Resume one char on, exactly where a global regex's lastIndex
+    // would have landed.
+    if (headerEnd < 0) {
+      i = begin + 1;
+      continue;
+    }
+    while (endPtr < ends.length && ends[endPtr].start < headerEnd) endPtr++;
+    // Every later BEGIN has a larger headerEnd, so if no footer is left at
+    // or after this one, none is left for them either: stop scanning and
+    // copy the remainder.
+    if (endPtr >= ends.length) break;
+    const cand = ends[endPtr];
+    if (cand.start - headerEnd <= PEM_BODY_MAX_CHARS) {
+      out += text.slice(flushed, begin) + '[REDACTED_PEM_BLOCK]';
+      flushed = cand.end;
+      i = cand.end;
+      endPtr++;
+    } else {
+      i = begin + 1;
+    }
+  }
+  if (flushed < text.length) out += text.slice(flushed);
+  return out;
+}
 
 const BEARER_RE = /Authorization\s*:\s*Bearer\s+[A-Za-z0-9_.-]{20,}/i;
 const BEARER_RE_G = /Authorization\s*:\s*Bearer\s+[A-Za-z0-9_.-]{20,}/gi;
@@ -227,7 +337,7 @@ export function redactSecrets(text) {
   if (typeof text !== 'string' || !text) return '';
   let out = text;
   out = out.replace(PROVIDER_KEY_RE_G, '[REDACTED_PROVIDER_KEY]');
-  out = out.replace(PEM_BLOCK_RE, '[REDACTED_PEM_BLOCK]');
+  out = redactPemBlocks(out);
   out = out.replace(BEARER_RE_G, 'Authorization: Bearer [REDACTED]');
   out = out.replace(BASIC_RE_G, 'Authorization: Basic [REDACTED]');
   // Connection strings run before the generic assignment rule so the

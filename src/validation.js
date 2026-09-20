@@ -1,5 +1,6 @@
 // Input validation shared between MCP tools and tests.
 import { canonicalizeRoot } from './project-key.js';
+import { clampInt } from './util.js';
 
 // Memory type vocabulary. Must mirror the CHECK constraint on
 // memories.type in src/persist.js SCHEMA_SQL (line 634) and every
@@ -94,7 +95,12 @@ export function validateOffset(v) {
   const n = Number(v);
   if (!Number.isFinite(n) || n < 0)
     return { ok: false, error: 'offset must be a non-negative integer' };
-  return { ok: true, value: Math.trunc(n) };
+  // Clamped above as well as floored: any finite non-negative number used
+  // to pass through, so `memory_list {offset: 1e30}` reached node:sqlite's
+  // `OFFSET ?` binding and failed with a raw ERR_SQLITE_ERROR datatype
+  // mismatch instead of returning an empty page. 1e9 is far past any
+  // real row count, so the clamped value is still an empty page.
+  return { ok: true, value: clampInt(n, 0, 1e9, 0) };
 }
 
 export function validateTags(v) {

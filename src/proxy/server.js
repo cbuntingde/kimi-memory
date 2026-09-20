@@ -47,7 +47,7 @@ import { closeDb, flushEmbeddings } from '../persist.js';
  *
  * The callable surface is whatever `makeServer()` (src/server.js)
  * registered: it returns `{ server, handlers }`, where `handlers` is a
- * `Map<tool_name, async fn>` that each domain module fills in as it
+ * `Map<tool_name, { schema, fn }>` that each domain module fills in as it
  * registers. `dispatchTool()` below resolves an inbound
  * `POST /tools/<name>` through that map and invokes the handler
  * directly — no JSON-RPC round trip, and no reach into the SDK's
@@ -237,21 +237,35 @@ export async function startProxy({
       throw err;
     }
     // The orchestrator (src/server.js) populates `mcp.handlers` with
-    // every tool's wrapped handler at startup. The Map<name, fn>
-    // shape is owned by us, not the SDK, so this code no longer
+    // every tool's wrapped handler at startup. The Map<name, {schema,
+    // fn}> shape is owned by us, not the SDK, so this code no longer
     // depends on the private `_registeredTools` / `_tools` fields
     // that previously shifted across SDK releases.
-    const handler = mcp.handlers && mcp.handlers.get(toolName);
-    if (typeof handler !== 'function') {
+    const entry = mcp.handlers && mcp.handlers.get(toolName);
+    if (!entry || typeof entry.fn !== 'function') {
       const err = new Error(`unknown tool: ${toolName}`);
       err.code = 'unknown_tool';
       throw err;
     }
+    // Parse through the tool's own Zod schema before dispatch — the step
+    // the MCP path gets for free. This is what strips undeclared keys (a
+    // `scope` on a schema that has none used to reach openScopeDb and
+    // retarget the call at the global store) and enforces the declared
+    // caps (memory_diagnostics {limit:1000000} used to select the whole
+    // log). A def with no schema keeps the SDK's own no-schema path.
+    let parsed = { success: true, data: args || {} };
+    if (entry.schema && typeof entry.schema.safeParseAsync === 'function') {
+      parsed = await entry.schema.safeParseAsync(args || {});
+      if (!parsed.success) {
+        const err = new Error(formatParseError(parsed.error));
+        err.code = 'invalid_args';
+        throw err;
+      }
+    }
     // The wrapped handler ignores its second arg (its ctx is built
-    // internally from `args.cwd`); we pass the proxy signal context
-    // for forward-compat in case a future handler wants to honour
-    // cancellation through the proxy transport.
-    return await handler(args || {}, {
+    // internally from `args.cwd`); we pass the proxy signal context for
+    // forward-compat in case a future handler honours cancellation.
+    return await entry.fn(parsed.data, {
       signal: new AbortController().signal,
       sendNotification: () => {},
       sendRequest: () => Promise.resolve({}),
@@ -464,15 +478,30 @@ export async function startProxy({
       }
       try {
         const out = await dispatchTool(toolName, body);
+        // The wrapped handlers report a user-facing failure by RETURNING a
+        // tool-result with isError rather than throwing, so the HTTP
+        // transport has to inspect the result to choose a status: a failed
+        // call used to come back as 200 with the error buried in the body,
+        // which reads as success to anything that only checks the status.
+        if (out && out.isError) {
+          res.writeHead(400, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ ...out, code: 'tool_error' }));
+          return;
+        }
         res.writeHead(200, { 'content-type': 'application/json' });
         res.end(JSON.stringify(out));
       } catch (e) {
         const isUnknown = e && e.code === 'unknown_tool';
-        res.writeHead(isUnknown ? 404 : 500, { 'content-type': 'application/json' });
+        // A schema rejection is the caller's malformed body, not a server
+        // fault: answer 400 so an HTTP client can tell it apart from the
+        // 500s a genuine internal failure produces.
+        const isInvalid = e && e.code === 'invalid_args';
+        const status = isUnknown ? 404 : isInvalid ? 400 : 500;
+        res.writeHead(status, { 'content-type': 'application/json' });
         res.end(
           JSON.stringify({
             error: safeErrorMessage(e),
-            code: e.code || (isUnknown ? 'unknown_tool' : 'internal'),
+            code: e.code || (isUnknown ? 'unknown_tool' : isInvalid ? 'invalid_args' : 'internal'),
           }),
         );
       }
@@ -605,6 +634,15 @@ const NETWORK_DESTRUCTIVE_TOOLS = new Set([
   'memory_unlink',
   'memory_reinforce',
   'codegraph_build_edges',
+  // Moves rows OUT of the project DB into the cross-project global store —
+  // a network caller could lift a project's whole memory set.
+  'memory_promote_to_global',
+  // Soft-supersedes live source rows and rewrites their content when the
+  // staged job is applied, with no per-row confirmation step.
+  'dream_apply_job',
+  // {"sub":"run","include":"gc","force":true} runs the GC passes and
+  // defeats the debounce, so it can delete rows on demand.
+  'dreaming',
 ]);
 
 export function nonLoopbackToolGuard(toolName, { host } = {}) {
@@ -650,6 +688,30 @@ function splitToolList(raw) {
       .map((s) => s.trim().toLowerCase())
       .filter(Boolean),
   );
+}
+
+// Render a ZodError the way the SDK's own `getParseErrorMessage`
+// (server/zod-compat.js) does, so a rejected body reads the same whether
+// the call arrived over MCP or over the HTTP proxy. The caller still runs
+// it through safeErrorMessage like every other wrapper error, so an
+// over-long message is capped at 200 chars.
+function formatParseError(error) {
+  const issues = error && Array.isArray(error.issues) ? error.issues : [];
+  if (issues.length > 0) {
+    return issues
+      .map((i) => (i.path && i.path.length ? `${i.message} at ${dotPath(i.path)}` : i.message))
+      .join('\n');
+  }
+  return error && typeof error.message === 'string' ? error.message : String(error);
+}
+
+// Mirrors the SDK's `getDotPath`: the first segment prints bare, a numeric
+// segment takes bracket form (`tags[0]`), a string segment dot form.
+function dotPath(path) {
+  return path.reduce((acc, seg, index) => {
+    if (index === 0) return String(seg);
+    return typeof seg === 'number' ? `${acc}[${seg}]` : `${acc}.${seg}`;
+  }, '');
 }
 
 // Pre-flight depth check for inbound JSON bodies. Walks the raw

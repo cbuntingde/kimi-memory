@@ -104,6 +104,16 @@ const HANDLERS = {
   PostToolUseFailure: handlePostToolUseFailure,
 };
 
+// A closed stdout pipe is reported ASYNCHRONOUSLY as an 'error' event on
+// the stream, so the `try { process.stdout.write() } catch {}` guarding
+// every write never sees it: the event is unhandled, Node prints a stack
+// and the process exits 1. The harness closing its read end is exactly the
+// case the hard-timeout guard below exists for — the runtime stops reading
+// while a handler is still writing — so without this the hook converts its
+// own fail-open path into a crash. Handlers may write only after this runs.
+process.stdout.on('error', () => {});
+process.stderr.on('error', () => {});
+
 async function main() {
   setContext({ home: HOME, event: EVENT });
   const stdin = await readStdin(256 * 1024);
