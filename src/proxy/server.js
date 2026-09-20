@@ -9,9 +9,12 @@
 // as the in-process server.
 //
 // Auth: `KIMI_MEMORY_PROXY_TOKEN` env var. When set, every request
-// must carry `Authorization: Bearer <token>`. When unset, the proxy
-// refuses to start unless `KIMI_MEMORY_PROXY_AUTH=off` (intended for
-// dev only — see `proxyAuthBypass()`).
+// must carry `Authorization: Bearer <token>`. When unset the proxy
+// still starts, but auth fails closed: `authenticate()` rejects every
+// call, so every route except the `/healthz` + `/readyz` probes and
+// the CORS preflight answers 401. `KIMI_MEMORY_PROXY_AUTH=off` turns
+// that gate off (intended for dev only — see `proxyAuthBypass()`);
+// that combination is refused on a non-loopback bind.
 //
 // Endpoint surface (kept minimal — the proxy is a transport, not a
 // re-implementation of the tool surface):
@@ -24,8 +27,10 @@
 // `--host 0.0.0.0` to expose it on the network — strongly discouraged
 // outside of a trusted LAN. Non-loopback binds default to a read-only
 // tool surface; the destructive set is opt-in via
-// `KIMI_MEMORY_PROXY_ALLOW_TOOLS` (comma-separated). See
-// `nonLoopbackToolGuard()` for the exact set.
+// `KIMI_MEMORY_PROXY_ALLOW_TOOLS` (comma-separated). The operator
+// deny-list `KIMI_MEMORY_PROXY_DENY_TOOLS` is separate: it applies on
+// every bind, loopback included. See `nonLoopbackToolGuard()` for the
+// exact sets.
 //
 // (Prior audit flag F-003 — a network bind with bearer auth alone was
 // the network-wide admin path the audit called out.)
@@ -222,7 +227,9 @@ export async function startProxy({
     // operator explicitly opted in via KIMI_MEMORY_PROXY_ALLOW_TOOLS.
     // A network bind with a single shared bearer token is a
     // network-wide admin path otherwise — the audit floor requires
-    // this default-off shape. (Prior audit flag F-003.)
+    // this default-off shape. (Prior audit flag F-003.) The operator
+    // deny-list is checked inside the same call and applies on every
+    // bind, loopback included.
     const deny = guardToolName(toolName);
     if (deny) {
       const err = new Error(deny);
@@ -426,9 +433,19 @@ export async function startProxy({
       // Defer the close so the response is flushed first. gracefulShutdown
       // drains in-flight embeddings + closes the SQLite cache so the
       // next process restart inherits a handle whose WAL was
-      // checkpointed.
-      setImmediate(() => {
-        gracefulShutdown().catch(() => {});
+      // checkpointed. Only this route (and the CLI's signal handler)
+      // exits the process — the exported `close()` stays pure so a test
+      // can tear the proxy down in-process. Without the explicit exit
+      // this route leaves a zombie: no listener, a closed SQLite cache,
+      // and nothing left to keep the event loop busy except whatever
+      // handle `server.close()` is still draining.
+      setImmediate(async () => {
+        try {
+          await gracefulShutdown();
+        } catch {
+          /* ignore */
+        }
+        process.exit(0);
       });
       return;
     }
@@ -494,7 +511,9 @@ export async function startProxy({
   // active tool request race database teardown — a transient 500
   // or a corrupted in-flight row. (Audit finding F-009.)
   // /shutdown and the exported close() both route here so the two
-  // surfaces can never drift.
+  // teardown sequences can never drift; the process exit itself is the
+  // route's (see /shutdown) and the CLI signal handler's, not this
+  // function's.
   async function gracefulShutdown() {
     const serverClosed = new Promise((resolve) => {
       try {
@@ -568,7 +587,10 @@ export function isLoopbackHost(host) {
 // bind without an explicit operator opt-in. Read-only and routine-write
 // tools (memory_recall, memory_list, memory_get, memory_save, …) stay
 // available. The opt-in env var is `KIMI_MEMORY_PROXY_ALLOW_TOOLS`
-// (comma-separated). (Prior audit flag F-003.)
+// (comma-separated). This set is a non-loopback rule only; the
+// separate `KIMI_MEMORY_PROXY_DENY_TOOLS` check in
+// `nonLoopbackToolGuard()` applies on every bind. (Prior audit flag
+// F-003.)
 const NETWORK_DESTRUCTIVE_TOOLS = new Set([
   'memory_reset_project',
   'memory_prune',
@@ -586,32 +608,48 @@ const NETWORK_DESTRUCTIVE_TOOLS = new Set([
 ]);
 
 export function nonLoopbackToolGuard(toolName, { host } = {}) {
-  // Loopback binds never trip the guard; the bearer-auth boundary is
-  // considered sufficient for the same machine. `host` is the address
-  // startProxy is listening on, and it is authoritative. Only when the
-  // caller omits it entirely do we fall back to KIMI_MEMORY_PROXY_HOST
-  // and then to the loopback default — startProxy itself never reads
-  // that env var, so a stale value there cannot loosen a live bind.
+  // `host` is the address startProxy is listening on, and it is
+  // authoritative. Only when the caller omits it entirely do we fall
+  // back to KIMI_MEMORY_PROXY_HOST and then to the loopback default —
+  // startProxy itself never reads that env var, so a stale value there
+  // cannot loosen a live bind.
   const bindHost = host != null ? host : process.env.KIMI_MEMORY_PROXY_HOST || '127.0.0.1';
-  if (isLoopbackHost(bindHost)) return null;
-  // Operator-set deny-list always wins, regardless of any allow-list.
-  // Useful for hardening the proxy against a specific tool even when
-  // the operator has broader ALLOW_TOOLS set.
-  const denied = (process.env.KIMI_MEMORY_PROXY_DENY_TOOLS || '')
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean);
-  if (denied.includes(toolName)) {
+  // Tool names are always lowercase. Normalise both sides of every
+  // list comparison so `KIMI_MEMORY_PROXY_DENY_TOOLS=Memory_Delete`
+  // denies instead of silently failing open on the operator's typo.
+  const name = typeof toolName === 'string' ? toolName.toLowerCase() : toolName;
+  // Operator-set deny-list always wins, regardless of any allow-list —
+  // and it applies on EVERY bind, loopback included. The proxy is
+  // documented to default to 127.0.0.1, so reading the deny-list after
+  // the loopback early-return made this control dead on the default
+  // configuration while AGENTS.md still advertised it (there is no
+  // loopback carve-out in that contract). Use it to harden the proxy
+  // against a specific tool even when the operator has a broader
+  // ALLOW_TOOLS set.
+  const denied = splitToolList(process.env.KIMI_MEMORY_PROXY_DENY_TOOLS);
+  if (denied.has(name)) {
     return `tool ${toolName} is on the operator's deny-list (KIMI_MEMORY_PROXY_DENY_TOOLS). Remove it to allow.`;
   }
-  if (!NETWORK_DESTRUCTIVE_TOOLS.has(toolName)) return null;
+  // Loopback binds never trip the destructive-tool guard; the
+  // bearer-auth boundary is considered sufficient for the same machine.
+  if (isLoopbackHost(bindHost)) return null;
+  if (!NETWORK_DESTRUCTIVE_TOOLS.has(name)) return null;
   // Operator-opt-in: each destructive tool must be named explicitly.
-  const allowed = (process.env.KIMI_MEMORY_PROXY_ALLOW_TOOLS || '')
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean);
-  if (allowed.includes(toolName)) return null;
+  const allowed = splitToolList(process.env.KIMI_MEMORY_PROXY_ALLOW_TOOLS);
+  if (allowed.has(name)) return null;
   return `tool ${toolName} is not allowed on a non-loopback bind (host=${bindHost}). Set KIMI_MEMORY_PROXY_ALLOW_TOOLS=${toolName} to opt in.`;
+}
+
+// Comma-separated env list → lowercase Set. Set membership rather than
+// `Array.includes` so the case normalisation cannot be forgotten at one
+// of the two comparison sites.
+function splitToolList(raw) {
+  return new Set(
+    (raw || '')
+      .split(',')
+      .map((s) => s.trim().toLowerCase())
+      .filter(Boolean),
+  );
 }
 
 // Pre-flight depth check for inbound JSON bodies. Walks the raw

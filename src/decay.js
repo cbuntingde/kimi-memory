@@ -84,15 +84,15 @@ export function retrievabilityToConfidence(r) {
 }
 
 // Stability after one rehearsal. Multiplies by STABILITY_GROWTH and
-// caps at STABILITY_MAX. Pass `prevStability` as null/undefined to
-// grow from the initial stability (handles brand-new rows that have
-// not been migrated yet, or rows created by saveMemory without a
-// value). The first reinforce of a freshly-saved row should produce
-// STABILITY_INITIAL * STABILITY_GROWTH, not STABILITY_MIN — a brand
+// caps at STABILITY_MAX. Pass `prevStability` as null/undefined — or
+// as any non-positive / non-finite value, which carries no usable
+// history either — to grow from the initial stability. The first
+// reinforce of a freshly-saved row should produce
+// STABILITY_INITIAL * STABILITY_GROWTH, not STABILITY_MIN: a brand
 // new memory has 30 days of expected durability, not 1.
 export function growStability(prevStability) {
   const prev =
-    prevStability == null || !Number.isFinite(prevStability) ? STABILITY_INITIAL : prevStability;
+    Number.isFinite(prevStability) && prevStability > 0 ? prevStability : STABILITY_INITIAL;
   return Math.max(STABILITY_MIN, Math.min(STABILITY_MAX, prev * STABILITY_GROWTH));
 }
 

@@ -84,16 +84,28 @@ function contentText(content) {
 // then drop it via the empty-after-trim filter).
 //
 // The regex matches both complete `<system-reminder>...</system-reminder>`
-// blocks and unclosed leading/trailing fragments, which the runtime
-// occasionally emits. Multi-line blocks are handled by the `s` flag.
-// Non-greedy so two adjacent reminder blocks don't merge into one.
+// blocks and unclosed leading/trailing fragments (which the runtime
+// occasionally emits, as long as the opening tag itself is closed by a
+// `>`). Multi-line blocks are handled by the `s` flag. Non-greedy so two
+// adjacent reminder blocks don't merge into one.
+//
+// The attribute run is bounded (`[^>]{0,4096}`) instead of the obvious
+// `[^>]*`. An unbounded quantifier followed by the literal `>` is O(n²)
+// when the input contains `<system-reminder` with no `>` anywhere: the
+// quantifier consumes to end-of-string, fails, and backtracks at every
+// occurrence — measured on repeated-tag text at ≈170 ms for 64 KiB and
+// ≈3.0 s for 256 KiB, on content that is read from a caller-supplied
+// archive. 4096 chars is far longer than any real reminder tag, and the
+// bound makes the scan linear while leaving every well-formed block
+// (and every unclosed fragment whose opening tag is closed) stripping
+// exactly as before.
 function stripSystemReminders(text) {
   if (typeof text !== 'string' || !text) return text;
   // Pre-compute once; the regex is module-scoped to avoid re-allocation.
   return text.replace(SYSTEM_REMINDER_RE, '').trim();
 }
 
-const SYSTEM_REMINDER_RE = /<system-reminder\b[^>]*>[\s\S]*?(?:<\/system-reminder>|$)/gi;
+const SYSTEM_REMINDER_RE = /<system-reminder\b[^>]{0,4096}>[\s\S]*?(?:<\/system-reminder>|$)/gi;
 
 export function extractSummary(parsed) {
   if (!parsed || typeof parsed !== 'object') return null;

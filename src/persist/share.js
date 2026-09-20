@@ -525,9 +525,11 @@ function safeParseProvenance(value) {
 // the current one (L0→L1→L2→L3 in either direction); setMemoryTier is
 // the explicit override.
 //
-// All three return { memory, transition } where transition is the
-// audit row, or { memory: null } when the memory is missing / soft-
-// deleted. Throws on invalid tier input; the caller is expected to
+// All three return { memory, transition } where transition is the audit
+// row that was actually persisted, or null when nothing changed: a
+// missing / soft-deleted memory (also { memory: null }), a memory
+// already at the target tier, or an audit INSERT the PRIMARY KEY guard
+// ignored. Throws on invalid tier input; the caller is expected to
 // validate before invoking.
 
 function recordPromotion(db, memoryId, fromTier, toTier, reason) {
@@ -538,79 +540,103 @@ function recordPromotion(db, memoryId, fromTier, toTier, reason) {
   // (Audit finding B2-6.)
   const stamp = `${nowIso()}:${Date.now() % 1e9}:${crypto.randomUUID()}`;
   const id = shortId(hashId('promo', memoryId, fromTier, toTier, reason || '', stamp), 16);
-  db.prepare(
-    `INSERT OR IGNORE INTO persona_promotions (id, memory_id, from_tier, to_tier, reason, at)
-     VALUES (?, ?, ?, ?, ?, ?)`,
-  ).run(id, memoryId, fromTier, toTier, reason || null, nowIso());
-  return {
-    id,
-    memory_id: memoryId,
-    from_tier: fromTier,
-    to_tier: toTier,
-    reason: reason || null,
-    at: nowIso(),
-  };
+  const info = db
+    .prepare(
+      `INSERT OR IGNORE INTO persona_promotions (id, memory_id, from_tier, to_tier, reason, at)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+    )
+    .run(id, memoryId, fromTier, toTier, reason || null, nowIso());
+  // INSERT OR IGNORE drops the row silently on a PRIMARY KEY collision,
+  // so a fabricated return value would claim an audit row that does not
+  // exist. Report the no-op as null and otherwise hand back the row as
+  // it was actually stored.
+  if (info.changes === 0) return null;
+  return db
+    .prepare(
+      `SELECT id, memory_id, from_tier, to_tier, reason, at
+       FROM persona_promotions WHERE id = ?`,
+    )
+    .get(id);
 }
+
+// Single read-modify-write for every tier change. BEGIN IMMEDIATE (not a
+// deferred BEGIN) takes the write lock before the SELECT, so two
+// processes cannot both read L0, both compute the same target, and have
+// the second UPDATE clobber the first: the tier column and its audit row
+// always move together, and the read can never be interleaved with a
+// competing write. `resolveTargetTier(currentTier)` returns the target,
+// or null for a no-op (already at the cap / floor).
+function applyTierTransition(db, projectKey, memoryId, resolveTargetTier, reason) {
+  db.exec('BEGIN IMMEDIATE');
+  try {
+    const row = db
+      .prepare("SELECT id, tier FROM memories WHERE id=? AND project_key=? AND status='active'")
+      .get(memoryId, projectKey);
+    if (!row) {
+      db.exec('COMMIT');
+      return { memory: null, transition: null };
+    }
+    const targetTier = resolveTargetTier(row.tier);
+    if (targetTier == null || targetTier === row.tier) {
+      const memory = getMemory(db, projectKey, memoryId);
+      db.exec('COMMIT');
+      return { memory, transition: null };
+    }
+    db.prepare(`UPDATE memories SET tier = ?, updated_at = ? WHERE id = ? AND project_key = ?`).run(
+      targetTier,
+      nowIso(),
+      memoryId,
+      projectKey,
+    );
+    const transition = recordPromotion(db, memoryId, row.tier, targetTier, reason);
+    const memory = getMemory(db, projectKey, memoryId);
+    db.exec('COMMIT');
+    return { memory, transition };
+  } catch (err) {
+    try {
+      db.exec('ROLLBACK');
+    } catch {
+      /* ignore */
+    }
+    throw err;
+  }
+}
+
+const TIER_ORDER = ['L0', 'L1', 'L2', 'L3'];
 
 export function setMemoryTier(db, projectKey, memoryId, targetTier, { reason } = {}) {
   if (!TIER_VALUES.has(targetTier)) {
     throw new Error(`invalid tier: ${targetTier}`);
   }
-  const row = db
-    .prepare("SELECT id, tier FROM memories WHERE id=? AND project_key=? AND status='active'")
-    .get(memoryId, projectKey);
-  if (!row) return { memory: null, transition: null };
-  if (row.tier === targetTier) {
-    return {
-      memory: getMemory(db, projectKey, memoryId),
-      transition: null,
-    };
-  }
-  db.prepare(`UPDATE memories SET tier = ?, updated_at = ? WHERE id = ? AND project_key = ?`).run(
-    targetTier,
-    nowIso(),
-    memoryId,
-    projectKey,
-  );
-  const transition = recordPromotion(db, memoryId, row.tier, targetTier, reason);
-  return {
-    memory: getMemory(db, projectKey, memoryId),
-    transition,
-  };
+  return applyTierTransition(db, projectKey, memoryId, () => targetTier, reason);
 }
 
 // Promote one tier up (capped at L3). Returns { memory, transition }.
 export function promoteMemory(db, projectKey, memoryId, { reason } = {}) {
-  const row = db
-    .prepare("SELECT tier FROM memories WHERE id=? AND project_key=? AND status='active'")
-    .get(memoryId, projectKey);
-  if (!row) return { memory: null, transition: null };
-  const order = ['L0', 'L1', 'L2', 'L3'];
-  const idx = order.indexOf(row.tier);
-  if (idx < 0 || idx === order.length - 1) {
-    return {
-      memory: getMemory(db, projectKey, memoryId),
-      transition: null,
-    };
-  }
-  return setMemoryTier(db, projectKey, memoryId, order[idx + 1], { reason });
+  return applyTierTransition(
+    db,
+    projectKey,
+    memoryId,
+    (tier) => {
+      const idx = TIER_ORDER.indexOf(tier);
+      return idx < 0 || idx === TIER_ORDER.length - 1 ? null : TIER_ORDER[idx + 1];
+    },
+    reason,
+  );
 }
 
 // Demote one tier down (floor at L0). Returns { memory, transition }.
 export function demoteMemory(db, projectKey, memoryId, { reason } = {}) {
-  const row = db
-    .prepare("SELECT tier FROM memories WHERE id=? AND project_key=? AND status='active'")
-    .get(memoryId, projectKey);
-  if (!row) return { memory: null, transition: null };
-  const order = ['L0', 'L1', 'L2', 'L3'];
-  const idx = order.indexOf(row.tier);
-  if (idx <= 0) {
-    return {
-      memory: getMemory(db, projectKey, memoryId),
-      transition: null,
-    };
-  }
-  return setMemoryTier(db, projectKey, memoryId, order[idx - 1], { reason });
+  return applyTierTransition(
+    db,
+    projectKey,
+    memoryId,
+    (tier) => {
+      const idx = TIER_ORDER.indexOf(tier);
+      return idx <= 0 ? null : TIER_ORDER[idx - 1];
+    },
+    reason,
+  );
 }
 
 // Return the audit log of tier transitions for a memory, oldest-first.

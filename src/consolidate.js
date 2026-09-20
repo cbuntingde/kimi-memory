@@ -173,11 +173,18 @@ function loadExistingConclusionChildren(db, projectKey) {
 }
 
 // Decode an embedding BLOB into a Float32Array. Reuses the canonical
-// decoder from src/embedding.js which validates BLOB size and rejects
-// NaN/Inf values — the previous local copy silently produced NaN-filled
-// Float32Arrays on corrupt input, causing cosine to silently return 0.
-// (Audit finding B4-7.)
-import { decodeVector as decodeEmbedding } from './embedding.js';
+// decoder from src/embedding.js rather than a local copy — the previous
+// local implementation silently produced NaN-filled Float32Arrays on
+// corrupt input, causing cosine to silently return 0. (Audit finding
+// B4-7.)
+//
+// Every call site in this module is a best-effort "skip the row if it
+// has no usable vector" check, so the decoder used is the null-returning
+// `tryDecodeVector`. The strict `decodeVector` throws
+// KIMI_MEMORY_EMBED_CORRUPT on a short or non-finite BLOB, which would
+// abort the whole pass instead of skipping one row; it stays the right
+// choice for genuine validation paths.
+import { tryDecodeVector } from './embedding.js';
 
 // Cosine similarity between two Float32Arrays of equal length.
 function cosine(a, b) {
@@ -215,8 +222,9 @@ function clusterMemories(memories, { decodeEmbedding }) {
   const visited = new Set();
 
   // Pre-decode each BLOB into a Float32Array once. Skips BLOBs that
-  // decode to nothing (corrupt size, NaN/Inf) so the inner loops only
-  // see valid vectors.
+  // decode to nothing (corrupt size, NaN/Inf, missing) so the inner
+  // loops only see valid vectors — a row we cannot decode is dropped,
+  // never fatal to the pass.
   const decoded = new Map();
   for (const m of memories) {
     const v = decodeEmbedding(m.embedding);
@@ -537,7 +545,10 @@ export async function runConsolidate({
   memoryLink,
   mergeMemory,
   isDisabled = () => process.env.KIMI_MEMORY_CONSOLIDATE === 'off',
-  decodeEmbeddingImpl = decodeEmbedding,
+  // Nullable decoder: a corrupt BLOB must drop its row, not abort the
+  // pass. Injected implementations are expected to behave the same way
+  // (return null for "no usable vector").
+  decodeEmbeddingImpl = tryDecodeVector,
   // 'proposal' returns the same shape as direct mode but the caller
   // gets a `proposals` array and the live memories table is
   // untouched. Anything else falls back to the legacy direct path.

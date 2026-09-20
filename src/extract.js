@@ -314,11 +314,10 @@ function isPrivateIpv4(addr) {
 }
 
 // `new URL()` emits IPv6 in canonical compressed form, but `::` keeps the
-// textual layout variable, so byte offsets are not stable. Expand to eight
-// fixed-width hextets (32 hex digits) instead, which makes every prefix
-// test below a plain string compare. Returns null when the text is not a
-// valid IPv6 address.
-function expandIpv6Parts(addr) {
+// textual layout variable, so group offsets are not stable. Expand to the
+// eight 16-bit group values instead, which makes every test below a plain
+// array compare. Returns null when the text is not a valid IPv6 address.
+function expandIpv6Groups(addr) {
   let text = String(addr || '');
   let v4 = [];
   const dotted = /(^|:)(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/.exec(text);
@@ -341,31 +340,39 @@ function expandIpv6Parts(addr) {
     return null;
   }
   if (parts.some((h) => !/^[0-9a-f]{1,4}$/.test(h))) return null;
-  return parts.map((h) => h.padStart(4, '0')).join('');
+  return parts.map((h) => parseInt(h, 16));
 }
 
-// ::ffff:0:0/96 — the IPv4-mapped prefix. Addresses inside it carry a real
-// IPv4 address in their low 32 bits, so they are classified by the IPv4
-// table rather than as IPv6.
-const IPV6_V4MAPPED_PREFIX = '0'.repeat(20) + 'ffff';
+// The dotted-quad IPv4 address a known IPv4-in-IPv6 form carries in its low
+// 32 bits, or null when the address is not one of those forms:
+//   ::ffff:0:0/96    IPv4-mapped     — 80 zero bits, then ffff
+//   ::ffff:0:0:0/96  IPv4-translated — 64 zero bits, then ffff:0 (SIIT)
+//   64:ff9b::/96     NAT64 well-known prefix — 64:ff9b, then 64 zero bits
+function embeddedIpv4(parts) {
+  const [g0, g1, g2, g3, g4, g5, g6, g7] = parts;
+  const quad = [g6 >> 8, g6 & 0xff, g7 >> 8, g7 & 0xff].join('.');
+  const zero = (...groups) => groups.every((g) => g === 0);
+  if (zero(g0, g1, g2, g3, g4) && g5 === 0xffff) return quad;
+  if (zero(g0, g1, g2, g3) && g4 === 0xffff && g5 === 0) return quad;
+  if (g0 === 0x64 && g1 === 0xff9b && zero(g2, g3, g4, g5)) return quad;
+  return null;
+}
 
-function isPrivateIpv6(addr) {
-  const hex = expandIpv6Parts(addr);
-  if (!hex) return false;
-  // fc00::/7 — unique local addresses.
-  if ((parseInt(hex.slice(0, 2), 16) & 0xfe) === 0xfc) return true;
-  // fe80::/10 — link-local.
-  if ((parseInt(hex.slice(0, 4), 16) & 0xffc0) === 0xfe80) return true;
-  // Every other non-public IPv6 shape puts an IPv4 address in the low 32
-  // bits: ::ffff:0:0/96 (IPv4-mapped, e.g. ::ffff:169.254.169.254) and the
-  // all-zero high 96 bits of :: , ::1 and the deprecated IPv4-compatible
-  // ::a.b.c.d form. One IPv4 table then covers them all.
-  const high = hex.slice(0, 24);
-  if (high === IPV6_V4MAPPED_PREFIX || high === '0'.repeat(24)) {
-    const v4 = [0, 2, 4, 6].map((i) => parseInt(hex.slice(24 + i, 26 + i), 16)).join('.');
-    return isPrivateIpv4(v4);
-  }
-  return false;
+// IPv6 classification. An address that embeds an IPv4 address in one of the
+// known IPv4-in-IPv6 forms above is judged by that IPv4 address through the
+// same table as the IPv4 path — 64:ff9b::a9fe:a9fe is refused as
+// 169.254.169.254, not accepted as a NAT64 address. Every other address is
+// public only inside global unicast 2000::/3, so unique-local fc00::/7,
+// link-local fe80::/10, loopback ::1, unspecified ::, multicast ff00::/8
+// and the deprecated IPv4-compatible ::a.b.c.d form are all non-public.
+// DNS64/NAT64 translation itself is not modelled: the embedded IPv4 tail
+// (or its absence) is all this offline classifier can judge.
+export function isPrivateIpv6(addr) {
+  const parts = expandIpv6Groups(addr);
+  if (!parts) return false;
+  const v4 = embeddedIpv4(parts);
+  if (v4) return isPrivateIpv4(v4);
+  return (parts[0] & 0xe000) !== 0x2000;
 }
 
 // True when the host must never receive the (redacted) transcript. DNS
@@ -494,6 +501,11 @@ export function parseExtractionResponse(text) {
   }
   const out = [];
   for (const raw of arr) {
+    // A model that emits `[null]` (or a string / number element) must
+    // not take the whole pass down: this function is documented to
+    // "never throw", and a TypeError here collapsed the entire reply to
+    // `{skipped:'extract_threw'}`, discarding the valid siblings.
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) continue;
     const type = asString(raw.type);
     if (!['semantic', 'episodic', 'procedural', 'context_snapshot'].includes(type)) continue;
 
@@ -543,7 +555,8 @@ export async function callChat({ apiKey, baseUrl, type, model, system, user, sig
   if (!apiKey || !baseUrl) return null;
   const ctrl = new AbortController();
   const timeout = setTimeout(() => ctrl.abort(), LLM_TIMEOUT_MS);
-  if (signal) signal.addEventListener('abort', () => ctrl.abort());
+  const onAbort = () => ctrl.abort();
+  if (signal) signal.addEventListener('abort', onAbort);
   try {
     const url = baseUrl.replace(/\/+$/, '');
     // `redirect: 'error'` on both calls. The base-URL guard only ever sees
@@ -623,6 +636,10 @@ export async function callChat({ apiKey, baseUrl, type, model, system, user, sig
     throw err;
   } finally {
     clearTimeout(timeout);
+    // Detach the caller's abort listener. The retry loop re-enters
+    // callChat per attempt, so leaving the listener attached would
+    // accumulate one per attempt on a long-lived signal.
+    if (signal) signal.removeEventListener('abort', onAbort);
   }
 }
 

@@ -65,7 +65,8 @@ export async function maybeEnqueueDream(projectDb, projectKey, cwd) {
   }
   return enqueue;
 }
-// wall-clock floor or activity gate). Called from SessionStart. The
+// Phase-1 Dreaming pass (consolidate + dream + auto-GC) on a
+// wall-clock floor or activity gate. Called from SessionStart. The
 // orchestrator decides mode + interval + include set from the
 // per-project state file at $KIMI_CODE_HOME/kimi-memory/<project>/
 // dreaming.json (with the global _config/dreaming.json as fallback).

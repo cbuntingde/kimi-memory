@@ -82,7 +82,11 @@ export async function readStdin(limitBytes = 1024 * 1024) {
   });
 }
 
-// Read a JSONL file. Yields {line, n, raw, parsed, error}. Always tolerant.
+// Read a JSONL file. Yields {line, n, raw, parsed, error, byteOffset,
+// nextByteOffset}. Always tolerant. `byteOffset` is the physical byte
+// position of the line (after a stripped BOM); `nextByteOffset` is
+// where the following line starts, or the file size when this was the
+// last one.
 export async function* readJsonl(filePath, { startByte = 0, signal } = {}) {
   let fh;
   try {
@@ -96,25 +100,31 @@ export async function* readJsonl(filePath, { startByte = 0, signal } = {}) {
     if (startByte >= stat.size) return;
     const stream = fh.createReadStream({ start: startByte, end: stat.size - 1, encoding: 'utf8' });
     let buf = '';
-    // Strip a leading UTF-8 BOM only on the very first byte of the
+    // Strip a leading UTF-8 BOM, but only at the very first byte of the
     // file. PowerShell `Set-Content -Encoding utf8` (and a number of
     // Windows editors) prepend `\uFEFF`; without the strip, the very
     // first event — usually the initial user prompt, the highest-
     // signal line for the agent — is parsed as malformed and the
-    // JSON content is silently lost. (Audit fix BUG-5.)
-    let bomStripped = startByte === 0;
+    // JSON content is silently lost. A continuation read (startByte >
+    // 0) never sees a BOM, so it must not eat a U+FEFF that happens to
+    // sit at the front of its first chunk. (Audit fix BUG-5; the flag
+    // used to be initialised the wrong way round, so the strip never
+    // ran on a whole-file read.)
+    let bomSettled = startByte !== 0;
     let lineNo = 0;
     let offset = startByte;
     for await (const chunk of stream) {
       if (signal && signal.aborted) break;
       buf += chunk;
-      if (!bomStripped && buf.length > 0 && buf.charCodeAt(0) === 0xfeff) {
-        buf = buf.slice(1);
-        // The BOM occupies 3 bytes on disk but only 1 code unit in the
-        // decoded UTF-8 stream; advance the offset so nextByteOffset
-        // arithmetic still aligns to physical bytes.
-        offset += 3;
-        bomStripped = true;
+      if (!bomSettled && buf.length > 0) {
+        bomSettled = true;
+        if (buf.charCodeAt(0) === 0xfeff) {
+          buf = buf.slice(1);
+          // The BOM occupies 3 bytes on disk but only 1 code unit in
+          // the decoded UTF-8 stream; advance the offset so
+          // nextByteOffset arithmetic still aligns to physical bytes.
+          offset += 3;
+        }
       }
       let nl;
       while ((nl = buf.indexOf('\n')) !== -1) {
@@ -125,7 +135,12 @@ export async function* readJsonl(filePath, { startByte = 0, signal } = {}) {
         const stripped = isCrlf ? line.slice(0, -1) : line;
         const parsed = stripped.length === 0 ? null : safeJsonParse(stripped);
         const lineBytes = Buffer.byteLength(line, 'utf8'); // includes the '\r' on CRLF
-        const nlBytes = isCrlf ? 2 : 1;
+        // The line was split at '\n', so the byte the cursor must step
+        // over to reach the next line is exactly 1 on both endings — the
+        // '\r' of a CRLF pair is already counted inside `lineBytes`.
+        // Charging a CRLF line 2 terminator bytes over-advanced `offset`
+        // by 1 per line and left every later byteOffset running ahead
+        // of the real file position. (Audit fix.)
         yield {
           line: stripped,
           n: lineNo,
@@ -133,15 +148,9 @@ export async function* readJsonl(filePath, { startByte = 0, signal } = {}) {
           parsed: parsed && parsed.ok ? parsed.value : null,
           error: parsed && !parsed.ok ? parsed.error : null,
           byteOffset: offset,
-          // nextByteOffset was previous shape `+ 1` only, which left
-          // a CRLF cursor pointing at the trailing `\r` of the just-
-          // emitted line. Count the line bytes + terminator bytes so
-          // the next read resumes at the start of the next line
-          // regardless of which line ending the file uses. (Audit
-          // fix BUG-6.)
-          nextByteOffset: offset + lineBytes + nlBytes - (isCrlf ? 1 : 0),
+          nextByteOffset: offset + lineBytes + 1,
         };
-        offset += lineBytes + nlBytes;
+        offset += lineBytes + 1;
       }
     }
     if (buf.length > 0) {
@@ -150,8 +159,10 @@ export async function* readJsonl(filePath, { startByte = 0, signal } = {}) {
       lineNo += 1;
       const stripped = trailingCr ? buf.slice(0, -1) : buf;
       const parsed = stripped.length === 0 ? null : safeJsonParse(stripped);
+      // No terminator follows this final line, so the cursor advances
+      // over the line bytes only — `buf` is everything left in the
+      // stream, hence the next read starts exactly at EOF.
       const lineBytes = Buffer.byteLength(buf, 'utf8');
-      const nlBytes = trailingCr ? 2 : 1;
       yield {
         line: stripped,
         n: lineNo,
@@ -159,7 +170,7 @@ export async function* readJsonl(filePath, { startByte = 0, signal } = {}) {
         parsed: parsed && parsed.ok ? parsed.value : null,
         error: parsed && !parsed.ok ? parsed.error : null,
         byteOffset: offset,
-        nextByteOffset: offset + lineBytes + nlBytes - (trailingCr ? 1 : 0),
+        nextByteOffset: offset + lineBytes,
       };
     }
   } finally {
@@ -278,9 +289,9 @@ export const SHELL_VERB_REGEX =
   /\b(pnpm|npm|yarn|bun|node|npx|tsx|ts-node|python|pip|cargo|go|make|cmake|gradle|mvn|docker|kubectl|git|curl|wget|brew|apt|systemctl)\b/g;
 
 // Sanitize an exception for return to a remote caller. Strips
-// absolute-path fragments, host:port fragments, and long stack dumps
-// that could leak filesystem layout, internal IPs, or library versions
-// to the agent context. (Audit fix.)
+// absolute-path fragments, host:port fragments, and URLs that could
+// leak filesystem layout or internal IPs to the agent context. (Audit
+// fix.)
 //
 // Callers: the MCP tool wrapper (src/mcp/lib/register-tool.js), the
 // HTTP proxy's error responses, the auto-extract retry path, and the
@@ -289,13 +300,33 @@ export const SHELL_VERB_REGEX =
 //
 // The shape mirrors toError in src/validation.js but applies a stricter
 // regex so a caller who simply forwards `(e && e.message)` does not
-// accidentally expose internal strings. Anything we cannot classify
-// gets truncated to 200 chars so a verbose third-party exception cannot
-// flood the response.
+// accidentally expose internal strings. Bounding the length is
+// `safeErrorMessage`'s job, not this function's: it caps the result at
+// 200 chars so a verbose third-party exception cannot flood the
+// response, while `sanitizeText` keeps full stack traces for the
+// diagnostics log.
+
+// Path-shaped fragment stripped by `sanitizeText`. Three shapes:
+//   - a UNC path (`\\fileserver\share\secret.txt`),
+//   - a Windows path, including a root-level one (`C:\secret.txt`),
+//   - a POSIX absolute path (`/home/alice/secret.js`), anchored to a
+//     non-word boundary so a *relative* reference such as
+//     `docs/api/reference.md` is left alone — the fragment only starts
+//     at a real path position (string start, space, quote, `(`, `=`).
+// Path segments containing spaces are NOT covered: tolerating them
+// requires matching across word boundaries, which turns ordinary prose
+// ("/a then /b") into a false positive. Leaking the tail of a
+// space-containing POSIX path is the lesser evil.
 const PATH_FRAGMENT =
-  /(?:\/(?:[\w.\-]+\/)+[\w.\-]+)|(?:[A-Za-z]:[\\\/](?:[\w.\-]+[\\\/])+[\w.\-]+)/g;
+  /\\\\[A-Za-z0-9._-]{2,}[\\\/][^\s"'<>|,;)]+|(?:[A-Za-z]:[\\\/][^\s"'<>|,;)]*)|(?<![\w.-])\/(?:[\w.\-]+\/)+[\w.\-]+/g;
 const HOST_PORT = /\b(?:\d{1,3}\.){3}\d{1,3}(?::\d+)?\b/g;
-const SCHEME_URL = /\b[a-z][a-z0-9+.\-]*:\/\/[^\s)]+/gi;
+// The scheme class is bounded ([a-z0-9+.-]{0,31}) on purpose. With an
+// unbounded class, `\b` matches at every letter/dot boundary, so a
+// dot-dense string is re-scanned from each position and the match
+// attempt becomes O(n²): 64 KB of `a.a.a…` cost ~1.9 s for the regex
+// alone (~2.8 s through `sanitizeText`). No real scheme is longer than
+// 32 characters. (Audit fix.)
+const SCHEME_URL = /\b[a-z][a-z0-9+.\-]{0,31}:\/\/[^\s)]+/gi;
 
 // Strip absolute paths, host:port pairs, URLs, and credential-shaped
 // substrings from free text. Shared by `safeErrorMessage` (single line,

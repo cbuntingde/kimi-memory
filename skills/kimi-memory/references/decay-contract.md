@@ -34,4 +34,6 @@ The hook debounces reinforcement to within 60 seconds so re-typing the same prom
 
 ## Migration
 
-`SCHEMA_VERSION = 9` introduced the columns. `SCHEMA_VERSION = 10` then layered on visibility/ACL, tier/persona, wiki, codegraph, and the `skill` type extension. The full migration list lives in `src/persist/connection.js`.
+`SCHEMA_VERSION = 9` introduced the columns. `SCHEMA_VERSION = 10` then layered on visibility/ACL, tier/persona, wiki, codegraph, and the `skill` type extension. The current value is `16`. The full migration list lives in `src/persist/connection.js`.
+
+`openDb` records the version in `PRAGMA user_version` and refuses to open a database whose marker is _newer_ than the running build, so an older checkout cannot re-run its own migrations over an unknown future schema. When the marker is at or below the current build's version the migrations run as before — each is individually idempotent.

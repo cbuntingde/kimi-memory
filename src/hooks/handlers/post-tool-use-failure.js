@@ -1,12 +1,10 @@
-import path from 'node:path';
-
-import { deriveProjectKey } from '../../project-key.js';
-import { openDb } from '../../persist/connection.js';
+import { deriveProjectKey, ensureProjectDir, projectDbPath } from '../../project-key.js';
 import { saveMemory } from '../../persist/memories.js';
 import {
   HOME,
   payloadProjectRoot,
   payloadSessionId,
+  safeOpenDb,
   logDiag,
   emitLines,
   truncate,
@@ -86,12 +84,20 @@ export async function handlePostToolUseFailure(payload) {
         : null;
 
   const projectKey = deriveProjectKey(cwd);
-  const db = openDb(path.join(HOME, 'kimi-memory', projectKey, 'memory.sqlite'));
-
   const title = buildTitle(toolName);
   const nowMs = Date.now();
 
   try {
+    // `safeOpenDb` never lazy-creates: a hook must not create the
+    // project directory, the schema, or run the migration list as a
+    // side effect of observing a tool failure. The open itself lives
+    // inside the try so a busy / corrupt / EPERM open takes the same
+    // fail-open path as the insert below instead of throwing out of the
+    // handler.
+    await ensureProjectDir(HOME, projectKey);
+    const db = safeOpenDb(projectDbPath(HOME, projectKey));
+    if (!db) return { ok: false, reason: 'no_db' };
+
     const existingId = findRecentDuplicate(db, projectKey, title, nowMs);
     if (existingId !== null) {
       emitLines([`[tool-failure] deduped ${existingId} ${title}`]);
@@ -118,7 +124,7 @@ export async function handlePostToolUseFailure(payload) {
     emitLines([`[tool-failure] recorded ${memory.id} ${title}`]);
     return { ok: true, id: memory.id };
   } catch (error) {
-    await logDiag('warn', 'post_tool_use_failure insert failed', {
+    await logDiag('warn', 'post_tool_use_failure write failed', {
       error: error instanceof Error ? error.message : String(error),
     });
     return {
