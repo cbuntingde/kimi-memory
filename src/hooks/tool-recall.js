@@ -19,7 +19,7 @@
 // degrades gracefully.
 
 import { searchMemories } from '../persist.js';
-import { PATH_REGEX, SHELL_VERB_REGEX, firstContentLine } from '../util.js';
+import { PATH_REGEX, SHELL_VERB_REGEX, firstContentLine, singleLine } from '../util.js';
 
 const TOOL_RECALL_MAX = 2;
 // Score floor for a tool-recall hit. Default `minScore=0.01` matches
@@ -82,10 +82,13 @@ function extractQueryFromToolArgs(args) {
 // Render a hit as a `[tool-recall]` line. Mirrors the [recall: i/N]
 // shape so the agent's parser already knows what to do with it.
 function formatHit(memory, { index, total, scope }) {
-  const title = (memory.title || '').trim() || (memory.content || '').slice(0, 80);
-  const truncated = title.length > 80 ? title.slice(0, 80) + '…' : title;
+  // singleLine on both fields: these lines are written to the hook's
+  // stdout, which the runtime feeds back to the model as tool output.
+  // A stored title with a newline would otherwise forge a fresh line
+  // there (stored prompt injection).
+  const truncated = singleLine(memory.title, 80) || singleLine(memory.content, 80);
   const score = memory.score != null ? `, score=${memory.score.toFixed(2)}` : '';
-  const snippet = firstContentLine(memory.content);
+  const snippet = singleLine(firstContentLine(memory.content));
   const tail = snippet ? ` — ${snippet}` : '';
   return `[tool-recall: ${index + 1}/${total}] "${truncated}" (${memory.type}, ${scope}${score})${tail}`;
 }

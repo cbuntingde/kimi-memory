@@ -3,7 +3,7 @@
 //
 // Core memory lifecycle lives here. Search, recall, reinforcement,
 // edges, sharing, and skills all sit in sibling modules.
-import { nowIso, hashId, shortId, safeJsonParse, safeErrorMessage } from '../util.js';
+import { nowIso, hashId, shortId, safeJsonParse, safeErrorMessage, clampInt } from '../util.js';
 import { looksLikeSecret } from '../secrets.js';
 import {
   EMBEDDING_MODEL,
@@ -14,6 +14,7 @@ import {
 } from '../embedding.js';
 import { VISIBILITY_SET as VISIBILITY_VALUES, TIER_SET as TIER_VALUES } from '../vocabulary.js';
 import { linkMemory } from './edges.js';
+import { withSavepoint } from './tx.js';
 
 // Re-export statSync for project.js (re-clone detection).
 // (Note: actually re-exported from connection.js to avoid a node:fs
@@ -298,8 +299,7 @@ export function saveMemory(db, projectKey, input) {
   // save (session-focus, work-log, the deterministic stack summary)
   // was exposed to that corruption window. (Audit fix BUG-7.)
   let supersedesId = input.supersedes || null;
-  db.exec('SAVEPOINT save_memory_supersede');
-  try {
+  withSavepoint(db, 'save_memory_supersede', () => {
     if (input.supersede) {
       const existing = db
         .prepare(
@@ -337,15 +337,7 @@ export function saveMemory(db, projectKey, input) {
         }
       }
     }
-    db.exec('RELEASE SAVEPOINT save_memory_supersede');
-  } catch (e) {
-    try {
-      db.exec('ROLLBACK TO SAVEPOINT save_memory_supersede');
-    } catch {
-      /* ignore */
-    }
-    throw e;
-  }
+  });
 
   const row = db.prepare('SELECT id, created_at FROM memories WHERE id=?').get(id);
   // Dedicated session-focus column: stamped when the metadata carries
@@ -361,9 +353,10 @@ export function saveMemory(db, projectKey, input) {
   // so a throw inside the FTS path could roll back the FTS / synth
   // side while leaving a `memories` row visible to listMemories but
   // invisible to searchMemories (recall depends on the FTS row).
-  // (Audit fix H3.)
-  db.exec('SAVEPOINT save_memory_upsert');
-  try {
+  // (Audit fix H3.) withSavepoint releases the savepoint on the error
+  // path as well, so a failed save cannot strand an open transaction
+  // on the shared connection (see persist/tx.js).
+  withSavepoint(db, 'save_memory_upsert', () => {
     if (row) {
       db.prepare(
         `
@@ -493,15 +486,7 @@ export function saveMemory(db, projectKey, input) {
         }
       }
     }
-    db.exec('RELEASE SAVEPOINT save_memory_upsert');
-  } catch (e) {
-    try {
-      db.exec('ROLLBACK TO SAVEPOINT save_memory_upsert');
-    } catch {
-      /* ignore */
-    }
-    throw e;
-  }
+  });
   const saved = getMemory(db, projectKey, id);
 
   // Fire-and-forget embedding update. Runs as a microtask so saveMemory
@@ -529,7 +514,7 @@ export function listConclusionsFor(db, projectKey, childId, { limit = 50 } = {})
     LIMIT ?
   `,
     )
-    .all(childId, projectKey, Math.max(1, Math.min(200, limit)));
+    .all(childId, projectKey, clampInt(limit, 1, 200));
   return rows.map(rowToMemory);
 }
 
@@ -547,7 +532,7 @@ export function getParents(db, projectKey, conclusionId, { limit = 200 } = {}) {
     LIMIT ?
   `,
     )
-    .all(conclusionId, projectKey, Math.max(1, Math.min(500, limit)));
+    .all(conclusionId, projectKey, clampInt(limit, 1, 500));
   return rows.map(rowToMemory);
 }
 
@@ -685,25 +670,53 @@ export function listMemories(
   }
   if (!includeExpired) where.push("(expires_at IS NULL OR datetime(expires_at) > datetime('now'))");
   const sql = `SELECT * FROM memories WHERE ${where.join(' AND ')} ORDER BY priority DESC, datetime(updated_at) DESC LIMIT ? OFFSET ?`;
-  params.push(Math.max(1, Math.min(500, limit)), Math.max(0, offset));
+  // clampInt, not Math.max/min: a NaN or fractional limit reaches
+  // `LIMIT ?` unchanged and node:sqlite rejects it with "datatype
+  // mismatch".
+  params.push(clampInt(limit, 1, 500), clampInt(offset, 0, Number.MAX_SAFE_INTEGER, 0));
   const rows = db.prepare(sql).all(...params);
   return rows.map(rowToMemory);
 }
 
+// Delete a memory. `hard` removes the row outright along with the rows
+// that hang off it by id — memory_edges, memory_synthesizes, and
+// memories_acl have no foreign key (and no project_key for the ACL
+// table), so nothing else would clean them up. The FTS index is a
+// plain FTS5 table maintained by hand (saveMemory deletes + reinserts),
+// so it needs its own DELETE on both paths. Everything runs inside one
+// savepoint: a failure after the FTS delete but before the row delete
+// used to leave a live row that recall could no longer find.
 export function deleteMemory(db, projectKey, id, { hard = false } = {}) {
   if (hard) {
-    db.prepare('DELETE FROM memories_fts WHERE id=?').run(id);
-    const r = db.prepare('DELETE FROM memories WHERE id=? AND project_key=?').run(id, projectKey);
+    return withSavepoint(db, 'delete_memory_hard', () => {
+      db.prepare('DELETE FROM memory_edges WHERE project_key=? AND (from_id=? OR to_id=?)').run(
+        projectKey,
+        id,
+        id,
+      );
+      db.prepare(
+        'DELETE FROM memory_synthesizes WHERE project_key=? AND (parent_id=? OR child_id=?)',
+      ).run(projectKey, id, id);
+      try {
+        db.prepare('DELETE FROM memories_acl WHERE memory_id=?').run(id);
+      } catch {
+        /* pre-v10 DB without the ACL table */
+      }
+      db.prepare('DELETE FROM memories_fts WHERE id=?').run(id);
+      const r = db.prepare('DELETE FROM memories WHERE id=? AND project_key=?').run(id, projectKey);
+      return r.changes > 0;
+    });
+  }
+  return withSavepoint(db, 'delete_memory_soft', () => {
+    const now = nowIso();
+    const r = db
+      .prepare("UPDATE memories SET status='deleted', updated_at=? WHERE id=? AND project_key=?")
+      .run(now, id, projectKey);
+    if (r.changes) {
+      db.prepare('DELETE FROM memories_fts WHERE id=?').run(id);
+    }
     return r.changes > 0;
-  }
-  const now = nowIso();
-  const r = db
-    .prepare("UPDATE memories SET status='deleted', updated_at=? WHERE id=? AND project_key=?")
-    .run(now, id, projectKey);
-  if (r.changes) {
-    db.prepare('DELETE FROM memories_fts WHERE id=?').run(id);
-  }
-  return r.changes > 0;
+  });
 }
 
 // Save N memories atomically inside one transaction. On any error
@@ -717,29 +730,24 @@ export function deleteMemory(db, projectKey, id, { hard = false } = {}) {
 //
 // (Audit finding F-001 — partial-commit was a bug; the documented
 // all-or-nothing contract is now actually all-or-nothing.)
+//
+// The savepoint (rather than BEGIN/COMMIT) keeps the same all-or-nothing
+// contract at the top level while staying safe when a caller already
+// holds a transaction: a blind ROLLBACK there would have discarded the
+// caller's work along with the batch.
 export function saveMemoryBulk(db, projectKey, inputs) {
   if (!Array.isArray(inputs) || inputs.length === 0) return [];
 
   const results = [];
 
-  db.exec('BEGIN');
-  try {
+  withSavepoint(db, 'save_memory_bulk', () => {
     for (let i = 0; i < inputs.length; i++) {
       // saveMemory throws on any error (secret detection, FK / CHECK
-      // constraint, validation failure). The outer catch below rolls
-      // the whole transaction back, so the batch is genuinely atomic.
+      // constraint, validation failure). The savepoint rollback below
+      // undoes the whole batch, so it is genuinely atomic.
       results.push(saveMemory(db, projectKey, inputs[i]));
     }
-
-    db.exec('COMMIT');
-  } catch (err) {
-    try {
-      db.exec('ROLLBACK');
-    } catch {
-      /* ignore */
-    }
-    throw err;
-  }
+  });
 
   return results;
 }
@@ -822,80 +830,87 @@ export function mergeMemory(
   // The previous shape called saveMemory here despite the docstring
   // claim that it "bypasses" the supersede logic — it did not.
   // (Audit fix M2.)
-  const now1 = nowIso();
-  const mergedContentFinal =
-    typeof mergedContent === 'string' && mergedContent.length > 0 ? mergedContent : into.content;
-  const isSessionFocus = /"session_focus":true/.test(JSON.stringify(into.metadata || {}));
-  db.prepare(
-    `UPDATE memories SET
-       title = ?,
-       content = ?,
-       tags = ?,
-       metadata = ?,
-       provenance = ?,
-       confidence = ?,
-       status = 'active',
-       priority = ?,
-       expires_at = ?,
-       is_session_focus = ?,
-       updated_at = ?
-     WHERE id = ? AND project_key = ?`,
-  ).run(
-    into.title,
-    mergedContentFinal,
-    JSON.stringify(tags),
-    JSON.stringify(into.metadata || {}),
-    JSON.stringify(provenance),
-    typeof into.confidence === 'number' ? into.confidence : 0.8,
-    Number.isFinite(into.priority) ? Math.trunc(into.priority) : 0,
-    into.expires_at || null,
-    isSessionFocus ? 1 : 0,
-    now1,
-    into.id,
-    projectKey,
-  );
-  // Re-seed the FTS index so the merged row is searchable by its new
-  // content. The DELETE-then-INSERT pair mirrors what saveMemory does
-  // and is safe because the FTS5 row is keyed on id only.
-  db.prepare('DELETE FROM memories_fts WHERE id=?').run(into.id);
-  db.prepare(
-    'INSERT INTO memories_fts (id, project_key, type, title, content, tags) VALUES (?, ?, ?, ?, ?, ?)',
-  ).run(into.id, projectKey, into.type, into.title, mergedContentFinal, tags.join(' '));
-  // Reload so the caller sees the post-merge shape.
-  const updated = getMemory(db, projectKey, into.id);
+  //
+  // Every write below (into-update, FTS reseed, from-supersede, FTS
+  // delete, supersedes edge) runs in one savepoint: without it a
+  // half-finished merge left the target row updated while the source
+  // row stayed active and the FTS index disagreed with the table.
+  return withSavepoint(db, 'merge_memory', () => {
+    const now1 = nowIso();
+    const mergedContentFinal =
+      typeof mergedContent === 'string' && mergedContent.length > 0 ? mergedContent : into.content;
+    const isSessionFocus = /"session_focus":true/.test(JSON.stringify(into.metadata || {}));
+    db.prepare(
+      `UPDATE memories SET
+         title = ?,
+         content = ?,
+         tags = ?,
+         metadata = ?,
+         provenance = ?,
+         confidence = ?,
+         status = 'active',
+         priority = ?,
+         expires_at = ?,
+         is_session_focus = ?,
+         updated_at = ?
+       WHERE id = ? AND project_key = ?`,
+    ).run(
+      into.title,
+      mergedContentFinal,
+      JSON.stringify(tags),
+      JSON.stringify(into.metadata || {}),
+      JSON.stringify(provenance),
+      typeof into.confidence === 'number' ? into.confidence : 0.8,
+      Number.isFinite(into.priority) ? Math.trunc(into.priority) : 0,
+      into.expires_at || null,
+      isSessionFocus ? 1 : 0,
+      now1,
+      into.id,
+      projectKey,
+    );
+    // Re-seed the FTS index so the merged row is searchable by its new
+    // content. The DELETE-then-INSERT pair mirrors what saveMemory does
+    // and is safe because the FTS5 row is keyed on id only.
+    db.prepare('DELETE FROM memories_fts WHERE id=?').run(into.id);
+    db.prepare(
+      'INSERT INTO memories_fts (id, project_key, type, title, content, tags) VALUES (?, ?, ?, ?, ?, ?)',
+    ).run(into.id, projectKey, into.type, into.title, mergedContentFinal, tags.join(' '));
+    // Reload so the caller sees the post-merge shape.
+    const updated = getMemory(db, projectKey, into.id);
 
-  // Soft-supersede the from-memory and stamp a back-link. Use raw SQL
-  // so we don't re-fire saveMemory's title-based supersede logic (which
-  // would chase a chain).
-  const now = nowIso();
-  db.prepare(
-    `
-    UPDATE memories
-    SET status='superseded', superseded_by=?, updated_at=?
-    WHERE id=? AND project_key=?
-  `,
-  ).run(intoId, now, fromId, projectKey);
-  db.prepare('DELETE FROM memories_fts WHERE id=?').run(fromId);
+    // Soft-supersede the from-memory and stamp a back-link. Use raw SQL
+    // so we don't re-fire saveMemory's title-based supersede logic (which
+    // would chase a chain).
+    const now = nowIso();
+    db.prepare(
+      `
+      UPDATE memories
+      SET status='superseded', superseded_by=?, updated_at=?
+      WHERE id=? AND project_key=?
+    `,
+    ).run(intoId, now, fromId, projectKey);
+    db.prepare('DELETE FROM memories_fts WHERE id=?').run(fromId);
 
-  // Record the typed supersedes edge in memory_edges so consumers of
-  // the new graph primitive see the relationship too.
-  const edge = linkMemory(db, projectKey, fromId, intoId, 'supersedes', { weight });
+    // Record the typed supersedes edge in memory_edges so consumers of
+    // the new graph primitive see the relationship too.
+    const edge = linkMemory(db, projectKey, fromId, intoId, 'supersedes', { weight });
 
-  // Reload from-side so the caller sees the soft-superseded status.
-  const after = db
-    .prepare('SELECT * FROM memories WHERE id=? AND project_key=?')
-    .get(fromId, projectKey);
-  return {
-    into: updated,
-    from: after ? { ...rowToMemory(after), status: 'superseded', superseded_by: intoId } : null,
-    edge,
-  };
+    // Reload from-side so the caller sees the soft-superseded status.
+    const after = db
+      .prepare('SELECT * FROM memories WHERE id=? AND project_key=?')
+      .get(fromId, projectKey);
+    return {
+      into: updated,
+      from: after ? { ...rowToMemory(after), status: 'superseded', superseded_by: intoId } : null,
+      edge,
+    };
+  });
 }
 
 // Promote pending rows through the processing pipeline.
 // pending -> distilling -> ready (via metadata.processing_status).
 export function promotePendingRows(db, projectKey, { limit = 10 } = {}) {
-  const cap = Math.max(1, Math.min(10, Math.trunc(limit)));
+  const cap = clampInt(limit, 1, 10);
   const rows = db
     .prepare(
       `SELECT id, metadata FROM memories

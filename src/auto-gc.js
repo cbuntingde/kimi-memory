@@ -27,6 +27,7 @@
 
 import { nowIso } from './util.js';
 import { pruneOldLogBackups } from './diagnostics.js';
+import { withSavepoint } from './persist/tx.js';
 
 // ----- Auto-prune thresholds -----
 // All times are days. A row is "ripe" for pruning when it has been
@@ -160,20 +161,16 @@ export function runAutoPrune(db, projectKey, { now = new Date() } = {}) {
   }
 
   // Each DELETE is wrapped in a SAVEPOINT so a constraint failure in
-  // one category doesn't abort the rest. SAVEPOINT is a no-op when
-  // no outer transaction is in flight.
+  // one category doesn't abort the rest. A SAVEPOINT with no enclosing
+  // transaction opens one, so the helper must always release it — see
+  // persist/tx.js.
   const safeDelete = (label, sql, ...args) => {
     try {
-      db.exec(`SAVEPOINT auto_prune_${label}`);
-      const r = db.prepare(sql).run(...args);
-      db.exec(`RELEASE SAVEPOINT auto_prune_${label}`);
-      return r.changes || 0;
+      return withSavepoint(db, `auto_prune_${label}`, () => {
+        const r = db.prepare(sql).run(...args);
+        return r.changes || 0;
+      });
     } catch (e) {
-      try {
-        db.exec(`ROLLBACK TO SAVEPOINT auto_prune_${label}`);
-      } catch {
-        /* ignore */
-      }
       result.error = e && e.message ? e.message : String(e);
       return 0;
     }
@@ -313,16 +310,11 @@ export function runAutoArchive(db, projectKey, { now = new Date() } = {}) {
 
   const safeDelete = (label, sql, ...args) => {
     try {
-      db.exec(`SAVEPOINT auto_archive_${label}`);
-      const r = db.prepare(sql).run(...args);
-      db.exec(`RELEASE SAVEPOINT auto_archive_${label}`);
-      return r.changes || 0;
+      return withSavepoint(db, `auto_archive_${label}`, () => {
+        const r = db.prepare(sql).run(...args);
+        return r.changes || 0;
+      });
     } catch (e) {
-      try {
-        db.exec(`ROLLBACK TO SAVEPOINT auto_archive_${label}`);
-      } catch {
-        /* ignore */
-      }
       result.error = e && e.message ? e.message : String(e);
       return 0;
     }
@@ -476,97 +468,89 @@ export function runAutoTier(db, projectKey, { now = new Date() } = {}) {
     return moved;
   }
 
+  // Wrap the four transitions in a SAVEPOINT rather than BEGIN/COMMIT:
+  // runAutoGcThrottled calls this from inside its own `BEGIN IMMEDIATE`
+  // mutual-exclusion block, and a bare COMMIT here would release that
+  // caller's lock before it stamps `auto_gc_last_run`. The savepoint
+  // rolls back only this function's writes on failure and leaves any
+  // enclosing transaction intact.
   try {
-    db.exec('BEGIN');
-  } catch {
-    /* already in a transaction; ignore */
-  }
-  try {
-    // L0 → L1: reinforced or recalled AUTO_TIER_REINFORCE_TO_L1 times.
-    // We use access_count + a heuristic of recent_reinforce count
-    // extracted from a stability_days growth pattern. The persistence
-    // layer doesn't track reinforce events separately, so we use
-    // access_count as a proxy. A memory with access_count ≥
-    // AUTO_TIER_REINFORCE_TO_L1 is considered "recalled enough".
-    {
-      const ids = db
-        .prepare(
-          `SELECT id FROM memories
-           WHERE project_key = ? AND status = 'active'
-             AND tier = 'L0' AND access_count >= ?`,
-        )
-        .all(projectKey, AUTO_TIER_REINFORCE_TO_L1)
-        .map((r) => r.id);
-      result.promoted_l0_to_l1 = transitionIds(ids, 'L1', 'auto_tier');
-    }
+    withSavepoint(db, 'auto_tier', () => {
+      // L0 → L1: reinforced or recalled AUTO_TIER_REINFORCE_TO_L1 times.
+      // We use access_count + a heuristic of recent_reinforce count
+      // extracted from a stability_days growth pattern. The persistence
+      // layer doesn't track reinforce events separately, so we use
+      // access_count as a proxy. A memory with access_count ≥
+      // AUTO_TIER_REINFORCE_TO_L1 is considered "recalled enough".
+      {
+        const ids = db
+          .prepare(
+            `SELECT id FROM memories
+             WHERE project_key = ? AND status = 'active'
+               AND tier = 'L0' AND access_count >= ?`,
+          )
+          .all(projectKey, AUTO_TIER_REINFORCE_TO_L1)
+          .map((r) => r.id);
+        result.promoted_l0_to_l1 = transitionIds(ids, 'L1', 'auto_tier');
+      }
 
-    // L1 → L2: access_count ≥ AUTO_TIER_ACCESS_TO_L2.
-    {
-      const ids = db
-        .prepare(
-          `SELECT id FROM memories
-           WHERE project_key = ? AND status = 'active'
-             AND tier = 'L1' AND access_count >= ?`,
-        )
-        .all(projectKey, AUTO_TIER_ACCESS_TO_L2)
-        .map((r) => r.id);
-      result.promoted_l1_to_l2 = transitionIds(ids, 'L2', 'auto_tier');
-    }
+      // L1 → L2: access_count ≥ AUTO_TIER_ACCESS_TO_L2.
+      {
+        const ids = db
+          .prepare(
+            `SELECT id FROM memories
+             WHERE project_key = ? AND status = 'active'
+               AND tier = 'L1' AND access_count >= ?`,
+          )
+          .all(projectKey, AUTO_TIER_ACCESS_TO_L2)
+          .map((r) => r.id);
+        result.promoted_l1_to_l2 = transitionIds(ids, 'L2', 'auto_tier');
+      }
 
-    // L2 → L3: at L2 for AUTO_TIER_L2_DAYS days AND access_count ≥
-    // AUTO_TIER_REINFORCE_TO_L3. Curation is hard to undo, so we
-    // require both time + access.
-    {
-      const ids = db
-        .prepare(
-          `SELECT id FROM memories
-           WHERE project_key = ? AND status = 'active'
-             AND tier = 'L2' AND access_count >= ?
-             AND julianday('now') - julianday(updated_at) >= ?`,
-        )
-        .all(projectKey, AUTO_TIER_REINFORCE_TO_L3, AUTO_TIER_L2_DAYS)
-        .map((r) => r.id);
-      result.promoted_l2_to_l3 = transitionIds(ids, 'L3', 'auto_tier');
-    }
+      // L2 → L3: at L2 for AUTO_TIER_L2_DAYS days AND access_count ≥
+      // AUTO_TIER_REINFORCE_TO_L3. Curation is hard to undo, so we
+      // require both time + access.
+      {
+        const ids = db
+          .prepare(
+            `SELECT id FROM memories
+             WHERE project_key = ? AND status = 'active'
+               AND tier = 'L2' AND access_count >= ?
+               AND julianday('now') - julianday(updated_at) >= ?`,
+          )
+          .all(projectKey, AUTO_TIER_REINFORCE_TO_L3, AUTO_TIER_L2_DAYS)
+          .map((r) => r.id);
+        result.promoted_l2_to_l3 = transitionIds(ids, 'L3', 'auto_tier');
+      }
 
-    // L? → L0 demotion: confidence (set by decay) below
-    // AUTO_TIER_DEMOTE_FLOOR for AUTO_TIER_DEMOTE_DAYS. Uses
-    // stability_days/ last_rehearsed_at to approximate the curve
-    // rather than recomputing Math.exp per row — the SessionStart
-    // decay pass already normalises confidence, so anything below
-    // the floor is a candidate for demotion.
-    //
-    // COALESCE(last_rehearsed_at, updated_at): the previous shape
-    // used `last_rehearsed_at` directly, but `julianday(NULL)` is NULL,
-    // and `NULL >= N` is NULL (not true) — every row whose
-    // last_rehearsed_at was NULL (pre-v9 backfill rows, externally-
-    // inserted rows, microsecond-window saves between the column
-    // add and the v9 backfill) was permanently exempt from auto-
-    // demotion even as its confidence decayed. (Audit fix M5.)
-    {
-      const ids = db
-        .prepare(
-          `SELECT id FROM memories
-           WHERE project_key = ? AND status = 'active'
-             AND tier != 'L0' AND confidence < ?
-             AND julianday('now') - julianday(COALESCE(last_rehearsed_at, updated_at)) >= ?`,
-        )
-        .all(projectKey, AUTO_TIER_DEMOTE_FLOOR, AUTO_TIER_DEMOTE_DAYS)
-        .map((r) => r.id);
-      result.demoted_to_l0 = transitionIds(ids, 'L0', 'auto_tier');
-    }
-
-    try {
-      db.exec('COMMIT');
-    } catch {
-      /* already committed; ignore */
-    }
+      // L? → L0 demotion: confidence (set by decay) below
+      // AUTO_TIER_DEMOTE_FLOOR for AUTO_TIER_DEMOTE_DAYS. Uses
+      // stability_days/ last_rehearsed_at to approximate the curve
+      // rather than recomputing Math.exp per row — the SessionStart
+      // decay pass already normalises confidence, so anything below
+      // the floor is a candidate for demotion.
+      //
+      // COALESCE(last_rehearsed_at, updated_at): the previous shape
+      // used `last_rehearsed_at` directly, but `julianday(NULL)` is NULL,
+      // and `NULL >= N` is NULL (not true) — every row whose
+      // last_rehearsed_at was NULL (pre-v9 backfill rows, externally-
+      // inserted rows, microsecond-window saves between the column
+      // add and the v9 backfill) was permanently exempt from auto-
+      // demotion even as its confidence decayed. (Audit fix M5.)
+      {
+        const ids = db
+          .prepare(
+            `SELECT id FROM memories
+             WHERE project_key = ? AND status = 'active'
+               AND tier != 'L0' AND confidence < ?
+               AND julianday('now') - julianday(COALESCE(last_rehearsed_at, updated_at)) >= ?`,
+          )
+          .all(projectKey, AUTO_TIER_DEMOTE_FLOOR, AUTO_TIER_DEMOTE_DAYS)
+          .map((r) => r.id);
+        result.demoted_to_l0 = transitionIds(ids, 'L0', 'auto_tier');
+      }
+    });
   } catch (e) {
-    try {
-      db.exec('ROLLBACK');
-    } catch {
-      /* ignore */
-    }
     result.error = e && e.message ? e.message : String(e);
   }
   return result;

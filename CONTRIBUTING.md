@@ -63,9 +63,14 @@ to keep CI fast.
    `src/mcp/handlers/` with `registerTool(server, D.<name>, …)`.
 3. Use Zod for input validation (`z.enum`, `z.string`, `z.number().min()
 .max()`).
-4. Validate `cwd` via `resolveProjectRoot(args.cwd)` and refuse if
-   `!pr.ok`.
+4. Declare `cwd` in the Zod schema whenever the handler touches a
+   project database. `registerTool` reads the schema: a tool that
+   declares `cwd` gets `resolveProjectRoot(args.cwd)` and is refused
+   when `!pr.ok`; a tool that does not (see `memory_diagnostics`) is
+   registered with `skipDb: true` and opens no database.
 5. Wrap the handler in `try { … } catch (e) { return textError(...); }`.
+   The wrapper already routes the message through `safeErrorMessage`,
+   so do not build a path-bearing error string by hand.
 6. Add the tool name to `kimi.plugin.json`'s `interface.longDescription`
    so the plugin manifest matches the runtime surface.
 7. Write a focused test in a new or existing `tests/NN-*.test.js`.

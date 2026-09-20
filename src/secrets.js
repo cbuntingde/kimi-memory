@@ -39,6 +39,9 @@ const PROVIDER_KEY_SOURCE = [
   'npm_[A-Za-z0-9]{36}', // npm automation token
   'hf_[A-Za-z0-9]{30,}', // Hugging Face
   'AIza[0-9A-Za-z_-]{35}', // Google API key
+  'GOCSPX-[A-Za-z0-9_-]{16,}', // Google OAuth client secret
+  'SG\\.[A-Za-z0-9_-]{16,}\\.[A-Za-z0-9_-]{16,}', // SendGrid API key
+  'https://hooks\\.slack\\.com/services/[A-Za-z0-9_/-]{20,}', // Slack incoming webhook
   'eyJ[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}\\.[A-Za-z0-9_-]{10,}', // JWT
 ].join('|');
 
@@ -46,12 +49,12 @@ const PROVIDER_KEY_RE = new RegExp(`\\b(?:${PROVIDER_KEY_SOURCE})\\b`);
 const PROVIDER_KEY_RE_G = new RegExp(`\\b(?:${PROVIDER_KEY_SOURCE})\\b`, 'g');
 
 // ---------------------------------------------------------------------
-// Assigned secrets: `name = value` / `"name": "value"`.
+// Assigned secrets: `name = value` / `"name": "value"` / `name value`.
 //
-// The leading boundary accepts quote / brace / bracket / paren so a
-// JSON-encoded or TOML-encoded key (`{"api_key": "…"}`) matches — the
-// previous `[\s,;]`-only boundary missed every quoted key name, which
-// is the single most common shape a credential appears in.
+// The leading boundary accepts any non-alphanumeric character, so a
+// JSON-encoded or TOML-encoded key (`{"api_key": "…"}`), a CLI flag
+// (`--api-key=…`), a dotted or slashed name all match. A name therefore
+// still has to start a token; only the set of legal separators widened.
 //
 // The name alternation carries an optional dotted/underscored prefix
 // (bounded, to keep backtracking flat) so `AWS_SECRET_ACCESS_KEY` and
@@ -63,29 +66,67 @@ const PROVIDER_KEY_RE_G = new RegExp(`\\b(?:${PROVIDER_KEY_SOURCE})\\b`, 'g');
 // ---------------------------------------------------------------------
 const SECRET_NAME_SOURCE =
   '(?:[A-Za-z0-9]{1,32}[_.-]){0,4}' +
-  '(?:api[_-]?key|apikey|api[_-]?token|access[_-]?token|auth[_-]?token|bearer[_-]?token|' +
-  'refresh[_-]?token|id[_-]?token|secret[_-]?access[_-]?key|access[_-]?key[_-]?id|' +
-  'secret[_-]?key|client[_-]?secret|private[_-]?key|password|passwd|pwd|token|secret)';
+  '(?:api[_-]?key|apikey|api[_-]?secret|api[_-]?token|access[_-]?token|auth[_-]?token|' +
+  'bearer[_-]?token|refresh[_-]?token|id[_-]?token|secret[_-]?access[_-]?key|' +
+  'access[_-]?key[_-]?id|shared[_-]?access[_-]?key|account[_-]?key|secret[_-]?key|' +
+  'client[_-]?secret|private[_-]?key|signing[_-]?key|password|passwd|pwd|token|secret)';
 
 // The boundary is a CAPTURING group (and the value is not) so the
 // redaction replacement can put the boundary back with `$1`. Getting
 // this backwards silently leaves the secret bytes in the output while
 // still appending the token — see tests/49-secret-coverage.test.js,
 // which asserts the original bytes are gone.
-const ASSIGNMENT_BOUNDARY = '(^|[\\s,;{\\[(])';
+//
+// The class is "anything that is not a letter or digit" rather than an
+// explicit separator list: a name always begins a token, and the four
+// separators the previous `[\s,;{\[(]` class omitted are the common
+// ones — `--api-key=…` (dash), `com.example.api_key=…` (dot),
+// `conf/token=…` (slash) and `NAME=value` (the `=` of the assignment).
+const ASSIGNMENT_BOUNDARY = '(^|[^A-Za-z0-9])';
 const ASSIGNMENT_SOURCE = `${ASSIGNMENT_BOUNDARY}["']?${SECRET_NAME_SOURCE}["']?\\s*[:=]\\s*["']?(?:[^\\s"',;]{8,})`;
 const ASSIGNMENT_RE = new RegExp(ASSIGNMENT_SOURCE, 'i');
 const ASSIGNMENT_RE_G = new RegExp(ASSIGNMENT_SOURCE, 'gi');
 
+// Whitespace-separated form: `AWS_SECRET_ACCESS_KEY <value>`. The `=`
+// form above misses it because the value class stops at whitespace.
+//
+// Two lookaheads keep ordinary prose out. The value must be at least 16
+// characters, and it must contain a digit — real credentials almost
+// always carry one, while the long English words that follow a key-ish
+// noun ("token authentication", "secret management", "password
+// implementation", "token case-insensitive") do not.
+const ASSIGNMENT_WS_SOURCE =
+  `${ASSIGNMENT_BOUNDARY}["']?${SECRET_NAME_SOURCE}["']?[ \\t]+` +
+  '(?=[^\\s"\',;]{16,})(?=[^\\s"\',;]*[0-9])[^\\s"\',;]+';
+const ASSIGNMENT_WS_RE = new RegExp(ASSIGNMENT_WS_SOURCE, 'i');
+const ASSIGNMENT_WS_RE_G = new RegExp(ASSIGNMENT_WS_SOURCE, 'gi');
+
 // ---------------------------------------------------------------------
 // Connection strings that embed a username:password pair.
 //
-// Requires the `scheme://user:pass@host` shape, so a plain
+// The authority has to carry a `user:pass@` pair, so a plain
 // `DATABASE_URL=postgres://localhost/db` (no credentials) is left alone.
+//
+// The name part is optional so a bare URL whose authority carries a
+// user:password pair is caught on its own. It is deliberately
+// unconstrained rather than the old `…(?:url|dsn|uri|connection_string)`
+// list: when the name is present the whole `NAME=url` pair has to be
+// consumed, otherwise redacting only the URL leaves `DB_PASSWORD=`
+// behind and the leftover re-matches the assignment rule on the next
+// pass.
+//
+// Every quantifier inside the URL is bounded and the userinfo classes
+// exclude `/` (RFC 3986 does not allow `/` in userinfo). Together that
+// is what keeps the scan from degenerating on input that contains many
+// `://` and no `@`: without the `/` exclusion the engine rescans the
+// length of the password bound at every `://` site. The scanner runs on
+// every write, so this matters more than the unlikely password with a
+// literal slash in it.
 // ---------------------------------------------------------------------
-const CONNECTION_SOURCE =
-  `${ASSIGNMENT_BOUNDARY}["']?[A-Za-z0-9_.-]{0,64}(?:url|dsn|uri|connection[_-]?string)["']?\\s*[:=]\\s*["']?` +
-  '(?:[a-z][a-z0-9+.-]*://[^\\s"\',;@]*:[^\\s"\',;@]*@[^\\s"\',;]+)';
+const CONNECTION_NAME_SOURCE = '["\']?[A-Za-z0-9_.-]{0,64}["\']?\\s*[:=]\\s*["\']?';
+const CONNECTION_URL_SOURCE =
+  '[a-z][a-z0-9+.-]{0,32}://[^\\s"\',;@/:]{1,64}:[^\\s"\',;@/]{0,128}@[^\\s"\',;]{1,256}';
+const CONNECTION_SOURCE = `${ASSIGNMENT_BOUNDARY}(?:${CONNECTION_NAME_SOURCE})?(?:${CONNECTION_URL_SOURCE})`;
 const CONNECTION_RE = new RegExp(CONNECTION_SOURCE, 'i');
 const CONNECTION_RE_G = new RegExp(CONNECTION_SOURCE, 'gi');
 
@@ -98,6 +139,62 @@ const BEARER_RE_G = /Authorization\s*:\s*Bearer\s+[A-Za-z0-9_.-]{20,}/gi;
 
 const BASIC_RE = /Authorization\s*:\s*Basic\s+[A-Za-z0-9+/=]{16,}/i;
 const BASIC_RE_G = /Authorization\s*:\s*Basic\s+[A-Za-z0-9+/=]{16,}/gi;
+
+// ---------------------------------------------------------------------
+// High-entropy fallback: bare tokens with no known prefix and no
+// assignment name (`aB3d…`), the shape the audit matrix calls out as
+// the last hole. Length and entropy alone cannot separate a random
+// token from a long identifier, so the bar is deliberately
+// conservative and the exclusions are explicit:
+//
+//   * `[A-Za-z0-9_+=-]` run of 32+ characters — base64 / base64url /
+//     hex. `/` is excluded so filesystem paths and URLs do not become
+//     one giant candidate.
+//   * lower AND upper AND digit must all appear. That alone drops git
+//     SHAs and UUIDs (hex, one case), snake_case and SCREAMING_SNAKE
+//     identifiers, and all-lowercase no-space prose runs.
+//   * entirely-hex runs are refused outright: a 40-char git SHA and a
+//     40-char hex token are indistinguishable by entropy.
+//   * Shannon entropy >= 4.5 bits/char. Random 40-char base64url tokens
+//     measure ~4.5 and up (4.47 at p1, 4.78 at the median); camelCase
+//     identifiers top out around 4.4. The threshold is above every
+//     benign sample in tests/49-secret-coverage.test.js, which is what
+//     keeps ordinary prose, paths and identifiers clean.
+//
+// Consequence, accepted on purpose: a 32-char random token whose
+// characters happen to repeat enough to fall under the bar is missed.
+// The false-positive direction is the expensive one here.
+// ---------------------------------------------------------------------
+const HIGH_ENTROPY_SOURCE = '[A-Za-z0-9_+=-]{32,}';
+const HIGH_ENTROPY_RE = new RegExp(HIGH_ENTROPY_SOURCE, 'g');
+const HIGH_ENTROPY_HEX_RE = /^[0-9a-fA-F]+$/;
+const HIGH_ENTROPY_MIN_BITS_PER_CHAR = 4.5;
+
+function shannonBitsPerChar(s) {
+  const counts = new Map();
+  for (const ch of s) counts.set(ch, (counts.get(ch) || 0) + 1);
+  let bits = 0;
+  for (const n of counts.values()) {
+    const p = n / s.length;
+    bits -= p * Math.log2(p);
+  }
+  return bits;
+}
+
+function isHighEntropyToken(token) {
+  if (HIGH_ENTROPY_HEX_RE.test(token)) return false;
+  if (!/[a-z]/.test(token) || !/[A-Z]/.test(token) || !/[0-9]/.test(token)) return false;
+  return shannonBitsPerChar(token) >= HIGH_ENTROPY_MIN_BITS_PER_CHAR;
+}
+
+function hasHighEntropyToken(text) {
+  HIGH_ENTROPY_RE.lastIndex = 0;
+  let m;
+  while ((m = HIGH_ENTROPY_RE.exec(text)) !== null) {
+    if (isHighEntropyToken(m[0])) return true;
+  }
+  return false;
+}
 
 // ---------------------------------------------------------------------
 // Detection
@@ -113,7 +210,9 @@ export function looksLikeSecret(text) {
     BEARER_RE.test(text) ||
     BASIC_RE.test(text) ||
     CONNECTION_RE.test(text) ||
-    ASSIGNMENT_RE.test(text)
+    ASSIGNMENT_RE.test(text) ||
+    ASSIGNMENT_WS_RE.test(text) ||
+    hasHighEntropyToken(text)
   );
 }
 
@@ -135,6 +234,11 @@ export function redactSecrets(text) {
   // credentials inside the URL are consumed by the more specific match.
   out = out.replace(CONNECTION_RE_G, '$1[REDACTED_CONNECTION_STRING]');
   out = out.replace(ASSIGNMENT_RE_G, '$1[REDACTED_ASSIGNED_SECRET]');
+  out = out.replace(ASSIGNMENT_WS_RE_G, '$1[REDACTED_ASSIGNED_SECRET]');
+  // Lowest confidence, so it runs last and never pre-empts a named shape.
+  out = out.replace(HIGH_ENTROPY_RE, (m) =>
+    isHighEntropyToken(m) ? '[REDACTED_HIGH_ENTROPY]' : m,
+  );
   return out;
 }
 

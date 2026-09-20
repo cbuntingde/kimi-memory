@@ -9,13 +9,20 @@
 //     const db = openScopeDb({ cwd: pr.value, scope: sc.value, record: write });
 //     return ok(await handler(args, { cwd: pr.value, scope: sc.value, db, projectKey }));
 //   } catch (e) {
-//     return textError(toError(e).error);
+//     return textError(safeErrorMessage(e));
 //   }
 //
 // Each per-tool handler is now a plain async function that returns
 // its payload and throws `toolError(msg)` on failure. The wrapper
 // catches ToolError specifically so the user-facing message is the
-// thrown string verbatim (no double-encoding through toError).
+// thrown string (no double-encoding), still scrubbed through
+// safeErrorMessage so an embedded filesystem path never reaches the
+// model.
+//
+// Every failure mode returns through safeErrorMessage: the raw driver
+// text used to be forwarded verbatim, which reproduced as
+//   memory_reset_project -> {"error":"no project DB at C:\\Users\\…\\memory.sqlite"}
+// leaking the home layout and the project key into the agent context.
 //
 // `handlers` (optional Map<name, async fn>) is populated with the
 // post-resolve handler so the proxy can call a tool by name without
@@ -23,7 +30,8 @@
 // dependency on the SDK's private `_registeredTools` / `_tools`
 // fields.
 
-import { resolveProjectRoot, validateScope, toError } from '../../validation.js';
+import { resolveProjectRoot, validateScope } from '../../validation.js';
+import { safeErrorMessage } from '../../util.js';
 import { openScopeDb, ok, textError } from './scope-db.js';
 import { ToolError } from './tool-error.js';
 
@@ -54,6 +62,12 @@ export function registerTool(server, def, handler, handlers, home) {
   } else {
     effectiveSkipScopeValidation = true;
   }
+  // Same schema-driven auto-detection for the project root: a def whose
+  // input has no `cwd` key is declaring that it does not need one.
+  // memory_diagnostics is the only such tool — it reads the
+  // cross-project diagnostics log, so demanding a cwd made every call
+  // fail with "project cwd is required" (it touches no project DB).
+  const needsProjectRoot = !input || Object.prototype.hasOwnProperty.call(input, 'cwd');
   // Auto-detect write tools from the tool name. Write tools must
   // create the project / global DB on first use (or stamp the
   // project_paths row); read tools must NOT create the global DB on
@@ -67,8 +81,12 @@ export function registerTool(server, def, handler, handlers, home) {
   }
   const wrapped = async (args) => {
     try {
-      const pr = resolveProjectRoot(args.cwd);
-      if (!pr.ok) return textError(pr.error);
+      let cwd = null;
+      if (needsProjectRoot) {
+        const pr = resolveProjectRoot(args.cwd);
+        if (!pr.ok) return textError(pr.error);
+        cwd = pr.value;
+      }
       const sc = effectiveSkipScopeValidation
         ? { ok: true, value: args.scope ?? null }
         : validateScope(args.scope, { read: effectiveReadScope });
@@ -76,21 +94,25 @@ export function registerTool(server, def, handler, handlers, home) {
       const dbHandle = skipDb
         ? { db: null, projectKey: null }
         : openScopeDb({
-            cwd: pr.value,
+            cwd,
             scope: sc.value,
             record: write,
             home,
           });
       const result = await handler(args, {
-        cwd: pr.value,
+        cwd,
         scope: sc.value,
         db: dbHandle.db,
         projectKey: dbHandle.projectKey,
       });
       return ok(result);
     } catch (e) {
-      if (e instanceof ToolError) return textError(e.message);
-      return textError(toError(e).error);
+      // Scrubbed, including for ToolError: a handler message can embed
+      // the on-disk DB path (memory_reset_project's "no project DB at
+      // C:\\Users\\…"), which leaks the home layout and the project key
+      // to the model. safeErrorMessage reduces path-shaped fragments to
+      // `<path>` and leaves ordinary validation text untouched.
+      return textError(safeErrorMessage(e instanceof ToolError ? e.message : e));
     }
   };
   server.tool(name, desc, input, wrapped);

@@ -151,12 +151,20 @@ export async function withAutoExtractRetry(
 
 // Wrapper for LLM call retry with specific handling for API errors.
 //
-// The attempt budget is deliberately small. The only production caller is
-// the auto-extract pass inside the Stop hook, which the manifest gives a
-// 15s timeout, and each attempt can burn up to `LLM_TIMEOUT_MS` (4s) in
-// `extract.js`. Two attempts plus one short backoff is ~8.5s worst case,
-// leaving the hook room to finish. Three attempts at the old 2s base,
-// with a 30s delay cap, could have overrun the hook timeout.
+// Budget arithmetic — the Stop hook is the only production caller, and the
+// dispatcher kills the process at its own ceiling before the manifest
+// timeout fires (src/hooks/run.js: HOOK_TIMEOUTS_MS.Stop = 14000, under the
+// 15s manifest budget in kimi.plugin.json):
+//
+//   worst case = maxAttempts x LLM_TIMEOUT_MS + one backoff
+//              = 2 x 4000ms + min(1000 x 2^0, maxDelayMs) + jitter
+//              = 8000ms + ~1100ms
+//              ≈ 9.1s  →  ~5s of slack under the ceiling
+//
+// Three attempts at a 2000ms base with a 30s delay cap (the pre-audit
+// shape) would have reached ~14s and been killed mid-flight. The defaults
+// below match what `auto-extract` passes so a caller that forgets them
+// cannot overrun the ceiling by accident.
 export async function withLlmRetry(
   fn,
   { projectKey, maxAttempts = 2, baseDelayMs = 500, maxDelayMs = 1000 } = {},
@@ -181,7 +189,11 @@ export async function withLlmRetry(
       ) {
         return false;
       }
-      if (typeof code === 'number' && code >= 500) return true;
+      // A structured HTTP failure: `callChat` in extract.js attaches the
+      // response status as `code`, so a 5xx / 408 / 429 is transient while
+      // every other 4xx (401 auth, 404 missing model, 422 bad request) is
+      // permanent and must not burn the rest of the budget.
+      if (typeof code === 'number') return code >= 500 || code === 408 || code === 429;
       if (typeof code === 'string' && /ECONNRESET|ECONNREFUSED|ENOTFOUND|ETIMEDOUT/.test(code)) {
         return true;
       }

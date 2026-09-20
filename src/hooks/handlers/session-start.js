@@ -29,6 +29,10 @@ import {
   readLatestSessionFocus,
   buildSessionFocusLine,
   firstContentLine,
+  singleLine,
+  RECALL_FENCE_BEGIN,
+  RECALL_FENCE_END,
+  stripRecallMarkers,
 } from './_helpers.js';
 import { runConsolidate } from '../../consolidate.js';
 import { retryFailedEmbeddings } from '../embed-retry.js';
@@ -158,13 +162,20 @@ export async function handleSessionStart(payload) {
         { limit: 2, perType: true, includeScore: true },
       );
       const topRecall = [...recallHits].sort((a, b) => (b.score || 0) - (a.score || 0)).slice(0, 2);
+      // Same stored-injection surface as the UserPromptSubmit recall
+      // block: these lines land in the session's hook output, so the
+      // memory-derived fields are squeezed onto one line each and the
+      // whole block is fenced with the shared markers.
+      if (topRecall.length > 0) lines.push(RECALL_FENCE_BEGIN);
       for (const m of topRecall) {
-        const raw = (m.title || '').trim() || (m.content || '').slice(0, 80);
-        const truncated = raw.length > 80 ? raw.slice(0, 80) + '…' : raw;
-        const snippet = firstContentLine(m.content);
+        const truncated =
+          singleLine(stripRecallMarkers(m.title), 80) ||
+          singleLine(stripRecallMarkers(m.content), 80);
+        const snippet = singleLine(stripRecallMarkers(firstContentLine(m.content)));
         const tail = snippet ? ` — ${snippet}` : '';
         lines.push(`[recall: project] "${truncated}" (${m.type}, project)${tail}`);
       }
+      if (topRecall.length > 0) lines.push(RECALL_FENCE_END);
     } catch {
       // recall is best-effort at SessionStart
     }

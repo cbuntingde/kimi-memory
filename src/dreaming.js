@@ -29,7 +29,15 @@
 // Fail-open: every step is wrapped. A partial run is recorded with
 // the error in `last_run.error`; the next SessionStart decides again.
 
-import { promises as fs, mkdirSync, readFileSync, writeFileSync, existsSync } from 'node:fs';
+import {
+  promises as fs,
+  mkdirSync,
+  readFileSync,
+  writeFileSync,
+  renameSync,
+  unlinkSync,
+  existsSync,
+} from 'node:fs';
 import path from 'node:path';
 import { nowIso, safeJsonParse, asString } from './util.js';
 import { kimiHome } from './util.js';
@@ -144,21 +152,44 @@ function writeJsonSafe(p, payload) {
   } catch {
     /* ignore */
   }
-  // crash must not leave a half-written state file.
+  // Write to a sibling temp file and rename it into place: a crash must
+  // not leave a half-written state file, and rename() is atomic within a
+  // directory on POSIX and NTFS alike (Node maps it to MoveFileEx with
+  // MOVEFILE_REPLACE_EXISTING on Windows, so an existing target is
+  // overwritten rather than raising EEXIST — the old copyFileSync dance
+  // existed for that reason but also left the temp file behind whenever
+  // the copy failed).
   const tmp = p + '.tmp';
-  writeFileSync(tmp, JSON.stringify(payload, null, 2));
-  // Node's fs.renameSync overwrites on POSIX; on Windows it throws
-  // EEXIST if the target exists. copyFileSync + unlinkSync works
-  // portably and atomically-enough for our purposes.
+  let body;
   try {
-    require('node:fs').copyFileSync(tmp, p);
-    require('node:fs').unlinkSync(tmp);
+    body = JSON.stringify(payload, null, 2);
+    writeFileSync(tmp, body);
+    renameSync(tmp, p);
     return true;
-  } catch {
+  } catch (e) {
+    // The rename failed (or the temp write did). Remove the orphan temp
+    // file either way, then try a direct non-atomic write as a last
+    // resort: a torn state file is recoverable, a missing one loses the
+    // scheduling clock.
     try {
-      writeFileSync(p, JSON.stringify(payload, null, 2));
-      return true;
+      unlinkSync(tmp);
     } catch {
+      /* the temp file was never created */
+    }
+    try {
+      writeFileSync(p, body);
+      return true;
+    } catch (fallbackError) {
+      // Never swallowed silently — a dreaming state file that stops
+      // updating is otherwise invisible until the interval stops firing.
+      try {
+        process.stderr.write(
+          `[kimi-memory] dreaming state write failed (${p}): ` +
+            `${e && e.message}; fallback: ${fallbackError && fallbackError.message}\n`,
+        );
+      } catch {
+        /* stderr closed */
+      }
       return false;
     }
   }

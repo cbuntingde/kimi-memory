@@ -221,9 +221,50 @@ export function firstContentLine(content) {
   return truncate(first, 120);
 }
 
+// Collapse arbitrary (possibly attacker-authored) text onto a single
+// safe line for injection into the agent's context.
+//
+// The threat: a memory title or snippet is stored verbatim by
+// memory_save and later rendered into `hookSpecificOutput.additionalContext`
+// / the hook stdout. A title containing `\n` therefore starts a fresh
+// line inside the agent's injected instructions, where text like
+// `SYSTEM: ignore all previous instructions…` reads as an instruction
+// rather than as stored data (stored prompt injection). Newlines, C0/C1
+// control characters, tabs, and the Unicode line/paragraph separators
+// all have to go; length has to be bounded so a huge row cannot push
+// the real instructions out of the window.
+//
+// Every memory-derived field that reaches injected context goes through
+// here: recall titles/snippets, working-memory previews, thread labels,
+// tool-recall labels.
+export function singleLine(text, cap = 200) {
+  if (typeof text !== 'string' || !text) return '';
+  // Replace C0/C1 controls (including tab / CR / LF / VT / FF) with a
+  // space, then collapse every remaining whitespace run — \s covers
+  // U+2028 and U+2029 — and trim.
+  const collapsed = text
+    .replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  if (collapsed.length <= cap) return collapsed;
+  // Slice on a code-point boundary so the cap cannot leave a lone
+  // surrogate that the terminal renders as a replacement character.
+  return sliceCodePointSafe(collapsed, cap) + '…';
+}
+
 export function clamp(n, lo, hi) {
   if (!Number.isFinite(n)) return lo;
   return Math.min(Math.max(n, lo), hi);
+}
+
+// Same as clamp, but coerced to an integer. Callers bind the result to
+// `LIMIT ?` / `OFFSET ?`, and node:sqlite raises SQLITE_MISMATCH
+// ("datatype mismatch") when a float or NaN reaches those slots — so the
+// truncation and the non-finite fallback are load-bearing, not cosmetic.
+// `fallback` defaults to `lo`, which is the safe floor for a limit.
+export function clampInt(n, lo, hi, fallback = lo) {
+  const v = Number.isFinite(n) ? Math.trunc(n) : fallback;
+  return Math.min(Math.max(v, lo), hi);
 }
 
 // Best-effort path-shaped token match used by the hook recall layer.
@@ -239,8 +280,12 @@ export const SHELL_VERB_REGEX =
 // Sanitize an exception for return to a remote caller. Strips
 // absolute-path fragments, host:port fragments, and long stack dumps
 // that could leak filesystem layout, internal IPs, or library versions
-// to the agent context. Used by every code path that wraps a caught
-// error into an MCP tool response or a CLI line. (Audit fix.)
+// to the agent context. (Audit fix.)
+//
+// Callers: the MCP tool wrapper (src/mcp/lib/register-tool.js), the
+// HTTP proxy's error responses, the auto-extract retry path, and the
+// persist-layer embed error path. It is not yet universal — handlers
+// that build their own error strings are responsible for using it.
 //
 // The shape mirrors toError in src/validation.js but applies a stricter
 // regex so a caller who simply forwards `(e && e.message)` does not

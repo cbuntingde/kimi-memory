@@ -108,8 +108,13 @@ export function runAutoGcThrottled(db, projectKey) {
 
   let prune = null;
   let archive = null;
+  // Tracks whether *this* call opened the transaction. `BEGIN IMMEDIATE`
+  // throws when the connection already has a transaction open, and a
+  // blind ROLLBACK in the catch would then discard the caller's work.
+  let began = false;
   try {
     db.exec('BEGIN IMMEDIATE');
+    began = true;
     let lastRun = null;
     try {
       const row = db.prepare('SELECT value FROM schema_meta WHERE key = ?').get('auto_gc_last_run');
@@ -140,11 +145,14 @@ export function runAutoGcThrottled(db, projectKey) {
       }
     }
     db.exec('COMMIT');
+    began = false;
   } catch (e) {
-    try {
-      db.exec('ROLLBACK');
-    } catch {
-      /* ignore */
+    if (began) {
+      try {
+        db.exec('ROLLBACK');
+      } catch {
+        /* ignore */
+      }
     }
     prune = { error: e && e.message ? e.message : String(e) };
     archive = { error: e && e.message ? e.message : String(e) };
