@@ -629,6 +629,17 @@ test('CLI: prune dry-run reports orphans without deleting them', async () => {
     mcp.stop();
     // Now the project DB has project_paths.canonical_root set; remove
     // the cwd and ask the CLI to prune.
+    // The project key is a hash of the *realpath-resolved* root, and a
+    // short (8.3) spelling of a path only resolves while that path
+    // exists: on the Windows runner the temp dir is
+    // C:\Users\RUNNER~1\AppData\Local\Temp, so a
+    // deriveProjectKey(orphanCwd) taken after the rmSync below hashes
+    // the unresolved RUNNER~1 spelling and misses the key the product
+    // recorded. Identify the orphan by the canonical_root the write
+    // path stamped instead — canonicalizeRoot is a pure string
+    // normalisation with no file-system access, so it yields the same
+    // value before and after the directory is gone.
+    const recordedRoot = canonicalizeRoot(orphanCwd);
     rmSync(orphanCwd, { recursive: true, force: true });
     const out = execFileSync(
       process.execPath,
@@ -638,13 +649,13 @@ test('CLI: prune dry-run reports orphans without deleting them', async () => {
     const j = JSON.parse(out);
     assert.equal(j.operation, 'prune');
     assert.equal(j.apply, false);
-    const orphan = j.candidates.find((c) => c.project_key === deriveProjectKey(orphanCwd));
+    const orphan = j.candidates.find((c) => c.canonical_root === recordedRoot);
     assert.ok(orphan, 'orphan project is reported');
     assert.equal(orphan.action, 'would-remove');
     assert.equal(orphan.exists_on_disk, false);
     // The DB file must still be on disk — dry run is non-destructive.
     assert.ok(
-      existsSync(projectDbPath(home, deriveProjectKey(orphanCwd))),
+      existsSync(projectDbPath(home, orphan.project_key)),
       'dry run did not delete the file',
     );
   } finally {
