@@ -191,6 +191,10 @@ export function assertNoSecret(input) {
         break;
       }
     }
+  } else if (typeof input.tags === 'string' && looksLikeSecret(input.tags)) {
+    // A scalar tags value is still persisted via JSON.stringify on
+    // both branches, so it must still be scanned. (Review finding M4.)
+    matched.push('tags');
   }
   // The metadata object's string values, recursively. Stash the
   // serialised JSON as a fallback for shapes the recursion can't
@@ -210,6 +214,10 @@ export function assertNoSecret(input) {
   }
   if (input.metadata && typeof input.metadata === 'object') {
     scan(input.metadata, 'metadata');
+  } else if (typeof input.metadata === 'string' && looksLikeSecret(input.metadata)) {
+    // Scalar metadata is persisted on the UPDATE branch via
+    // JSON.stringify. (Review finding M4.)
+    matched.push('metadata');
   }
   // Provenance is caller-supplied JSON that lands in the row. The
   // prior scan covered only title / content / tags / metadata — a
@@ -217,6 +225,30 @@ export function assertNoSecret(input) {
   // (Audit finding F-007.)
   if (input.provenance && typeof input.provenance === 'object') {
     scan(input.provenance, 'provenance');
+  } else if (typeof input.provenance === 'string' && looksLikeSecret(input.provenance)) {
+    matched.push('provenance');
+  }
+  // Identity + grant columns are caller-supplied strings persisted
+  // verbatim on both INSERT and UPDATE. shared_with is MCP-accepted;
+  // the identity columns arrive via the hook layer and CLI import.
+  // (Review finding M4.)
+  for (const name of ['team_id', 'agent_id', 'user_id', 'session_id', 'task_id', 'persona_id']) {
+    if (typeof input[name] === 'string' && looksLikeSecret(input[name])) {
+      matched.push(name);
+    }
+  }
+  if (Array.isArray(input.shared_with)) {
+    for (const g of input.shared_with) {
+      if (typeof g === 'string' && looksLikeSecret(g)) {
+        matched.push('shared_with');
+        break;
+      }
+    }
+  }
+  // processing_status is folded into the stored metadata by
+  // saveMemory, but the gate above only sees input.metadata.
+  if (typeof input.processing_status === 'string' && looksLikeSecret(input.processing_status)) {
+    matched.push('processing_status');
   }
   if (matched.length === 0) return;
   // De-dupe matched paths so the error message is concise.
@@ -364,7 +396,17 @@ export function saveMemory(db, projectKey, input) {
         }
       }
     }
-    const row = db.prepare('SELECT id, created_at FROM memories WHERE id=?').get(id);
+    // Scoped read: an id is only writable in the caller's own
+    // scope. Today every live caller already routes (MCP save takes
+    // no id, update pre-reads scoped, import stamps the caller key),
+    // so this is a backstop against a cross-scope rewrite that would
+    // also desync memories_fts.project_key. (Review finding F3.)
+    const row = db.prepare('SELECT id, created_at, project_key FROM memories WHERE id=?').get(id);
+    if (row && row.project_key !== projectKey) {
+      throw new Error(
+        `saveMemory: id ${id} belongs to a different scope (stored '${row.project_key}', caller '${projectKey}')`,
+      );
+    }
     // Dedicated session-focus column: stamped when the metadata carries
     // the canonical flag. The hook thread's read path queries this
     // column instead of `instr(metadata, '"session_focus":true') > 0`,
@@ -433,7 +475,7 @@ export function saveMemory(db, projectKey, input) {
           is_session_focus = CASE WHEN ? THEN ? ELSE is_session_focus END,
           updated_at = ?,
           last_rehearsed_at = ?
-        WHERE id = ?
+        WHERE id = ? AND project_key = ?
       `,
       ).run(
         input.title ?? null,
@@ -484,6 +526,7 @@ export function saveMemory(db, projectKey, input) {
         now,
         now,
         id,
+        projectKey,
       );
     } else {
       db.prepare(
@@ -645,12 +688,27 @@ function trackEmbedding(promise) {
 // hold the process open forever; the cap is generous (10 s) so a
 // cold-cache model load has a chance to finish on the way out.
 export async function flushEmbeddings({ timeoutMs = 10000 } = {}) {
-  if (inFlightEmbeddings.size === 0) return { waited: 0 };
+  if (inFlightEmbeddings.size === 0) return { waited: 0, timedOut: false };
   const settled = inFlightEmbeddings.size;
+  // Snapshot semantics: saves that start racing shutdown after this
+  // snapshot are neither awaited nor reported — the wall-clock cap
+  // bounds the wait, and the embedding_status='pending' rows they
+  // leave behind are picked up by the embed-retry pass on next start.
+  // (Review finding: documented rather than re-snapshotted.)
   const drain = Promise.allSettled([...inFlightEmbeddings]);
-  const timer = new Promise((resolve) => setTimeout(() => resolve('timeout'), timeoutMs));
-  await Promise.race([drain, timer]);
-  return { waited: settled };
+  let timer;
+  const timeout = new Promise((resolve) => {
+    timer = setTimeout(() => resolve('timeout'), timeoutMs);
+  });
+  try {
+    // The race winner is the whole point: callers must be able to
+    // tell "drained" from "timed out" or shutdown truncates embedding
+    // writes blindly. (Review finding M1.)
+    const winner = await Promise.race([drain, timeout]);
+    return { waited: settled, timedOut: winner === 'timeout' };
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 // Async helper: compute embedding for a saved memory and write the

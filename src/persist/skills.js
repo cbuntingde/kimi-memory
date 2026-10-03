@@ -7,7 +7,7 @@
 // recall lines. Invocations are recorded in skill_invocations for
 // stats / ranking.
 import { nowIso, hashId, shortId } from '../util.js';
-import { rowToMemory } from './memories.js';
+import { rowToMemory, assertNoSecret } from './memories.js';
 import crypto from 'node:crypto';
 
 /**
@@ -114,6 +114,14 @@ export function recordSkillInvocation(
   skillId,
   { success, toolName, durationMs = null } = {},
 ) {
+  // Gate the caller-controlled strings like every other writer —
+  // tool names arrive from tool-call args. (Review finding F5.)
+  if (typeof toolName === 'string' && toolName.length > 0) {
+    assertNoSecret({ content: toolName });
+  }
+  if (typeof skillId === 'string' && skillId.length > 0) {
+    assertNoSecret({ content: skillId });
+  }
   const ok = success === 1 || success === true ? 1 : 0;
   // Three calls in the same millisecond would otherwise collide on
   // PRIMARY KEY; mix in nanoseconds + a per-call counter so the id

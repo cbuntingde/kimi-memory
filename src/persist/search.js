@@ -358,6 +358,10 @@ export async function searchMemories(db, projectKey, query, opts = {}) {
   // includeScore surface always carries fts_score + vec_score (the test
   // at tests/13-recall-per-type.test.js:127 asserts both are numbers).
   // A row that did NOT match a channel gets a 0 score for that channel.
+  // Per-channel display score: rank-decayed 1/rank, NOT the RRF
+  // component 1/(RRF_K+rank). rrf_score/score carry the fused value;
+  // these exist so callers can see which channel matched, not to sum
+  // to the total. (Review finding: define-or-document.)
   const ftsScoreOf = (r) => (Number.isFinite(r) && r >= 1 ? 1 / r : 0);
   const vecScoreOf = (rowId) => {
     const sim = vecScores.get(rowId);

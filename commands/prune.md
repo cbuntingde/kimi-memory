@@ -28,10 +28,10 @@ before touching the filesystem. Review the list, then re-run with
 
 ## Procedure
 
-1. Call `memory_prune(scope: "all-projects", apply: false)`. The MCP
-   tool enumerates every project DB in the data root, looks up the
-   recorded canonical root, and reports `exists_on_disk: true|false`
-   for each.
+1. Call `memory_prune(cwd, scope: "all-projects", apply: false)`,
+   with `cwd` set to the project root. The MCP tool enumerates every
+   project DB in the data root, looks up the recorded canonical root,
+   and reports `exists_on_disk: true|false` for each.
 2. Print the list of orphans (`exists_on_disk: false`) clearly:
    ```
    Found 2 orphan project databases:
@@ -41,8 +41,8 @@ before touching the filesystem. Review the list, then re-run with
 3. Stop. Tell the user the dry-run result. If they want to proceed,
    wait for confirmation; this command is destructive.
 4. After explicit confirmation, call
-   `memory_prune(scope: "all-projects", apply: true)` and report the
-   final `removed` count. The global database is never touched.
+   `memory_prune(cwd, scope: "all-projects", apply: true)` and report
+   the final `removed` count. The global database is never touched.
 
 ## When not to use
 
@@ -59,9 +59,9 @@ before touching the filesystem. Review the list, then re-run with
 
 ## Related
 
-- `memory_prune(scope: "project", apply: ...)` — check / clean a single
-  project (use this when the user just deleted the active project and
-  wants the current directory's memory swept immediately).
+- `memory_prune(cwd, scope: "project", apply: ...)` — check / clean a
+  single project (use this when the user just deleted the active
+  project and wants the current directory's memory swept immediately).
 - Manual removal — use `/plugins remove kimi-memory`, then remove the managed
   copy and data directories described in `README.md` under "Uninstall and
   data retention".

@@ -44,5 +44,5 @@ Example dry run response:
 }
 ```
 
-The plugin's `/reset_project` skill is equivalent; this command is the
-namespaced fallback (`/kimi-memory:reset_project`).
+The `reset_project` skill (`skills/reset_project/SKILL.md`) covers the
+same flow; this command is the explicit slash-command entry point.

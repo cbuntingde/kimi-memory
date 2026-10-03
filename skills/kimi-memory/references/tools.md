@@ -41,7 +41,7 @@ The plugin exposes 52 MCP tools over the `kimi-memory` stdio server (37 always-o
 
 ## ACL / visibility (deprecated)
 
-The ACL/visibility layer is a port from `TencentDB-Agent-Memory` and ships without an authenticated caller on the MCP surface (the server itself has no auth; ACL rows are advisory). It is gated behind `KIMI_MEMORY_LEGACY_SUBSYSTEMS=off` (default `on`); set to `off` to hide the five tools and the matching schema migrations from being touched by future cleanup. Removal is planned for the next major version. Until then:
+The ACL/visibility layer is a port from `TencentDB-Agent-Memory` and ships without an authenticated caller on the MCP surface (the server itself has no auth; ACL rows are advisory). It is gated behind `KIMI_MEMORY_LEGACY_SUBSYSTEMS=off` (default `on`); set to `off` to hide the five tools — the schema columns and tables stay in place, and the auto-tier promotion and `persona_promotions` archive sweeps are skipped too. Removal is planned for the next major version. Until then:
 
 - `acl_grant`, `acl_revoke`, `acl_list`, `acl_share_memory`, `acl_resolve_principal`.
 
@@ -76,4 +76,4 @@ Phase 1 of the Dream subsystem replaces the inline fire-and-forget dream pass wi
 
 ## Gating legacy subsystems
 
-Set `KIMI_MEMORY_LEGACY_SUBSYSTEMS=off` in the environment to disable every tool in the ACL, tier/persona, codegraph, and (separately gated by `KIMI_MEMORY_DREAM=off`) Dream groups in one switch. The corresponding MCP tool registrations are skipped at boot; the schema tables remain (no data loss) so a user can flip the env var back on without a migration. The wiki group was removed entirely in v14; its tools are no longer registered. See `AGENTS.md §Subsystem deprecation`.
+Set `KIMI_MEMORY_LEGACY_SUBSYSTEMS=off` in the environment to disable every tool in the ACL, tier/persona, and codegraph groups in one switch. (Dream is unrelated to this gate; it has its own `KIMI_MEMORY_DREAM=off`.) The corresponding MCP tool registrations are skipped at boot; the schema tables remain (no data loss) so a user can flip the env var back on without a migration. The wiki group was removed entirely in v14; its tools are no longer registered. See `AGENTS.md §Subsystem deprecation`.

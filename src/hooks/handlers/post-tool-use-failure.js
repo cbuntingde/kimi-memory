@@ -88,12 +88,12 @@ export async function handlePostToolUseFailure(payload) {
   const nowMs = Date.now();
 
   try {
-    // `safeOpenDb` never lazy-creates: a hook must not create the
-    // project directory, the schema, or run the migration list as a
-    // side effect of observing a tool failure. The open itself lives
-    // inside the try so a busy / corrupt / EPERM open takes the same
-    // fail-open path as the insert below instead of throwing out of the
-    // handler.
+    // `safeOpenDb` never lazy-creates the DB file: observing a tool
+    // failure must not create the schema or run the migration list.
+    // (ensureProjectDir above may create the project directory.) The
+    // open itself lives inside the try so a busy / corrupt / EPERM
+    // open takes the same fail-open path as the insert below instead
+    // of throwing out of the handler. (Review finding: comment fix.)
     await ensureProjectDir(HOME, projectKey);
     const db = safeOpenDb(projectDbPath(HOME, projectKey));
     if (!db) return { ok: false, reason: 'no_db' };

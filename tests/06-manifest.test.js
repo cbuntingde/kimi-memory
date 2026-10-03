@@ -70,6 +70,8 @@ test('all required hook events are declared', () => {
     'PreCompact',
     'Interrupt',
     'StopFailure',
+    'PostToolUse',
+    'PostToolUseFailure',
   ]) {
     assert.ok(events.has(ev), 'missing hook event: ' + ev);
   }
@@ -246,6 +248,12 @@ test('plugin commands are documented in their namespaced form', () => {
   assert.ok(
     !/\/memos\b/.test(long.replace(/\/kimi-memory:memos/g, '')),
     'longDescription should not advertise /memos without the kimi-memory: prefix',
+  );
+  // The same ban applies to skillInstructions, which is agent-facing.
+  const instr = manifest.skillInstructions || '';
+  assert.ok(
+    !/\/advisor\b/.test(instr.replace(/\/kimi-memory:advisor/g, '')),
+    'skillInstructions should not advertise /advisor without the kimi-memory: prefix',
   );
 });
 

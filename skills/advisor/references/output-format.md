@@ -72,13 +72,13 @@ Good examples:
 ## Sample response
 
 ```
-Verdict: The memory layer is healthy; the one high-value change is to add a `/reflect` style slash command that invokes the advisor procedure explicitly.
+Verdict: The memory layer is healthy; the one high-value change is to add a `/kimi-memory:advisor` style slash command that invokes the advisor procedure explicitly.
 
 Findings
 1. **No explicit advisor entry point**
    - Severity: high
    - Evidence: ~/.kimi-code/plugins/managed/advisor/AGENTS.md (missing), memory:procedure-summary (pre-existing procedure but no command)
-   - Action: add `/advisor` slash command backed by skill `advisor`.
+   - Action: add `/kimi-memory:advisor` slash command backed by skill `advisor`.
 
 2. **Hook detection unverified**
    - Severity: medium

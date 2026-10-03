@@ -636,6 +636,18 @@ export function register(server, handlers, home) {
           errors.push(`${ictx}: ${prio.error}`);
           continue;
         }
+        // Funnel shared_with through the same dedup + trim + cap
+        // memory_save uses so the two surfaces cannot drift.
+        // (Review finding S4.)
+        let sharedWithValue;
+        if (item.shared_with !== undefined) {
+          try {
+            sharedWithValue = validateSharedWith(item.shared_with).value;
+          } catch (e) {
+            errors.push(`${ictx}: ${e && e.message ? e.message : String(e)}`);
+            continue;
+          }
+        }
         cleaned.push({
           type: t.value,
           title: typeof item.title === 'string' ? item.title : '',
@@ -649,9 +661,9 @@ export function register(server, handlers, home) {
           supersede: !!item.supersede,
           synthesizes: Array.isArray(item.synthesizes) ? item.synthesizes : undefined,
           // v10 ACL fields. visibility defaults to 'private' inside
-          // saveMemory; shared_with is pass-through.
+          // saveMemory; shared_with was funneled above.
           visibility: item.visibility || 'private',
-          shared_with: Array.isArray(item.shared_with) ? item.shared_with : undefined,
+          shared_with: sharedWithValue,
           // team_id / agent_id / user_id / session_id / task_id are
           // intentionally not accepted on bulk — see memory_save
           // TOOL_DEFS comment.

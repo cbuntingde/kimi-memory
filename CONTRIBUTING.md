@@ -23,7 +23,9 @@ to keep CI fast.
 - Comments explain _why_, not _what_. The codebase has a long history of
   `(Audit fix …)` and `(Audit finding …)` markers — preserve them.
 - No mock or stub logic on production paths. Test-only stubs go behind
-  `_setPipelineStubForTests` style seams (see `src/embedding.js`).
+  `_setPipelineStubForTests` style seams (see `src/embedding.js`) or
+  dependency injection with real implementations as defaults
+  (see `src/dream.js`).
 
 ## Layout
 
@@ -40,7 +42,8 @@ to keep CI fast.
 - `src/<subsystem>.js` — feature modules (acl, codegraph, consolidate,
   decay, dream, session-focus, etc.).
 - `tests/NN-<name>.test.js` — number-prefixed so they sort in the order
-  they were added.
+  they were added. A letter suffix (`NNb-`) marks a follow-up file for
+  the same area (e.g. `22b-`, `40b-`).
 
 ## Schema changes
 
@@ -68,8 +71,8 @@ to keep CI fast.
    declares `cwd` gets `resolveProjectRoot(args.cwd)` and is refused
    when `!pr.ok`; a tool that does not (see `memory_diagnostics`) is
    registered with `skipDb: true` and opens no database.
-5. Wrap the handler in `try { … } catch (e) { return textError(...); }`.
-   The wrapper already routes the message through `safeErrorMessage`,
+5. Throw `toolError(...)` on failure and let the wrapper catch it.
+   The wrapper routes the message through `safeErrorMessage`,
    so do not build a path-bearing error string by hand.
 6. Add the tool name to `kimi.plugin.json`'s `interface.longDescription`
    so the plugin manifest matches the runtime surface.
@@ -91,8 +94,8 @@ to keep CI fast.
   logic to it; route through `src/hooks/handlers/<event>.js`.
 - New event? Add a handler file, register it in the `HANDLERS` map, and
   add an entry in `kimi.plugin.json`'s `hooks` array with a sensible
-  `timeout` (10s for `SessionStart`, 15s for `Stop`/`SessionEnd`, 5s
-  for the rest).
+  `timeout` (10s for `SessionStart`/`UserPromptSubmit`, 15s for
+  `Stop`/`SessionEnd`, 5s for the rest).
 - Hooks are fail-open: any caught exception must log via `logHookDiag`
   and exit 0 so Kimi isn't blocked.
 

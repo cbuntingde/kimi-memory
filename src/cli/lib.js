@@ -22,6 +22,23 @@ import {
 } from '../project-key.js';
 import { openDb, closeDb } from '../persist.js';
 
+// Flags that never take a value. Without this set, `get --json <id>`
+// stores flags.json="<id>" and the positional id is lost.
+// (Review finding: cli-3.)
+const BOOLEAN_FLAGS = new Set([
+  'json',
+  'quiet',
+  'apply',
+  'yes',
+  'merge',
+  'replace',
+  'force',
+  'all-projects',
+  'include-expired',
+  'per-type',
+  'no-auth',
+]);
+
 export function parseArgs(argv) {
   const out = {
     command: argv[2],
@@ -37,7 +54,9 @@ export function parseArgs(argv) {
       } else {
         const key = a.slice(2);
         const next = argv[i + 1];
-        if (next != null && !next.startsWith('--')) {
+        if (BOOLEAN_FLAGS.has(key)) {
+          out.flags[key] = true;
+        } else if (next != null && !next.startsWith('--')) {
           out.flags[key] = next;
           i++;
         } else {

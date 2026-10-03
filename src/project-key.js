@@ -46,6 +46,10 @@ export function canonicalizeRoot(input) {
   const isUncAbs = /^\\\\[^\\/]+[\\/]/.test(trimmed);
   const isPosixAbs = trimmed.startsWith('/');
   if (!isWinAbs && !isUncAbs && !isPosixAbs) return null;
+  // UNC is meaningful only on Windows; on POSIX it is rejected so a
+  // UNC string can never hash to a live project key (see doc comment).
+  // (Review finding F3-dream.)
+  if (isUncAbs && process.platform !== 'win32') return null;
   if (isWinAbs || isUncAbs) {
     // Normalise separators, then collapse '.' / '..' segments and
     // redundant separators using the Windows-path rules. path.win32 (not

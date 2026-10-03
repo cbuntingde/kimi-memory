@@ -7,7 +7,7 @@ import { promises as fs } from 'node:fs';
 import { statSync } from 'node:fs';
 import { randomBytes } from 'node:crypto';
 import path from 'node:path';
-import { nowIso, safeJsonParse } from '../util.js';
+import { nowIso, safeJsonParse, clampInt } from '../util.js';
 import { ensureProjectDir, ingestStatePath } from '../project-key.js';
 import { assertNoSecret } from './memories.js';
 import { redactSecrets, redactPayload } from '../secrets.js';
@@ -24,6 +24,11 @@ export function setWorkingMemory(db, projectKey, slot, value) {
   // (Production-readiness review finding F-1.)
   if (typeof value === 'string' && value.length > 0) {
     assertNoSecret({ content: value });
+  }
+  // The slot name is persisted verbatim and echoed in the preview —
+  // gate it under the same strict reading. (Review finding F10.)
+  if (typeof slot === 'string' && slot.length > 0) {
+    assertNoSecret({ content: slot });
   }
   const now = nowIso();
   db.prepare(
@@ -70,6 +75,10 @@ export function listWorkingMemory(db, projectKey) {
 // ----- Conversations -----
 
 export function upsertConversation(db, projectKey, sessionId, cwd) {
+  // cwd is caller-controlled and persisted verbatim. (Review F5.)
+  if (typeof cwd === 'string' && cwd.length > 0) {
+    assertNoSecret({ content: cwd });
+  }
   db.prepare(
     `
     INSERT INTO conversations (session_id, project_key, cwd, last_event_at)
@@ -101,7 +110,7 @@ export function listConversations(db, projectKey, { limit = 50 } = {}) {
     .prepare(
       'SELECT * FROM conversations WHERE project_key=? ORDER BY datetime(last_event_at) DESC LIMIT ?',
     )
-    .all(projectKey, Math.max(1, Math.min(500, limit)));
+    .all(projectKey, clampInt(limit, 1, 500, 50));
   return rows.map((r) => ({
     session_id: r.session_id,
     cwd: r.cwd,
@@ -149,7 +158,7 @@ export function searchConversationEvents(
       ftsWhere.push('f.role = ?');
       ftsParams.push(role);
     }
-    ftsParams.push(Math.max(1, Math.min(200, limit)));
+    ftsParams.push(clampInt(limit, 1, 200, 20));
     rows = db
       .prepare(
         `SELECT m.* FROM conversation_events_fts f
@@ -195,8 +204,24 @@ export function searchConversationEvents(
     rows = [];
   }
   // LIKE fallback covers freshly-ingested rows the mirror hasn't seen
-  // yet, and the case where the FTS5 mirror was never populated.
-  if (rows.length === 0) {
+  // yet, and the case where the FTS5 mirror was never populated. It
+  // runs whenever the mirror may trail the source — not just when FTS
+  // returns nothing — or rows ingested after a mirror exists stay
+  // invisible while any older row matches. (Review finding F6.)
+  const mirrorStale = (() => {
+    try {
+      const s = db
+        .prepare('SELECT COUNT(*) AS n FROM conversation_events WHERE project_key = ?')
+        .get(projectKey).n;
+      const m = db
+        .prepare('SELECT COUNT(*) AS n FROM conversation_events_fts WHERE project_key = ?')
+        .get(projectKey).n;
+      return s > m;
+    } catch {
+      return true;
+    }
+  })();
+  if (rows.length === 0 || mirrorStale) {
     const like = '%' + tokens.slice(0, 6).join('%') + '%';
     const where = ['project_key = ?', '(summary LIKE ? OR payload LIKE ?)'];
     const params = [projectKey, like, like];
@@ -208,12 +233,25 @@ export function searchConversationEvents(
       where.push('role = ?');
       params.push(role);
     }
-    params.push(Math.max(1, Math.min(200, limit)));
-    rows = db
+    params.push(clampInt(limit, 1, 200, 20));
+    const likeRows = db
       .prepare(
         `SELECT * FROM conversation_events WHERE ${where.join(' AND ')} ORDER BY datetime(created_at) DESC LIMIT ?`,
       )
       .all(...params);
+    if (rows.length === 0) {
+      rows = likeRows;
+    } else {
+      // Merge rows the FTS pass did not return, keyed by identity.
+      const seen = new Set(rows.map((r) => `${r.session_id}\n${r.line_no}`));
+      for (const r of likeRows) {
+        if (!seen.has(`${r.session_id}\n${r.line_no}`)) {
+          seen.add(`${r.session_id}\n${r.line_no}`);
+          rows.push(r);
+        }
+        if (rows.length >= clampInt(limit, 1, 200, 20)) break;
+      }
+    }
   }
   return rows.map((r) => ({
     session_id: r.session_id,
@@ -236,7 +274,7 @@ export function getConversationEvents(db, projectKey, sessionId, { limit = 200, 
     ORDER BY line_no ASC LIMIT ?
   `,
     )
-    .all(projectKey, sessionId, Math.max(0, since), Math.max(1, Math.min(1000, limit)));
+    .all(projectKey, sessionId, Math.max(0, since), clampInt(limit, 1, 1000, 200));
   return rows.map((r) => ({
     session_id: r.session_id,
     line_no: r.line_no,
@@ -309,6 +347,10 @@ export function mirrorConversationEventsFts(db, projectKey) {
     );
     db.exec('BEGIN');
     try {
+      // The mirror has no UNIQUE constraint, so INSERT OR REPLACE is
+      // a plain INSERT — clear the project's rows first or a repeat
+      // call duplicates the mirror. (Review finding F6.)
+      db.prepare('DELETE FROM conversation_events_fts WHERE project_key = ?').run(projectKey);
       for (const r of rows) {
         insert.run(
           r.session_id,

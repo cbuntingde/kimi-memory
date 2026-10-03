@@ -92,7 +92,7 @@ export const TOOL_DEFS = [
   },
   {
     name: 'memory_recall',
-    desc: 'Keyword search across the active scope\u2019s durable memories using FTS5. Hybrid FTS5 + cosine ranking, RRF-fused with the default RRF_K=60. Optional `visibility` (single string or array) and `tier` filters narrow the result set; `tier_budgets` caps per-tier selection; `max_chars_per_memory` truncates individual rows; `max_total_recall_chars` drops tail rows once the cumulative content length exceeds the budget.',
+    desc: 'Keyword search across the active scope\u2019s durable memories using FTS5. Hybrid FTS5 + cosine ranking, RRF-fused with the default RRF_K=60. Optional `visibility` (single string or array) and `tier` filters narrow the result set; `tier_budgets` caps per-tier selection; `max_chars_per_memory` truncates individual rows; `max_total_recall_chars` drops tail rows once the cumulative content length exceeds the budget. With includeScore, fts_score/vec_score are 1/rank display scores; score/rrf_score is the fused RRF value.',
     input: {
       cwd: z.string().describe('Project root (absolute path). Required.'),
       scope: z
@@ -107,7 +107,15 @@ export const TOOL_DEFS = [
         .max(500)
         .describe('Search query. Supports basic FTS5 operators: "exact phrase" or -exclude.'),
       type: z
-        .enum(['working', 'episodic', 'semantic', 'procedural', 'context_snapshot'])
+        .enum([
+          'working',
+          'episodic',
+          'semantic',
+          'procedural',
+          'conclusion',
+          'skill',
+          'context_snapshot',
+        ])
         .optional(),
       limit: z.number().int().min(1).max(200).optional(),
       // Note: `recent_first` and `sort_by` were removed from the schema
@@ -357,8 +365,16 @@ export const TOOL_DEFS = [
         .array(
           z.object({
             type: z
-              .enum(['working', 'episodic', 'semantic', 'procedural', 'conclusion', 'skill'])
-              .describe('Memory type.'),
+              .enum([
+                'working',
+                'episodic',
+                'semantic',
+                'procedural',
+                'conclusion',
+                'skill',
+                'context_snapshot',
+              ])
+              .describe('Memory type (same vocabulary as memory_save).'),
             title: z.string().max(500).optional(),
             content: z.string().min(1).max(200000).describe('Memory body.'),
             tags: z.array(z.string().min(1).max(64)).max(32).optional(),

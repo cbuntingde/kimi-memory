@@ -21,7 +21,7 @@ status surface.
 
 ## Modes
 
-- `off` — never auto-run. Only fires on explicit `/dreaming run`.
+- `off` — never auto-run. Only fires on explicit `/kimi-memory:dreaming run`.
 - `auto` — the historical behaviour: activity-threshold + 30-minute debounce
   (env-tunable via `KIMI_MEMORY_DREAM_DEBOUNCE_MS`). Switching to `auto` is
   a no-op upgrade for existing users.
@@ -69,10 +69,9 @@ One call runs three passes in order, controlled by `--include`:
    rows, run L0→L1→L2→L3 tier promotion. Bounded by `KIMI_MEMORY_AUTO_GC=off`.
 
 The default include set is `consolidate,dream,gc`. Auto-extract is NOT
-included by default — it makes an outbound LLM call. Add it with
-`/dreaming run --include consolidate,dream,gc,extract` (or set
-`KIMI_MEMORY_AUTO_EXTRACT=on` and let the Stop hook fire it on its own
-schedule).
+a dreaming pass and cannot be added via `--include` — it makes an
+outbound LLM call and runs only on the Stop/SessionEnd hook (with
+`KIMI_MEMORY_AUTO_EXTRACT=on`) on its own schedule.
 
 ## Procedure
 
@@ -130,8 +129,11 @@ For `last`:
   duplicate. Check `memory_status` or `dream_status` first.
 - Do not set `interval` to less than 5 minutes. Consolidate re-walks the
   embedding matrix; dream re-stages proposals. A busy interval will
-  thrash the DB and the auto-tire sweep. The CLI refuses intervals
-  shorter than 5m.
+  thrash the DB and the auto-tier sweep. The `dreaming` MCP tool
+  refuses positive intervals below 300000 ms (`interval_ms` and
+  `interval_spec` alike; 0 disables the floor and is accepted); the
+  CLI currently accepts any non-negative value — keep intervals ≥5m
+  everywhere.
 - `on` mode is not a daemon. The plugin never spawns a background
   process; dreaming only runs when a `SessionStart` opens after the
   floor has elapsed (or when the user invokes `run`). Tell the user

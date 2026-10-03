@@ -69,7 +69,7 @@ const SECRET_NAME_SOURCE =
   '(?:api[_-]?key|apikey|api[_-]?secret|api[_-]?token|access[_-]?token|auth[_-]?token|' +
   'bearer[_-]?token|refresh[_-]?token|id[_-]?token|secret[_-]?access[_-]?key|' +
   'access[_-]?key[_-]?id|shared[_-]?access[_-]?key|account[_-]?key|secret[_-]?key|' +
-  'client[_-]?secret|private[_-]?key|signing[_-]?key|password|passwd|pwd|token|secret)';
+  'client[_-]?secret|private[_-]?key|signing[_-]?key|password|passwd|pwd|token|secret|pat)';
 
 // The boundary is a CAPTURING group (and the value is not) so the
 // redaction replacement can put the boundary back with `$1`. Getting
@@ -83,7 +83,12 @@ const SECRET_NAME_SOURCE =
 // ones — `--api-key=…` (dash), `com.example.api_key=…` (dot),
 // `conf/token=…` (slash) and `NAME=value` (the `=` of the assignment).
 const ASSIGNMENT_BOUNDARY = '(^|[^A-Za-z0-9])';
-const ASSIGNMENT_SOURCE = `${ASSIGNMENT_BOUNDARY}["']?${SECRET_NAME_SOURCE}["']?\\s*[:=]\\s*["']?(?:[^\\s"',;]{8,})`;
+// The value must not be one of our own emitted `[REDACTED_*]` tokens:
+// the provider pass runs first, so without this `PAT: ghp_…` redacts
+// to `PAT: [REDACTED_PROVIDER_KEY]` and then re-matches here,
+// collapsing the specific token into the generic one (and flipping
+// the pinned provider-token contract). (Review fixup.)
+const ASSIGNMENT_SOURCE = `${ASSIGNMENT_BOUNDARY}["']?${SECRET_NAME_SOURCE}["']?\\s*[:=]\\s*["']?(?!\\[REDACTED_)(?:[^\\s"',;]{8,})`;
 const ASSIGNMENT_RE = new RegExp(ASSIGNMENT_SOURCE, 'i');
 const ASSIGNMENT_RE_G = new RegExp(ASSIGNMENT_SOURCE, 'gi');
 
@@ -244,8 +249,12 @@ function redactPemBlocks(text) {
   return out;
 }
 
-const BEARER_RE = /Authorization\s*:\s*Bearer\s+[A-Za-z0-9_.-]{20,}/i;
-const BEARER_RE_G = /Authorization\s*:\s*Bearer\s+[A-Za-z0-9_.-]{20,}/gi;
+// The `Authorization:` prefix is optional: a pasted `Bearer <token>`
+// line (logs, curl -H, chat) carries the same credential without it.
+// The 20-char value class keeps prose ("Bearer [REDACTED] news") clean.
+// (Review finding: bare-Bearer gap.)
+const BEARER_RE = /(Authorization\s*:\s*)?Bearer\s+[A-Za-z0-9_.-]{20,}/i;
+const BEARER_RE_G = /(Authorization\s*:\s*)?Bearer\s+[A-Za-z0-9_.-]{20,}/gi;
 
 const BASIC_RE = /Authorization\s*:\s*Basic\s+[A-Za-z0-9+/=]{16,}/i;
 const BASIC_RE_G = /Authorization\s*:\s*Basic\s+[A-Za-z0-9+/=]{16,}/gi;
@@ -338,7 +347,7 @@ export function redactSecrets(text) {
   let out = text;
   out = out.replace(PROVIDER_KEY_RE_G, '[REDACTED_PROVIDER_KEY]');
   out = redactPemBlocks(out);
-  out = out.replace(BEARER_RE_G, 'Authorization: Bearer [REDACTED]');
+  out = out.replace(BEARER_RE_G, '$1Bearer [REDACTED]');
   out = out.replace(BASIC_RE_G, 'Authorization: Basic [REDACTED]');
   // Connection strings run before the generic assignment rule so the
   // credentials inside the URL are consumed by the more specific match.

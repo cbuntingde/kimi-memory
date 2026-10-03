@@ -133,6 +133,10 @@ async function getPipeline() {
       env.allowLocalModels = false;
       env.useBrowserCache = false;
       const integrity = describeEmbeddingIntegrity();
+      // Warn BEFORE the trust decision, not after a successful load —
+      // a failed first fetch from unpinned `main` must still say so.
+      // (Review finding recall-2.)
+      warnIntegrityOnce(integrity);
       const pipe = await pipeline('feature-extraction', EMBEDDING_MODEL, {
         quantized: true,
         revision: integrity.revision,
@@ -240,26 +244,17 @@ function disposePipeline(promise) {
   }
 }
 
-// One-time notice on first successful model load. The README documents
-// this, but a user who never reads the README would otherwise be
-// surprised by an outbound HTTPS request to Hugging Face Hub the
-// moment they save their first memory. (Audit fix.)
-//
-// Also states the integrity posture plainly: whether the revision is
-// pinned to an immutable commit SHA, or is trust-on-first-use. A
-// branch/tag pin looks like a pin but is movable, so `reason:
-// 'mutable_ref'` gets its own line rather than reading as "pinned".
-let downloadNoticed = false;
-function noticeDownloadOnce(modelId, integrity, cacheDir) {
-  if (downloadNoticed) return;
-  downloadNoticed = true;
+// One-time integrity warning, fired BEFORE the first download attempt
+// so the trust decision is visible even when the fetch fails. States
+// plainly whether the revision is pinned to an immutable commit SHA
+// or is trust-on-first-use; a branch/tag pin looks like a pin but is
+// movable, so `reason: 'mutable_ref'` gets its own line rather than
+// reading as "pinned".
+let integrityWarned = false;
+function warnIntegrityOnce(integrity) {
+  if (integrityWarned) return;
+  integrityWarned = true;
   try {
-    const cache = cacheDir ? ` (cache: ${cacheDir})` : '';
-    const rev =
-      integrity.revision && integrity.revision !== 'main' ? ` @ ${integrity.revision}` : '';
-    process.stderr.write(
-      `[kimi-memory] first call downloaded embedding model ${modelId}${rev} (~25 MB) from Hugging Face Hub${cache}; subsequent calls use the local cache.\n`,
-    );
     if (integrity.pinned) {
       process.stderr.write(
         `[kimi-memory] embedding model revision is pinned to commit ${integrity.revision} (immutable).\n`,
@@ -278,10 +273,30 @@ function noticeDownloadOnce(modelId, integrity, cacheDir) {
   }
 }
 
+// One-time notice on first successful model load. The README documents
+// this, but a user who never reads the README would otherwise be
+// surprised by an outbound HTTPS request to Hugging Face Hub the
+// moment they save their first memory. (Audit fix.)
+let downloadNoticed = false;
+function noticeDownloadOnce(modelId, integrity, cacheDir) {
+  if (downloadNoticed) return;
+  downloadNoticed = true;
+  try {
+    const cache = cacheDir ? ` (cache: ${cacheDir})` : '';
+    const rev =
+      integrity.revision && integrity.revision !== 'main' ? ` @ ${integrity.revision}` : '';
+    process.stderr.write(
+      `[kimi-memory] first call downloaded embedding model ${modelId}${rev} (~25 MB) from Hugging Face Hub${cache}; subsequent calls use the local cache.\n`,
+    );
+  } catch {
+    /* ignore */
+  }
+}
+
 export async function embedText(text) {
   // Canonical opt-out. When KIMI_MEMORY_EMBEDDINGS=off we never touch
   // the model; embedText is a no-op and returns null. Set by tests via
-  // _helpers.js; the CLI and MCP server leave it unset.
+  // tests/_helpers.js; the CLI and MCP server leave it unset.
   if (process.env.KIMI_MEMORY_EMBEDDINGS === 'off') return null;
   // `embedRaw` is responsible for the timeout race, the dim check, the
   // pipeline-reset on real failures, and the warn-once logging. By

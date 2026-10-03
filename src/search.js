@@ -25,7 +25,7 @@ const NEGATED_TERM = /(^|\s)(-\S+(?:\s+\S+)?)/g;
 // The transformation rules (matching the test contract):
 //
 //   - "exact phrase"                    => "exact phrase"        (preserved)
-//   - -exclude term                     => NOT "exclude"         (FTS5 NOT)
+//   - -exclude term                     => NOT "exclude term"    (FTS5 NOT; negation gobbles one following word)
 //   - single bare token                 => "token"
 //   - two+ bare tokens                  => "token1" OR "token2" OR ...
 //   - whitespace / empty / null         => ""

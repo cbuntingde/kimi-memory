@@ -1,12 +1,10 @@
-// CLI: keyword / hybrid recall against the project's durable memories.
+// CLI: keyword / hybrid recall against durable memories.
 //
-//   node src/cli.js recall <query>       [--cwd <path>] [--limit N]
+//   node src/cli.js recall <query>       [--cwd <path>] [--scope project|global|all] [--limit N]
 //                                       [--per-type] [--fusion rrf|weighted]
 //                                       [--rrf-k 60] [--visibility team,private] [--json]
-import { existsSync } from 'node:fs';
-import { openDb, closeDb, searchMemories } from '../persist.js';
-import { deriveProjectKey, projectDbPath } from '../project-key.js';
-import { homeDir, resolveCwd, emitJson } from '../cli/lib.js';
+import { closeDb, searchMemories } from '../persist.js';
+import { homeDir, resolveCwd, emitJson, eachScopeDb } from '../cli/lib.js';
 
 export async function cmdRecall(args) {
   const home = homeDir(args);
@@ -20,7 +18,18 @@ export async function cmdRecall(args) {
     process.stderr.write('error: query is required\n');
     process.exit(1);
   }
+  // --scope mirrors memory_recall (project|global|all, default all);
+  // --limit mirrors its 1..200 cap. (Review finding: cli-1.)
+  const scope = args.flags.scope ? String(args.flags.scope) : 'all';
+  if (scope !== 'project' && scope !== 'global' && scope !== 'all') {
+    process.stderr.write('error: --scope must be project, global, or all\n');
+    process.exit(1);
+  }
   const limit = args.flags.limit ? Number(args.flags.limit) : 10;
+  if (!Number.isFinite(limit) || limit < 1 || limit > 200) {
+    process.stderr.write('error: --limit must be 1..200\n');
+    process.exit(1);
+  }
   const perType = !!args.flags['per-type'];
   const asJson = !!args.flags.json;
   // v10: fusion strategy + RRF_K. Default fusion='rrf' (k=60). The
@@ -44,29 +53,42 @@ export async function cmdRecall(args) {
       .filter(Boolean);
     if (visibilityFlag.length === 0) visibilityFlag = undefined;
   }
-  const key = deriveProjectKey(cwd);
-  const dbPath = projectDbPath(home, key);
-  if (!existsSync(dbPath)) {
-    process.stderr.write('note: project DB does not exist yet\n');
-    process.exit(0);
-  }
-  const db = openDb(dbPath);
+  const items = [];
   try {
-    const rows = await searchMemories(db, key, query, {
-      limit,
-      perType,
-      includeScore: true,
-      fusion: fusionFlag,
-      rrfK: rrfKFlag,
-      visibility: visibilityFlag,
-    });
-    if (asJson) emitJson({ operation: 'recall', query, count: rows.length, items: rows });
+    await eachScopeDb(
+      {
+        home,
+        scope,
+        cwd,
+        onMissing: ({ scope: missing }) => {
+          if (missing === 'project') {
+            process.stderr.write('note: project DB does not exist yet\n');
+          }
+        },
+      },
+      async (db, key, s) => {
+        const rows = await searchMemories(db, key, query, {
+          limit,
+          perType,
+          includeScore: true,
+          fusion: fusionFlag,
+          rrfK: rrfKFlag,
+          visibility: visibilityFlag,
+        });
+        for (const r of rows) items.push({ scope: s, ...r });
+      },
+    );
+    // Cross-scope merge mirrors memory_recall's score-descending order.
+    items.sort((a, b) => (b.score ?? 0) - (a.score ?? 0));
+    const limited = items.slice(0, limit);
+    if (asJson)
+      emitJson({ operation: 'recall', query, scope, count: limited.length, items: limited });
     else {
-      for (const m of rows) {
+      for (const m of limited) {
         const title = m.title ? `"${m.title}"` : '(no title)';
         const score = typeof m.score === 'number' ? ` (score=${m.score.toFixed(3)})` : '';
         process.stdout.write(
-          `[${m.type}] ${m.id} ${title}${score} — ${(m.content || '').slice(0, 80).replace(/\s+/g, ' ')}\n`,
+          `[${m.scope}] [${m.type}] ${m.id} ${title}${score} — ${(m.content || '').slice(0, 80).replace(/\s+/g, ' ')}\n`,
         );
       }
     }

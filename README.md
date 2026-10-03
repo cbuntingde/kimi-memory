@@ -87,7 +87,7 @@ assistant handles them when you ask in plain language.
 | ------------------------------------------------- | -------------------------------------------- |
 | List this project's memories                      | `/kimi-memory:list_memories`                 |
 | Reflect on the active project                     | `/kimi-memory:advisor`                       |
-| Wipe a re-cloned project's stale memories         | `/kimi-memory:reset_project --apply`         |
+| Wipe a re-cloned project's stale memories         | `/kimi-memory:reset_project` (confirm flow)  |
 | Open the companion dashboard in your browser      | `/kimi-memory:memos`                         |
 | Check the pipeline (counts, queues, cleanup)      | `node src/cli.js status --cwd <path>`        |
 | Clean up memory for projects that no longer exist | `node src/cli.js prune --cwd <path> --apply` |
@@ -140,7 +140,7 @@ to call them by name. Just talk naturally:
 - **State a fact about the project** and the assistant will save it
   for that project (for example: "this repo uses tabs").
 - **Ask "do you remember…?" or "what did we decide…?"** and the
-  assistant will search cross-project first, then the active project.
+  assistant will search the active project first, then cross-project.
 
 At the end of every conversation, the assistant does one short review
 of the session and saves any facts that are worth keeping. The
@@ -170,7 +170,7 @@ folder:
 The diagnostic log records automatic actions at one record per line
 for failures, save issues, and similar warnings. Free-form error
 messages are cleaned before they land on disk, so absolute paths,
-host names, and URLs are removed from any third-party string.
+IP addresses, and URLs are removed from any third-party string.
 
 Two optional behaviours, each can be turned off:
 
@@ -215,12 +215,15 @@ plugin, through the `kimi-memory` bin entry:
 kimi-memory list                              [--cwd <path>] [--scope project|global|all]
 kimi-memory get <memory-id>                   [--cwd <path>] [--scope project|global]
 kimi-memory status                            [--cwd <path>]
-kimi-memory recall <query>                    [--cwd <path>] [--limit N]
+kimi-memory recall <query>                    [--cwd <path>] [--scope project|global|all] [--limit N]
 kimi-memory prune                             [--cwd <path>] [--all-projects] [--apply]
 kimi-memory reset-project                     [--cwd <path>] [--apply]
-kimi-memory export                            [--cwd <path>] [--output <path>]
-kimi-memory import                            [--cwd <path>] [--input <path>]
+kimi-memory export <output-file>              [--cwd <path>] [--scope project|global|all]
+kimi-memory import <input-file>               [--cwd <path>] [--scope project|global|all]
+kimi-memory acl|dream|dreaming|consolidate|promote-to-global|serve-http …
 ```
+
+The last row is abbreviated; `kimi-memory help` prints the full list.
 
 `--json` emits machine-readable output; `-q` suppresses per-row
 output; `--home <dir>` overrides the Kimi data folder.

@@ -231,6 +231,10 @@ export async function generateProposalsForJob(
   if (!db || !projectKey || !jobId) {
     return { ok: false, reason: 'no_inputs' };
   }
+  // Master opt-out gates generation too, not just enqueue — the
+  // module contract is "the entire pipeline (enqueue + apply)".
+  // (Review finding M3.)
+  if (dreamOptOut()) return { ok: false, reason: 'env_opt_out' };
 
   const job = readJob(db, projectKey, jobId);
   if (!job) return { ok: false, reason: 'not_found' };
@@ -417,6 +421,9 @@ function markJobFailed(db, projectKey, jobId, message) {
 // proposals) is a no-op success.
 export function applyDreamJob(db, projectKey, jobId, opts = {}) {
   if (!db || !projectKey || !jobId) return { ok: false, reason: 'no_inputs' };
+  // Master opt-out gates apply too — MCP/CLI/dreaming-pass callers
+  // already handle { ok: false }. (Review finding M3.)
+  if (dreamOptOut()) return { ok: false, reason: 'env_opt_out' };
   const job = readJob(db, projectKey, jobId);
   if (!job) return { ok: false, reason: 'not_found' };
   if (job.status !== 'ready' && job.status !== 'partially_applied') {
@@ -521,8 +528,11 @@ export function applyDreamJob(db, projectKey, jobId, opts = {}) {
         } catch (e) {
           // Per-proposal failure: mark stale so the lifecycle can
           // re-enqueue a fresh job without looping on the same row.
+          // Counted as stale (the row class), not failed — the return
+          // contract says each count names a proposal class.
+          // (Review finding F4-dream.)
           markProposal(db, p.id, projectKey, 'stale', now);
-          failed += 1;
+          stale += 1;
         }
       }
     });

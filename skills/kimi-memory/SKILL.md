@@ -37,11 +37,11 @@ Pick the right scope for every fact you save or recall:
 
 ## Hygiene rules
 
-- **Never store secrets** (API keys, tokens, passwords, credentials, `.env` contents, PII). If asked to remember a secret, refuse and explain. The server enforces this too: `memory_save` and `memory_save_bulk` (and `memory_update` / `memory_merge`) run a shape check on `title`, `content`, every `tags` entry, and every string value in `metadata` (recursively), and return a `secret_detected: refusing to persist…` error if any match a known credential shape (OpenAI, Anthropic, GitHub, AWS, JWT, PEM, `key=…` assignments, `Authorization: Bearer` headers). On a bulk save the whole batch is rolled back. The check is bypassed by setting `KIMI_MEMORY_SECRET_SCAN=off` in the server environment — do not do this unless the caller explicitly asks for a secret-shaped fixture.
+- **Never store secrets** (API keys, tokens, passwords, credentials, `.env` contents, PII). If asked to remember a secret, refuse and explain. The server enforces this too: `memory_save` and `memory_save_bulk` (and `memory_update` / `memory_merge`) run a shape check on `title`, `content`, every `tags` entry, every string value in `metadata` (recursively), and every string value in `provenance` (recursively), and return a `secret_detected: refusing to persist…` error if any match a known credential shape (OpenAI, Anthropic, GitHub, AWS, JWT, PEM, `key=…` assignments, `Authorization: Bearer` headers). On a bulk save the whole batch is rolled back. The check is bypassed by setting `KIMI_MEMORY_SECRET_SCAN=off` in the server environment — do not do this unless the caller explicitly asks for a secret-shaped fixture.
 - **Always pass the project root** (the cwd of the current session) as `cwd` — even for `scope: "global"` writes (it stays as provenance/audit context).
 - **Always `memory_recall` (default `scope: "all"`) before `memory_save`** so you don't duplicate. If a recall hit exists, prefer update or `supersede: true`.
 - **After a successful `memory_save` / `memory_update` / `memory_delete`**, echo the returned `id` and `scope` so the user can see what was persisted.
-- **Use `tags` as a real JSON array** of strings, e.g. `["build", "ci"]`. Never a single string, never a comma-separated value inside a string. The server validates with JSON Schema and returns `/tags must be array` if it is not an actual array.
+- **Use `tags` as a real JSON array** of strings, e.g. `["build", "ci"]`. Never a single string, never a comma-separated value inside a string. The server validates with JSON Schema and returns a tags-must-be-an-array validation error if it is not an actual array.
 
 ## Types
 
@@ -76,7 +76,7 @@ Defaults: `memory_save` / `memory_update` / `memory_delete` write to `scope: "pr
 
 ### Auto-extract can emit global candidates
 
-The Stop-hook auto-extract (`src/extract.js:118-…`) reads the conversation and asks the configured model for durable facts. Each candidate carries a `type` (`semantic` / `episodic` / `procedural` / `context_snapshot`) plus an optional `scope` field. When the model writes `scope: "global"`, the dispatcher routes that row to `$KIMI_CODE_HOME/kimi-memory/_global/memory.sqlite` instead of the project DB. Set `KIMI_MEMORY_AUTO_EXTRACT_GLOBAL=off` to demote every global candidate back to project scope without changing the model's classification. When a global candidate lands, it is visible from any project the next session opens.
+The Stop-hook auto-extract (`runAutoExtract` in `src/extract.js`) reads the conversation and asks the configured model for durable facts. Each candidate carries a `type` (`semantic` / `episodic` / `procedural` / `context_snapshot`) plus an optional `scope` field. When the model writes `scope: "global"`, the dispatcher routes that row to `$KIMI_CODE_HOME/kimi-memory/_global/memory.sqlite` instead of the project DB. Set `KIMI_MEMORY_AUTO_EXTRACT_GLOBAL=off` to demote every global candidate back to project scope without changing the model's classification. When a global candidate lands, it is visible from any project the next session opens.
 
 ### Recall accuracy (v17+)
 

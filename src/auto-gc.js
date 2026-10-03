@@ -288,13 +288,18 @@ export function runAutoPrune(db, projectKey, { now = new Date() } = {}) {
     projectKey,
     projectKey,
   );
-  safeDelete(
-    'promo_orphan',
-    `DELETE FROM persona_promotions
-     WHERE memory_id NOT IN (SELECT id FROM memories)
-       AND julianday('now') - julianday(at) >= ?`,
-    PRUNE_ORPHAN_DAYS,
-  );
+  // Legacy subsystem gate: with KIMI_MEMORY_LEGACY_SUBSYSTEMS=off the
+  // deprecated tier/persona audit table stays untouched (mirrors the
+  // archive sweep below and the runAutoTier gate). (Review finding F2.)
+  if (process.env.KIMI_MEMORY_LEGACY_SUBSYSTEMS !== 'off') {
+    safeDelete(
+      'promo_orphan',
+      `DELETE FROM persona_promotions
+       WHERE memory_id NOT IN (SELECT id FROM memories)
+         AND julianday('now') - julianday(at) >= ?`,
+      PRUNE_ORPHAN_DAYS,
+    );
+  }
 
   return result;
 }

@@ -28,8 +28,17 @@ try {
 // cannot be truncated by db.close().
 const flushAndExit = (code = 0) => {
   // Best-effort drain; the wall-clock cap inside flushEmbeddings
-  // bounds the wait so a hung encoder cannot block exit.
+  // bounds the wait so a hung encoder cannot block exit. A timeout
+  // is reported (not silent) so truncated embedding writes are
+  // visible instead of vanishing. (Review finding M1.)
   Promise.resolve(flushEmbeddings({ timeoutMs: 10000 }))
+    .then((r) => {
+      if (r && r.timedOut) {
+        process.stderr.write(
+          `[kimi-memory] shutdown: embedding drain timed out after 10000ms (waited=${r.waited}); pending rows retry on next start\n`,
+        );
+      }
+    })
     .catch(() => {})
     .finally(() => {
       try {

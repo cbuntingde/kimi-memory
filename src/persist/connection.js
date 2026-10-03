@@ -14,8 +14,11 @@ import { edgeKindSqlList } from '../edge-kinds.js';
 // sees a HIGHER value refuses to touch the file (an older build must
 // never mutate a newer schema). The value tracks the highest migration
 // label in the array; the numbering has a gap at v14 (no such
-// migration was ever shipped) and the array holds 19 functions for the
-// 17 labelled versions, because v10 was split across five functions.
+// migration was ever shipped) and the array holds 19 functions
+// covering 15 labels (v2–v13, v15–v17; v1 is the base SCHEMA_SQL),
+// because v10 was split across five functions. Order is load-bearing
+// only for v5/v10-skill/v16 vs v12; the rest are independent probes.
+// (Review finding F9.)
 // Bumping this without appending a migration is a no-op; appending a
 // migration without bumping it means existing DBs never run it.
 const SCHEMA_VERSION = 17;

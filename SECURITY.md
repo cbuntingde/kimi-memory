@@ -16,7 +16,8 @@ the user's other plugins, or third-party models.
 - **Trusted**: the user, their Kimi Code runtime, the local filesystem.
 - **Adversarial surface**: text the user pastes into chat or that an
   upstream model emits. The plugin must reject known credential shapes
-  on every write path (content, title, tags, metadata, recursively).
+  on every write path (content, title, tags, metadata, and every string
+  value in provenance, recursively).
 - **Out of scope**: network adversaries, cross-process injection,
   untrusted code from sibling plugins.
 
@@ -86,10 +87,11 @@ keeps under its own retention policy.
    make the supply chain deterministic. Disable with
    `KIMI_MEMORY_EMBEDDINGS=off`; recall falls back to keyword search.
 2. **Auto-extract LLM call** (`KIMI_MEMORY_AUTO_EXTRACT=on`,
-   default on). At every Stop / SessionEnd / SessionStart the plugin
+   default on). At every Stop / SessionEnd the plugin
    sends the most recent conversation exchange plus detected project
    metadata to the provider Kimi's `config.toml` already routes
-   through. The transcript is scrubbed by `redactSecrets` before it
+   through. SessionStart only surfaces the previous run's counts; it
+   makes no LLM call. The transcript is scrubbed by `redactSecrets` before it
    leaves the machine — known credential shapes are replaced with
    `[REDACTED_*]` placeholders — and the provider's own policies
    apply on top. To opt out, set `KIMI_MEMORY_AUTO_EXTRACT=off` or
@@ -150,11 +152,11 @@ on hardened setups need to opt out of:
   documented "dev convenience" path; on a shared host (multi-user
   workstation, shared CI runner, containerized agent with another
   local user) leave `KIMI_MEMORY_PROXY_AUTH` at its default (on, with
-  a token) or bind to a Unix socket instead.
+  a token) and keep the loopback bind.
 
 ## Dependency hygiene
 
-`npm audit` is run on every CI push. The lockfile is committed; builds
+Run `npm audit` locally before release. The lockfile is committed; builds
 are reproducible from `package-lock.json` only. Direct dependencies are
 pinned to caret-ranges in `package.json`; the lockfile pins exact
 versions.

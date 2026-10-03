@@ -18,7 +18,7 @@ Steps:
 2. If **not responding**, tell the user:
    `kimi-memos-dashboard is not running. Start it with:`
    `cd ~/.kimi-code/plugins/managed/kimi-memos-dashboard && npm start`
-   and then re-run `/memos`. Do not start it for them — the dashboard binds a
+   and then re-run `/kimi-memory:memos`. Do not start it for them — the dashboard binds a
    port and the user should opt in.
 3. If **responding**, open the dashboard URL in the default browser:
    - Windows (Git Bash / cmd): `start "" "http://127.0.0.1:8765/"`

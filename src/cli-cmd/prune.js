@@ -13,6 +13,7 @@ export async function cmdPrune(args) {
   const all = !!args.flags['all-projects'];
   const apply = !!args.flags.apply;
   const asJson = !!args.flags.json;
+  const quiet = !!args.flags.quiet;
   const cwd = resolveCwd(args);
   if (!cwd) {
     process.stderr.write('error: --cwd is required (the active project is never removed)\n');
@@ -40,7 +41,9 @@ export async function cmdPrune(args) {
   };
   if (asJson) emitJson(out);
   else {
-    for (const c of candidates) {
+    // -q suppresses per-row output, mirroring `list`. (Review cli-2.)
+    const rows = quiet ? [] : candidates;
+    for (const c of rows) {
       process.stdout.write(
         `${c.project_key} action=${c.action} exists_on_disk=${c.exists_on_disk} canonical_root=${c.canonical_root || '(none)'}\n`,
       );

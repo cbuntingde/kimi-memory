@@ -35,8 +35,6 @@
 // `{ skipped: 'reason' | null, written: 0|1, updated: 0|1, reason }`.
 
 import { execFile } from 'node:child_process';
-import path from 'node:path';
-import { promises as fs } from 'node:fs';
 import { nowIso } from './util.js';
 
 export const WORK_LOG_MIN_EVENTS = 8;
@@ -279,8 +277,3 @@ export function recordWorkLogResult(projectKey, result) {
 export function _resetWorkLogRegistryForTests() {
   _lastResultByKey.clear();
 }
-
-// Suppress an unused-symbol warning when fs is imported for future
-// enrichment. Kept so a future `readFile`-backed fallback (e.g. for
-// repos with `--no-pager` issues) doesn't add an import.
-void fs;

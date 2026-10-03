@@ -18,7 +18,9 @@
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 import { isIP } from 'node:net';
+import { lookup as dnsLookupCallback } from 'node:dns';
 import { lookup } from 'node:dns/promises';
+import { Agent } from 'undici';
 import { nowIso, safeJsonParse, asString } from './util.js';
 import { withLlmRetry } from './retry.js';
 import { logAutoExtractError } from './diagnostics.js';
@@ -274,6 +276,10 @@ export async function resolveLlmTarget(homeDir, { lookupImpl = lookup } = {}) {
   // Refusal is fail-open in the sense that the hook reports a count
   // and moves on; we never crash the agent lifecycle.
   // (Production-readiness review finding F-6.)
+  // Guard-time DNS answers, pinned for the fetch so a hostile
+  // resolver cannot answer public-then-private (DNS rebinding).
+  // Set only when the opt-in DNS leg runs below. (Review finding F6.)
+  let pinnedIps = null;
   if (process.env.KIMI_MEMORY_AUTO_EXTRACT_REQUIRE_HTTPS === '1') {
     const guarded = guardLlmBaseUrl(baseUrl);
     if (!guarded.ok) {
@@ -332,6 +338,10 @@ export async function resolveLlmTarget(homeDir, { lookupImpl = lookup } = {}) {
       if (addresses.some((a) => isPrivateHost(normalizeHostname(a && a.address)))) {
         return { error: `base_url_blocked:private_host:${resolvedHost}`, baseUrl };
       }
+      pinnedIps = addresses
+        .filter((a) => a && typeof a.address === 'string')
+        .map((a) => ({ address: a.address, family: a.family }));
+      if (pinnedIps.length === 0) pinnedIps = null;
     }
   }
   return {
@@ -340,6 +350,7 @@ export async function resolveLlmTarget(homeDir, { lookupImpl = lookup } = {}) {
     apiKey: asString(providerBlock.api_key),
     baseUrl,
     type: asString(providerBlock.type) || 'openai',
+    pinnedIps,
   };
 }
 
@@ -519,7 +530,10 @@ function buildExtractionPrompt(transcript, existingTitles, projectMeta) {
   const trimmed = redactSecrets(String(transcript || '')).slice(0, MAX_INPUT_CHARS);
   const titlesLine =
     existingTitles && existingTitles.length
-      ? `\nFor dedup, here are titles already in this project's memory (avoid repeating these):\n- ${existingTitles.slice(0, 50).join('\n- ')}\n`
+      ? `\nFor dedup, here are titles already in this project's memory (avoid repeating these):\n- ${existingTitles
+          .slice(0, 50)
+          .map((t) => redactSecrets(String(t)))
+          .join('\n- ')}\n`
       : '';
   // Defensive JSON.stringify for project metadata: a caller that
   // passes a projectMeta with a circular reference or a BigInt would
@@ -627,12 +641,36 @@ function llmHttpError(endpoint, res) {
 // exists for), and throws a structured error for an HTTP or transport
 // failure so the caller's retry wrapper can tell a permanent 4xx from a
 // transient 5xx.
-export async function callChat({ apiKey, baseUrl, type, model, system, user, signal }) {
+export async function callChat({ apiKey, baseUrl, type, model, system, user, signal, pinnedIps }) {
   if (!apiKey || !baseUrl) return null;
   const ctrl = new AbortController();
   const timeout = setTimeout(() => ctrl.abort(), LLM_TIMEOUT_MS);
   const onAbort = () => ctrl.abort();
   if (signal) signal.addEventListener('abort', onAbort);
+  // DNS-rebinding pin: resolveLlmTarget already resolved the provider
+  // name and judged every answer at guard time; without this, fetch
+  // re-resolves minutes later and a hostile resolver can answer
+  // public-then-private. Pin the guard-time answer for this fetch —
+  // TLS SNI/hostname verification still use the name, only the
+  // address is fixed. (Review finding F6.)
+  let pinAgent = null;
+  let dispatcher;
+  if (Array.isArray(pinnedIps) && pinnedIps.length > 0) {
+    const host = new URL(baseUrl).hostname.toLowerCase();
+    const first = pinnedIps[0];
+    const ip = typeof first === 'string' ? first : first && first.address;
+    const family =
+      typeof first === 'object' && first && first.family ? first.family : ip.includes(':') ? 6 : 4;
+    pinAgent = new Agent({
+      connect: {
+        lookup(h, opts, cb) {
+          if (typeof h === 'string' && h.toLowerCase() === host) cb(null, ip, family);
+          else dnsLookupCallback(h, opts, cb);
+        },
+      },
+    });
+    dispatcher = pinAgent;
+  }
   try {
     const url = baseUrl.replace(/\/+$/, '');
     // `redirect: 'error'` on both calls. The base-URL guard only ever sees
@@ -647,6 +685,7 @@ export async function callChat({ apiKey, baseUrl, type, model, system, user, sig
         method: 'POST',
         redirect: 'error',
         signal: ctrl.signal,
+        dispatcher,
         headers: {
           'content-type': 'application/json',
           'x-api-key': apiKey,
@@ -674,6 +713,7 @@ export async function callChat({ apiKey, baseUrl, type, model, system, user, sig
       method: 'POST',
       redirect: 'error',
       signal: ctrl.signal,
+      dispatcher,
       headers: { 'content-type': 'application/json', authorization: `Bearer ${apiKey}` },
       body: JSON.stringify({
         model,
@@ -716,6 +756,13 @@ export async function callChat({ apiKey, baseUrl, type, model, system, user, sig
     // callChat per attempt, so leaving the listener attached would
     // accumulate one per attempt on a long-lived signal.
     if (signal) signal.removeEventListener('abort', onAbort);
+    if (pinAgent) {
+      try {
+        await pinAgent.close();
+      } catch {
+        /* ignore — pool teardown is best-effort */
+      }
+    }
   }
 }
 
@@ -950,7 +997,12 @@ export async function runAutoExtract({
     // 2 x 4s + one 1000ms-capped backoff ≈ 9.1s. A third attempt would
     // reach ~14s and be killed mid-flight, losing the pass entirely.
     reply = await withLlmRetry(
-      () => callLlm({ ...target, system: prompt.system, user: prompt.user }),
+      // Normalize '' to null so an empty 200 body consumes the retry
+      // it deserves instead of scoring llm_no_reply. (Review finding.)
+      () =>
+        callLlm({ ...target, system: prompt.system, user: prompt.user }).then((r) =>
+          r ? r : null,
+        ),
       { projectKey, maxAttempts: 2, baseDelayMs: 1000 },
     );
   } catch (error) {

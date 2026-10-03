@@ -38,9 +38,10 @@ export function register(server, handlers, home) {
       const root = path.resolve(rawRoot);
       const projectRoot = path.resolve(ctx.cwd);
       if (root !== projectRoot && !root.startsWith(projectRoot + path.sep)) {
-        throw toolError(
-          `codegraph_extract root must be within the project directory (${projectRoot}); got ${root}`,
-        );
+        // Static message (no paths): the wrapper scrubs them today,
+        // but the guard needs no path to name the refusal. The
+        // leading text is pinned by tests/26. (Review finding S5.)
+        throw toolError('codegraph_extract root must be within the project directory');
       }
       const lim = validateLimit(args.limit, 1, 5000, 200);
       if (!lim.ok) throw toolError(lim.error);

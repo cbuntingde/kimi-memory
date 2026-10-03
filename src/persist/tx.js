@@ -16,6 +16,13 @@
 // to the caller; an error thrown by `fn` propagates after the savepoint
 // has been unwound.
 export function withSavepoint(db, name, fn) {
+  // The name is interpolated — savepoints cannot be parameterized —
+  // so validate once at the choke point. All in-domain callers pass
+  // literals today, but out-of-domain callers build from `label`.
+  // (Review finding F8.)
+  if (typeof name !== 'string' || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(name)) {
+    throw new Error(`withSavepoint: invalid savepoint name: ${String(name).slice(0, 64)}`);
+  }
   db.exec(`SAVEPOINT ${name}`);
   let out;
   try {

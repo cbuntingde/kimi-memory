@@ -114,12 +114,15 @@ export function revokeMemoryAcl(db, projectKey, memoryId, principalKind, princip
       `invalid principal_kind: ${principalKind} (must be one of: ${PRINCIPAL_KINDS.join(', ')})`,
     );
   }
+  // Trim like the grant path: without this, revoking " alice "
+  // no-ops on the grant stored as "alice". (Review finding NIT.)
+  const trimmedId = typeof principalId === 'string' ? principalId.trim() : principalId;
   const r = db
     .prepare(
       `DELETE FROM memories_acl
        WHERE memory_id = ? AND principal_kind = ? AND principal_id = ?`,
     )
-    .run(memoryId, principalKind, principalId);
+    .run(memoryId, principalKind, trimmedId);
   return r.changes > 0;
 }
 

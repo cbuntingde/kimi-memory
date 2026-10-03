@@ -58,9 +58,10 @@ import { logHookDiag } from './diagnostics.js';
 export const DREAMING_MODES = Object.freeze(['off', 'auto', 'on']);
 export const DREAMING_PASSES = Object.freeze(['consolidate', 'dream', 'gc']);
 
-// Default include set. auto-extract is intentionally NOT here — it makes
-// an outbound LLM call and runs at every Stop, so it has a different
-// cost profile. Add it explicitly via the agent or the MCP tool.
+// Default include set. auto-extract is intentionally NOT a dreaming
+// pass — it makes an outbound LLM call and runs on the Stop/SessionEnd
+// hook instead, so it has a different cost profile and cannot be
+// added via --include (unknown names are silently dropped).
 const DEFAULT_INCLUDE = ['consolidate', 'dream', 'gc'];
 
 // Default interval: 24h in `on`, 30 min in `auto`. Matches the existing
@@ -124,8 +125,9 @@ export function parseInterval(spec) {
 // A global fallback lives at:
 //   $KIMI_CODE_HOME/kimi-memory/_config/dreaming.json
 //
-// The agent's `/dreaming` command writes per-project. The global file
-// is a system-wide default applied when a project has no override.
+// The agent's `/kimi-memory:dreaming` command writes per-project. The
+// global file is a system-wide default applied when a project has no
+// override.
 function readJsonSafe(p, fallback) {
   try {
     if (!existsSync(p)) return fallback;

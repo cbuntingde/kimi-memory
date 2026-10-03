@@ -236,7 +236,7 @@ function cosine(a, b) {
 // once before the loop — the previous shape re-decoded the same BLOB
 // for every (i, j) pair, ~200k decodes for N=640 vs the 640 a single
 // pass requires. (Audit fix.)
-function clusterMemories(memories, { decodeEmbedding }) {
+function clusterMemories(memories, { decodeEmbedding, memoryCount }) {
   const clusters = [];
   const visited = new Set();
 
@@ -253,8 +253,10 @@ function clusterMemories(memories, { decodeEmbedding }) {
   // Small-dataset escape: when the project carries fewer than
   // SMALL_DATASET_THRESHOLD active memories, the tag-overlap filter
   // drops to 0 so a 4–6 memory project can still cluster. The cosine
-  // floor stays at CONSOLIDATE_THRESHOLD either way.
-  const tagFloor = effectiveTagOverlap(memories.length);
+  // floor stays at CONSOLIDATE_THRESHOLD either way. The count is the
+  // ACTIVE total, not the embedded-only list length — a project with
+  // 20 active but 8 embedded rows must not relax. (Review recall-4.)
+  const tagFloor = effectiveTagOverlap(memoryCount ?? memories.length);
 
   for (let i = 0; i < memories.length; i++) {
     if (visited.has(memories[i].id)) continue;
@@ -680,14 +682,21 @@ export async function runConsolidate({
         if (mode === 'proposal') {
           result.proposals.push(proposal);
         } else if (typeof mergeMemory === 'function') {
-          try {
-            mergeMemory(db, projectKey, pair.target.id, pair.sibling.id, {
-              mergedContent: proposal.proposed_content,
-              weight: 1.0,
-            });
-            result.merged += 1;
-          } catch {
+          // KIMI_MEMORY_AUTO_MERGE=off disables the pair-level
+          // auto-merge (AGENTS.md contract) — detection counters above
+          // still run, only the mutation is gated. (Review finding M2.)
+          if (!autoMergeEnabled) {
             result.mergeSkipped += 1;
+          } else {
+            try {
+              mergeMemory(db, projectKey, pair.target.id, pair.sibling.id, {
+                mergedContent: proposal.proposed_content,
+                weight: 1.0,
+              });
+              result.merged += 1;
+            } catch {
+              result.mergeSkipped += 1;
+            }
           }
         }
         covered.add(pair.target.id);
@@ -704,9 +713,26 @@ export async function runConsolidate({
     return result;
   }
 
+  // Active-row total for the small-dataset escape: `memories` may
+  // hold only the embeddable subset. Falls back to the list length
+  // when the count query itself fails. (Review finding recall-4.)
+  let activeCount = memories.length;
+  try {
+    activeCount = db
+      .prepare(
+        `SELECT COUNT(*) AS n FROM memories WHERE project_key = ? AND status = 'active'
+         AND (expires_at IS NULL OR datetime(expires_at) > datetime('now'))`,
+      )
+      .get(projectKey).n;
+  } catch {
+    activeCount = memories.length;
+  }
   let clusters;
   try {
-    clusters = clusterMemories(memories, { decodeEmbedding: decodeEmbeddingImpl });
+    clusters = clusterMemories(memories, {
+      decodeEmbedding: decodeEmbeddingImpl,
+      memoryCount: activeCount,
+    });
   } catch (e) {
     recordConsolidationRun(db, projectKey, result, { trigger: 'inline' });
     return { ...result, error: e && e.message ? e.message : String(e) };

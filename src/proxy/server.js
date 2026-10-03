@@ -554,7 +554,12 @@ export async function startProxy({
     await serverClosed;
 
     try {
-      await Promise.resolve(flushEmbeddings({ timeoutMs: 10000 }));
+      const flushed = await Promise.resolve(flushEmbeddings({ timeoutMs: 10000 }));
+      if (flushed && flushed.timedOut) {
+        process.stderr.write(
+          `[kimi-memory] shutdown: embedding drain timed out after 10000ms (waited=${flushed.waited}); pending rows retry on next start\n`,
+        );
+      }
     } catch {
       /* ignore */
     }

@@ -3,7 +3,7 @@
 //   node src/cli.js export <output-file> [--cwd <path>] [--scope project|global|all]
 import { writeFileSync } from 'node:fs';
 import { listMemories } from '../persist.js';
-import { homeDir, resolveCwd, eachScopeDb } from '../cli/lib.js';
+import { homeDir, resolveCwd, eachScopeDb, emitJson } from '../cli/lib.js';
 
 // The export shape drops the embedding vector: it is a large base64 blob
 // that the importer cannot use (it re-embeds), and including it would
@@ -27,6 +27,7 @@ export async function cmdExport(args) {
     process.exit(1);
   }
   const scope = (args.flags.scope || 'project').toString();
+  const asJson = !!args.flags.json;
 
   if (!['project', 'global', 'all'].includes(scope)) {
     process.stderr.write(`error: invalid scope: ${scope}\n`);
@@ -58,7 +59,18 @@ export async function cmdExport(args) {
   const doc = { version: 1, exported_at: new Date().toISOString(), scopes };
   try {
     writeFileSync(outFile, JSON.stringify(doc, null, 2));
-    process.stdout.write(`exported to ${outFile}\n`);
+    if (asJson) {
+      emitJson({
+        operation: 'export',
+        file: outFile,
+        scope,
+        project_memories: scopes.project ? scopes.project.memories.length : 0,
+        global_memories: scopes.global ? scopes.global.memories.length : 0,
+        project_working_slots: scopes.project ? scopes.project.working_memory.length : 0,
+      });
+    } else {
+      process.stdout.write(`exported to ${outFile}\n`);
+    }
   } catch (e) {
     process.stderr.write(`error writing export file: ${e && e.message ? e.message : e}\n`);
     process.exit(2);

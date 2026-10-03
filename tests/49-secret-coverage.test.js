@@ -75,6 +75,11 @@ const CREDENTIALS = [
   ],
   ['Azure: AccountKey=base64blob+morebase64==', 'base64blob+morebase64'],
   ['aB3dE5fG7hI9jK1lM2nO4pQ6rS8tU0vW1xY2zA', 'aB3dE5fG7hI9jK1lM2nO4pQ6rS8tU0vW1xY2zA'],
+  // Review pass: prefix-less PAT assignments (Azure DevOps, generic
+  // hex) and a bare Bearer line with no Authorization: prefix.
+  ['GH_PAT=abcdef1234567890abcdef', 'abcdef1234567890abcdef'],
+  ['PAT=abcdef1234567890abcdef', 'abcdef1234567890abcdef'],
+  ['Bearer abcdefghijklmnopqrstuvwxyz0123456789', 'abcdefghijklmnopqrstuvwxyz0123456789'],
 ];
 
 // Text that merely mentions a credential-adjacent word. Guard against

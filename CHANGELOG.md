@@ -212,6 +212,55 @@ jobs older than 90 days together with their proposals. Jobs in `queued`,
 touched, and `dream_enqueue` treats `partially_applied` as outstanding so
 the queue stays at one job per project (`src/auto-gc.js`, `src/dream.js`).
 
+### Fixed — full-plugin review pass (contract audit)
+
+A file-by-file review of the whole plugin against a reconstructed
+behavioural contract (16 behaviour clauses + 7 quality gates), each
+finding verified against the code before fixing. No BLOCK-level defect
+was found; the four MUST-level fixes:
+
+- `flushEmbeddings` discarded the drain/timeout race winner and always
+  returned `{ waited }`, so shutdown truncated embedding writes
+  blindly. It now returns `{ waited, timedOut }`, clears the timer,
+  and both shutdown paths log a timeout instead of staying silent
+  (`src/persist/memories.js`, `src/mcp/main.js`, `src/proxy/server.js`).
+- `KIMI_MEMORY_AUTO_MERGE=off` did not stop pair-level direct merges
+  in the inline consolidate pass. The pair loop now honours the flag
+  and counts skipped merges (`src/consolidate.js`).
+- `KIMI_MEMORY_DREAM=off` gated enqueue only — explicit
+  generate/apply (MCP, CLI, dreaming pass) still wrote. The
+  library-level gate now covers generation and apply (`src/dream.js`).
+- `assertNoSecret` never scanned `shared_with` (MCP-accepted),
+  identity columns, scalar `tags`/`metadata`/`provenance`, or
+  `processing_status`. All persisted caller-controlled strings are
+  now scanned (`src/persist/memories.js`).
+
+Hardening and consistency fixes in the same pass: `PAT` assignment
+names and bare `Bearer <token>` join the secret catalogue
+(`src/secrets.js`); extract redacts dedup titles and pins the
+guard-time DNS answer for the fetch via an `undici` dispatcher, and an
+empty LLM reply now consumes its retry (`src/extract.js`, new
+`undici` dependency); the save upsert is scope-checked, promotions
+re-screen the full row and honour `SECRET_SCAN=off`, skill/conversation
+writers are gated, the conversation FTS mirror dedupes and the LIKE
+fallback covers post-mirror rows, float/NaN limits are clamped, and
+savepoint names are validated (`src/persist/*`); the dreaming handler
+throws through the scrubbed error path and floors both interval
+spellings, bulk save accepts `context_snapshot` and funnels
+`shared_with`, path-bearing errors are static, and ACL revoke trims
+(`src/mcp/*`, `src/acl.js`); the MIN_HITS/BASE_LIMIT pair is clamped,
+the relax threshold counts active rows, and the embedding-integrity
+warning fires before the trust decision (`src/hooks/handlers/lib/
+constants.js`, `src/consolidate.js`, `src/embedding.js`); the legacy
+`persona_promotions` prune sweep is gated, UNC is refused on POSIX,
+and the stale/failed apply counter names the row class (`src/auto-gc.js`,
+`src/project-key.js`, `src/dream.js`); CLI recall gains `--scope` and
+a validated `--limit`, export/import honour `--json`, prune honours
+`-q`, and boolean flags no longer swallow positionals (`src/cli*`);
+thirty documentation drifts fixed across README, AGENTS.md,
+CONTRIBUTING.md, SECURITY.md, skills, and commands
+(`tests/75-review-fixes.test.js` pins the regressions).
+
 ## [0.7.0] — 2026-09-19
 
 ### Fixed — two earlier audit findings that never actually landed
@@ -746,7 +795,8 @@ but have no authenticated MCP caller and no agent-workflow integration.
 A new `KIMI_MEMORY_LEGACY_SUBSYSTEMS` env var hides the 20 corresponding
 MCP tools (ACL: 5, tier: 4, wiki: 5, codegraph: 6) and skips the
 auto-tier promotion + `persona_promotions` archive sweeps when set to
-`off`. The schema columns + tables remain in place so flipping the env
+`off`. (Correction: 20 at the time of writing; 15 after the wiki group
+was removed.) The schema columns + tables remain in place so flipping the env
 var back on requires no migration. Removal is planned for the next
 major version.
 

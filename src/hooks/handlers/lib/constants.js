@@ -48,7 +48,11 @@ export const RECALL_BASE_LIMIT = (() => {
 // floor keeps the surface usable.
 export const RECALL_MIN_HITS = (() => {
   const v = Number(process.env.KIMI_MEMORY_RECALL_MIN_HITS);
-  return Number.isFinite(v) && v >= 1 ? Math.floor(v) : 3;
+  const parsed = Number.isFinite(v) && v >= 1 ? Math.floor(v) : 3;
+  // A floor above the ceiling would defeat the "hard ceiling"
+  // (max(MIN, min(BASE, …)) > BASE). Clamp to keep the pair sane.
+  // (Review finding: recall-5.)
+  return Math.min(parsed, RECALL_BASE_LIMIT);
 })();
 // env: KIMI_MEMORY_RECALL_GAP_FACTOR. Score-gap elbow. After
 // per-type selection, drop any hit whose `score` is below

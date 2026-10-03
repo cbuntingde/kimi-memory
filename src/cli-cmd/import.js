@@ -20,7 +20,7 @@ import {
   globalDbPath,
   GLOBAL_PROJECT_KEY,
 } from '../project-key.js';
-import { homeDir, resolveCwd } from '../cli/lib.js';
+import { homeDir, resolveCwd, emitJson } from '../cli/lib.js';
 
 export async function cmdImport(args) {
   const home = homeDir(args);
@@ -58,6 +58,7 @@ export async function cmdImport(args) {
   const scope = (args.flags.scope || 'project').toString();
   const replace = !!args.flags.replace;
   const yes = !!args.flags.yes;
+  const asJson = !!args.flags.json;
 
   if (!['project', 'global', 'all'].includes(scope)) {
     process.stderr.write(`error: invalid scope: ${scope}\n`);
@@ -238,5 +239,9 @@ export async function cmdImport(args) {
     closeDb(gPath);
   }
 
-  process.stdout.write(`imported ${count} items from ${inFile}\n`);
+  if (asJson) {
+    emitJson({ operation: 'import', file: inFile, scope, replace, count });
+  } else {
+    process.stdout.write(`imported ${count} items from ${inFile}\n`);
+  }
 }

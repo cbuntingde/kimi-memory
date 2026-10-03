@@ -20,8 +20,10 @@ export function formatConsolidateSegment(consolidate) {
     return `pairs:${pairs}=title:${title}+near:${nearDup} clusters:${saved} merges:${merged}`;
   }
   if (consolidate.saved && consolidate.saved > 0) {
-    const merged = consolidate.merged ? `+merges:${consolidate.merged}` : '';
-    return `clusters:${consolidate.saved} merges:${consolidate.merged || 0}${merged}`;
+    // One merged counter exists (pair and cluster merges share it), so
+    // there is no second value to append — the old `+merges:` suffix
+    // repeated the same number. (Re-audit fix.)
+    return `clusters:${consolidate.saved} merges:${consolidate.merged || 0}`;
   }
   if (consolidate.clusters && consolidate.clusters > 0) {
     return `kept:0/of:${consolidate.clusters}`;

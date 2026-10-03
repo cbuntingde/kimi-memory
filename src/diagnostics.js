@@ -12,9 +12,9 @@ import { kimiHome, nowIso, sanitizeText } from './util.js';
 // Everything written to the log passes through `sanitizeText` first.
 // This module is the only place that persists raw error strings and
 // caller-supplied context objects, and the log sits on disk for 90 days;
-// the README promises it carries no absolute paths, host names, URLs, or
-// credentials. Without this the promise was false — stack traces went to
-// disk verbatim.
+// the README promises it carries no absolute paths, IP addresses,
+// URLs, or credentials. Without this the promise was false — stack
+// traces went to disk verbatim.
 function scrub(value) {
   if (typeof value !== 'string' || !value) return value;
   return sanitizeText(value);

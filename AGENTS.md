@@ -111,15 +111,15 @@ Unless noted, a value of `off` disables the feature and the default is
 
 ### HTTP proxy
 
-| Variable                          | Default     | What it does                                                                                              |
-| --------------------------------- | ----------- | --------------------------------------------------------------------------------------------------------- |
-| `KIMI_MEMORY_PROXY_HOST`          | `127.0.0.1` | Bind host for the memory proxy. A non-loopback bind enforces the guards below.                            |
-| `KIMI_MEMORY_PROXY_TOKEN`         | unset       | Bearer token required on every proxy request.                                                             |
-| `KIMI_MEMORY_PROXY_AUTH`          | unset       | `off` (or `0` / `false` / `no`) disables auth; refused on a non-loopback bind.                            |
-| `KIMI_MEMORY_PROXY_REQUIRE_HTTPS` | unset       | `1` demands TLS termination for a non-loopback bind; `off` explicitly allows cleartext (not recommended). |
-| `KIMI_MEMORY_PROXY_CORS_ORIGINS`  | unset       | Comma-separated CORS origin allowlist.                                                                    |
-| `KIMI_MEMORY_PROXY_ALLOW_TOOLS`   | unset       | Comma-separated opt-in for destructive tools on a non-loopback bind.                                      |
-| `KIMI_MEMORY_PROXY_DENY_TOOLS`    | unset       | Comma-separated deny-list. Wins over the allow-list.                                                      |
+| Variable                          | Default     | What it does                                                                                                                                                                                                                            |
+| --------------------------------- | ----------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `KIMI_MEMORY_PROXY_HOST`          | `127.0.0.1` | Guard-classification fallback only — read solely by `nonLoopbackToolGuard` when its caller omits `host`. The listen address always comes from `serve-http --host` (default `127.0.0.1`). A non-loopback bind enforces the guards below. |
+| `KIMI_MEMORY_PROXY_TOKEN`         | unset       | Bearer token required on every proxy request.                                                                                                                                                                                           |
+| `KIMI_MEMORY_PROXY_AUTH`          | unset       | `off` (or `0` / `false` / `no`) disables auth; refused on a non-loopback bind.                                                                                                                                                          |
+| `KIMI_MEMORY_PROXY_REQUIRE_HTTPS` | unset       | `1` demands TLS termination for a non-loopback bind; `off` explicitly allows cleartext (not recommended).                                                                                                                               |
+| `KIMI_MEMORY_PROXY_CORS_ORIGINS`  | unset       | Comma-separated CORS origin allowlist.                                                                                                                                                                                                  |
+| `KIMI_MEMORY_PROXY_ALLOW_TOOLS`   | unset       | Comma-separated opt-in for destructive tools on a non-loopback bind.                                                                                                                                                                    |
+| `KIMI_MEMORY_PROXY_DENY_TOOLS`    | unset       | Comma-separated deny-list. Wins over the allow-list.                                                                                                                                                                                    |
 
 ### Internal
 
@@ -139,8 +139,9 @@ of the repo. `KIMI_MEMORY_AUTO_RESET_ON_RECLONE` (default `on`) decides
 what happens at `SessionStart` / `UserPromptSubmit`:
 
 - **on** — `buildStaleMemoryLine` in
-  `src/hooks/handlers/lib/pipeline.js` wipes the project's per-row
-  tables in one transaction and reports what was deleted. The reset is
+  `src/hooks/handlers/lib/render.js` (re-exported through `pipeline.js`)
+  wipes the project's per-row tables in one transaction and reports
+  what was deleted. The reset is
   one-shot: `resetProject` moves `first_seen_at` forward, which
   neutralises the detection on the next session.
 - **off** — the hook emits the manual `[stale-memory]` hint instead,

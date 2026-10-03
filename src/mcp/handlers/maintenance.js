@@ -113,7 +113,11 @@ export function register(server, handlers, home) {
       const key = deriveProjectKey(ctx.cwd);
       const dbPath = projectDbPath(home, key);
       if (!existsSync(dbPath)) {
-        throw toolError(`no project DB at ${dbPath} (project has not been written to yet)`);
+        // No path in the message: the wrapper scrubs it today, but the
+        // project key names the target well enough. (Review finding S5.)
+        throw toolError(
+          `no project DB for this project yet (key ${key}; project has not been written to yet)`,
+        );
       }
       // Re-clone check: when stale memory is the reason for the reset,
       // surface the diagnostic so the user can confirm. The check is

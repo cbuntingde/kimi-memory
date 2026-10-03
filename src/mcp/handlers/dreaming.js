@@ -14,6 +14,7 @@
 // parses `args` itself.
 
 import { registerTool } from '../lib/register-tool.js';
+import { toolError } from '../lib/tool-error.js';
 import { TOOL_DEFS_BY_NAME } from '../tool-defs.js';
 import { saveMemory, linkMemory, mergeMemory } from '../../persist.js';
 import {
@@ -107,17 +108,14 @@ export function register(server, handlers, home) {
         } else if (Number.isFinite(Number(opts.interval_ms))) {
           intervalMs = Math.max(0, Math.trunc(Number(opts.interval_ms)));
         }
-        if (
-          opts.interval_spec == null &&
-          Number.isFinite(Number(opts.interval_ms)) &&
-          Number(opts.interval_ms) > 0 &&
-          Number(opts.interval_ms) < 300_000
-        ) {
+        // The 5-minute floor applies to both spellings — a parsed
+        // interval_spec of "30s" used to slip under it. (Review doc-11.)
+        if (intervalMs != null && intervalMs > 0 && intervalMs < 300_000) {
           return {
             operation: 'dreaming_set',
             scope,
             sub,
-            error: 'interval_ms must be >= 300000 (5 minutes). Use --interval 5m or larger.',
+            error: 'interval must be >= 300000 (5 minutes). Use --interval 5m or larger.',
           };
         }
         const include = asList(opts.include);
@@ -131,12 +129,11 @@ export function register(server, handlers, home) {
             kimiHomeDir: home,
           });
         } catch (e) {
-          return {
-            operation: 'dreaming_set',
-            scope,
-            sub,
-            error: e && e.message ? e.message : String(e),
-          };
+          // Throw so the wrapper routes the message through
+          // safeErrorMessage with isError — returning it inline would
+          // surface a raw persist exception as a success payload.
+          // (Review finding S2.)
+          throw toolError(e && e.message ? e.message : String(e));
         }
         return {
           operation: 'dreaming_set',

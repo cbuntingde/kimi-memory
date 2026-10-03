@@ -4,10 +4,9 @@
 // which meant memories.js imported it from this module while this module
 // imported rowToMemory/getMemory from memories.js: a real import cycle.
 // The values are re-exported below so existing importers keep working.
-import { nowIso, hashId, shortId } from '../util.js';
-import { looksLikeSecret } from '../secrets.js';
+import { nowIso, hashId, shortId, clampInt } from '../util.js';
 import { openSharedDb, openDb } from './connection.js';
-import { rowToMemory, getMemory } from './memories.js';
+import { rowToMemory, getMemory, assertNoSecret } from './memories.js';
 import { globalDbPath } from '../project-key.js';
 import { VISIBILITY_SET, TIER_SET } from '../vocabulary.js';
 import crypto from 'node:crypto';
@@ -17,6 +16,43 @@ import crypto from 'node:crypto';
 // to 'private' when the input is missing or out-of-vocabulary, so a save
 // never produces a row that bypasses the principal gate.
 export const VISIBILITY_VALUES = VISIBILITY_SET;
+
+// Rebuild a save-shaped input from a stored row so promotion paths
+// can re-screen through the same assertNoSecret gate the save path
+// uses. Corrupt JSON columns degrade to empty containers (never
+// throw) — a crash here would strand the promotion. (Review F4.)
+function safeParseJsonArray(v) {
+  try {
+    const p = JSON.parse(v);
+    return Array.isArray(p) ? p : [];
+  } catch {
+    return [];
+  }
+}
+function safeParseJsonObject(v) {
+  try {
+    const p = JSON.parse(v);
+    return p && typeof p === 'object' ? p : {};
+  } catch {
+    return {};
+  }
+}
+function rowToSecretInput(r) {
+  return {
+    title: r.title || '',
+    content: r.content || '',
+    tags: safeParseJsonArray(r.tags),
+    metadata: safeParseJsonObject(r.metadata),
+    provenance: safeParseJsonObject(r.provenance),
+    shared_with: safeParseJsonArray(r.shared_with),
+    team_id: r.team_id,
+    agent_id: r.agent_id,
+    user_id: r.user_id,
+    session_id: r.session_id,
+    task_id: r.task_id,
+    persona_id: r.persona_id,
+  };
+}
 
 export function validVisibilityLevels() {
   return [...VISIBILITY_VALUES];
@@ -85,9 +121,9 @@ export function shareMemory(db, projectKey, ids, opts = {}) {
     const idSet = new Set(ids);
     const candidates = db
       .prepare(
-        `SELECT id, title, content FROM memories WHERE project_key = ? AND id IN (${[...idSet]
-          .map(() => '?')
-          .join(',')})`,
+        `SELECT id, title, content, tags, metadata, provenance, shared_with,
+          team_id, agent_id, user_id, session_id, task_id, persona_id
+         FROM memories WHERE project_key = ? AND id IN (${[...idSet].map(() => '?').join(',')})`,
       )
       .all(projectKey, ...idSet);
     // Honour the same opt-out `assertNoSecret` does. The error message
@@ -96,12 +132,19 @@ export function shareMemory(db, projectKey, ids, opts = {}) {
     // hatch did nothing and the promotion failed anyway.
     if (process.env.KIMI_MEMORY_SECRET_SCAN !== 'off') {
       for (const r of candidates) {
-        if (looksLikeSecret(r.title || '') || looksLikeSecret(r.content || '')) {
-          const err = new Error(
-            `secret_detected: refusing to share memory ${r.id} — title or content matches a known credential shape. Remove the secret and retry, or set KIMI_MEMORY_SECRET_SCAN=off to bypass.`,
-          );
-          err.code = 'KIMI_MEMORY_SECRET_DETECTED';
-          throw err;
+        // Re-screen the full row through the save gate, not just
+        // title/content — bytes may predate the scanner revision.
+        try {
+          assertNoSecret(rowToSecretInput(r));
+        } catch (e) {
+          if (e && e.code === 'KIMI_MEMORY_SECRET_DETECTED') {
+            const err = new Error(
+              `secret_detected: refusing to share memory ${r.id} — ${e.where || 'a field'} matches a known credential shape. Remove the secret and retry, or set KIMI_MEMORY_SECRET_SCAN=off to bypass.`,
+            );
+            err.code = 'KIMI_MEMORY_SECRET_DETECTED';
+            throw err;
+          }
+          throw e;
         }
       }
     }
@@ -349,7 +392,9 @@ export function promoteMemoryToGlobal(db, projectKey, ids, { kimiHomeDir, nowOve
   try {
     candidates = db
       .prepare(
-        `SELECT id, title, content FROM memories
+        `SELECT id, title, content, tags, metadata, provenance, shared_with,
+          team_id, agent_id, user_id, session_id, task_id, persona_id
+         FROM memories
          WHERE project_key = ? AND id IN (${placeholders})`,
       )
       .all(projectKey, ...idSet);
@@ -358,14 +403,24 @@ export function promoteMemoryToGlobal(db, projectKey, ids, { kimiHomeDir, nowOve
   }
   const foundById = new Map(candidates.map((r) => [r.id, r]));
   const skipped = [];
+  // Honour the documented SECRET_SCAN=off escape hatch — previously
+  // the advertised opt-out silently failed here. (Review finding F4.)
+  const scanOff = process.env.KIMI_MEMORY_SECRET_SCAN === 'off';
   for (const id of ids) {
     const r = foundById.get(id);
     if (!r) {
       skipped.push({ id, reason: 'not_found' });
       continue;
     }
-    if (looksLikeSecret(r.title || '') || looksLikeSecret(r.content || '')) {
-      skipped.push({ id, reason: 'secret_detected' });
+    if (!scanOff) {
+      let secret = false;
+      try {
+        assertNoSecret(rowToSecretInput(r));
+      } catch (e) {
+        if (e && e.code === 'KIMI_MEMORY_SECRET_DETECTED') secret = true;
+        else throw e;
+      }
+      if (secret) skipped.push({ id, reason: 'secret_detected' });
     }
   }
   const movableIds = ids.filter((id) => foundById.has(id) && !skipped.find((s) => s.id === id));
@@ -649,6 +704,6 @@ export function listTierHistory(db, projectKey, memoryId, { limit = 200 } = {}) 
        ORDER BY datetime(at) ASC, id ASC
        LIMIT ?`,
     )
-    .all(memoryId, Math.max(1, Math.min(500, limit)));
+    .all(memoryId, clampInt(limit, 1, 500, 200));
   return rows;
 }

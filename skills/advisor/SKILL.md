@@ -18,7 +18,7 @@ You are being asked for an opinion grounded in accumulated experience, not gener
 
 ## When this skill applies
 
-Triggers (case-insensitive substring match; the frozen list lives in `src/advisor/detect.js`):
+Triggers (case-insensitive substring match; the frozen list lives in `src/advisor/detect.js`). Matches in a sentence containing a negation marker are suppressed:
 
 - "would we change"
 - "what would you do differently", "what would we do differently"
